@@ -95,6 +95,176 @@ def test_unfused_grouped_dsa_fn_output_shape():
     assert output.dtype == query.dtype
 
 
+def test_unfused_grouped_dsa_fn_matches_dense_reference():
+    torch.manual_seed(123)
+
+    seqlen = 6
+    batch_size = 2
+    num_heads = 8
+    num_query_groups = 2
+    head_dim = 16
+    topk = 3
+
+    query = torch.randn(
+        seqlen, batch_size, num_heads, head_dim, dtype=torch.float32, requires_grad=True
+    )
+    key = torch.randn(
+        seqlen, batch_size, num_query_groups, head_dim, dtype=torch.float32, requires_grad=True
+    )
+    value = torch.randn(
+        seqlen, batch_size, num_query_groups, head_dim, dtype=torch.float32, requires_grad=True
+    )
+    topk_indices = torch.randint(0, seqlen, (batch_size, seqlen, topk))
+    mask = torch.zeros(batch_size, seqlen, seqlen, dtype=torch.float32)
+    mask[:, :, -1] = float("-inf")
+
+    sparse_output = unfused_grouped_dsa_fn(
+        query=query,
+        key=key,
+        value=value,
+        topk_indices=topk_indices,
+        softmax_scale=head_dim**-0.5,
+        mask=mask,
+        use_gather=True,
+    )
+    sparse_output.sum().backward()
+    sparse_grads = (query.grad.clone(), key.grad.clone(), value.grad.clone())
+
+    query.grad = None
+    key.grad = None
+    value.grad = None
+
+    dense_output = unfused_grouped_dsa_fn(
+        query=query,
+        key=key,
+        value=value,
+        topk_indices=topk_indices,
+        softmax_scale=head_dim**-0.5,
+        mask=mask,
+    )
+    dense_output.sum().backward()
+
+    torch.testing.assert_close(sparse_output, dense_output)
+    torch.testing.assert_close(query.grad, sparse_grads[0])
+    torch.testing.assert_close(key.grad, sparse_grads[1])
+    torch.testing.assert_close(value.grad, sparse_grads[2])
+
+
+def test_unfused_grouped_dsa_fn_gather_bool_mask_matches_dense_float_mask():
+    torch.manual_seed(123)
+
+    seqlen = 6
+    batch_size = 2
+    num_heads = 8
+    num_query_groups = 2
+    head_dim = 16
+    topk = 3
+
+    query = torch.randn(
+        seqlen, batch_size, num_heads, head_dim, dtype=torch.float32, requires_grad=True
+    )
+    key = torch.randn(
+        seqlen, batch_size, num_query_groups, head_dim, dtype=torch.float32, requires_grad=True
+    )
+    value = torch.randn(
+        seqlen, batch_size, num_query_groups, head_dim, dtype=torch.float32, requires_grad=True
+    )
+    topk_indices = torch.randint(0, seqlen, (batch_size, seqlen, topk))
+    bool_mask = torch.zeros(batch_size, seqlen, seqlen, dtype=torch.bool)
+    bool_mask[:, :, -1] = True
+    float_mask = torch.zeros(batch_size, seqlen, seqlen, dtype=torch.float32).masked_fill(
+        bool_mask, float("-inf")
+    )
+
+    gather_output = unfused_grouped_dsa_fn(
+        query=query,
+        key=key,
+        value=value,
+        topk_indices=topk_indices,
+        softmax_scale=head_dim**-0.5,
+        mask=bool_mask,
+        use_gather=True,
+    )
+    gather_output.sum().backward()
+    gather_grads = (query.grad.clone(), key.grad.clone(), value.grad.clone())
+
+    query.grad = None
+    key.grad = None
+    value.grad = None
+
+    dense_output = unfused_grouped_dsa_fn(
+        query=query,
+        key=key,
+        value=value,
+        topk_indices=topk_indices,
+        softmax_scale=head_dim**-0.5,
+        mask=float_mask,
+    )
+    dense_output.sum().backward()
+
+    torch.testing.assert_close(gather_output, dense_output)
+    torch.testing.assert_close(query.grad, gather_grads[0])
+    torch.testing.assert_close(key.grad, gather_grads[1])
+    torch.testing.assert_close(value.grad, gather_grads[2])
+
+
+def test_unfused_grouped_dsa_fn_chunked_matches_unchunked():
+    torch.manual_seed(123)
+
+    seqlen = 6
+    batch_size = 2
+    num_heads = 8
+    num_query_groups = 2
+    head_dim = 16
+    topk = 3
+
+    query = torch.randn(
+        seqlen, batch_size, num_heads, head_dim, dtype=torch.float32, requires_grad=True
+    )
+    key = torch.randn(
+        seqlen, batch_size, num_query_groups, head_dim, dtype=torch.float32, requires_grad=True
+    )
+    value = torch.randn(
+        seqlen, batch_size, num_query_groups, head_dim, dtype=torch.float32, requires_grad=True
+    )
+    topk_indices = torch.randint(0, seqlen, (batch_size, seqlen, topk))
+    mask = torch.zeros(batch_size, seqlen, seqlen, dtype=torch.float32)
+    mask[:, :, -1] = float("-inf")
+
+    unchunked_output = unfused_grouped_dsa_fn(
+        query=query,
+        key=key,
+        value=value,
+        topk_indices=topk_indices,
+        softmax_scale=head_dim**-0.5,
+        mask=mask,
+        use_gather=True,
+    )
+    unchunked_output.sum().backward()
+    unchunked_grads = (query.grad.clone(), key.grad.clone(), value.grad.clone())
+
+    query.grad = None
+    key.grad = None
+    value.grad = None
+
+    chunked_output = unfused_grouped_dsa_fn(
+        query=query,
+        key=key,
+        value=value,
+        topk_indices=topk_indices,
+        softmax_scale=head_dim**-0.5,
+        mask=mask,
+        query_chunk_size=2,
+        use_gather=True,
+    )
+    chunked_output.sum().backward()
+
+    torch.testing.assert_close(chunked_output, unchunked_output)
+    torch.testing.assert_close(query.grad, unchunked_grads[0])
+    torch.testing.assert_close(key.grad, unchunked_grads[1])
+    torch.testing.assert_close(value.grad, unchunked_grads[2])
+
+
 def test_unfused_grouped_dsa_fn_recompute_matches_normal():
     torch.manual_seed(123)
 
@@ -143,6 +313,75 @@ def test_unfused_grouped_dsa_fn_recompute_matches_normal():
             topk_indices=topk_indices,
             softmax_scale=head_dim**-0.5,
             mask=mask,
+        )
+
+    recompute_output = torch_checkpoint.checkpoint(
+        _compute_recompute_output,
+        query,
+        key,
+        value,
+        use_reentrant=False,
+    )
+    recompute_output.sum().backward()
+
+    torch.testing.assert_close(recompute_output, normal_output)
+    torch.testing.assert_close(query.grad, normal_grads[0])
+    torch.testing.assert_close(key.grad, normal_grads[1])
+    torch.testing.assert_close(value.grad, normal_grads[2])
+
+
+def test_unfused_grouped_dsa_fn_gather_recompute_matches_normal():
+    torch.manual_seed(123)
+
+    seqlen = 6
+    batch_size = 2
+    num_heads = 8
+    num_query_groups = 2
+    head_dim = 16
+    topk = 3
+
+    query = torch.randn(
+        seqlen, batch_size, num_heads, head_dim, dtype=torch.float32, requires_grad=True
+    )
+    key = torch.randn(
+        seqlen, batch_size, num_query_groups, head_dim, dtype=torch.float32, requires_grad=True
+    )
+    value = torch.randn(
+        seqlen, batch_size, num_query_groups, head_dim, dtype=torch.float32, requires_grad=True
+    )
+    topk_indices = torch.randint(0, seqlen, (batch_size, seqlen, topk))
+    mask = torch.zeros(batch_size, seqlen, seqlen, dtype=torch.bool)
+    mask[:, :, -1] = True
+
+    normal_output = unfused_grouped_dsa_fn(
+        query=query,
+        key=key,
+        value=value,
+        topk_indices=topk_indices,
+        softmax_scale=head_dim**-0.5,
+        mask=mask,
+        query_chunk_size=2,
+        use_gather=True,
+    )
+    normal_output.sum().backward()
+    normal_grads = (query.grad.clone(), key.grad.clone(), value.grad.clone())
+
+    query.grad = None
+    key.grad = None
+    value.grad = None
+
+    def _compute_recompute_output(
+        query_tensor: torch.Tensor, key_tensor: torch.Tensor, value_tensor: torch.Tensor
+    ) -> torch.Tensor:
+        return unfused_grouped_dsa_fn(
+            query=query_tensor,
+            key=key_tensor,
+            value=value_tensor,
+            topk_indices=topk_indices,
+            softmax_scale=head_dim**-0.5,
+            mask=mask,
+            query_chunk_size=2,
+            use_gather=True,
         )
 
     recompute_output = torch_checkpoint.checkpoint(

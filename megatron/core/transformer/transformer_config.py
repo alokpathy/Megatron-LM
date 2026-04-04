@@ -295,6 +295,12 @@ class TransformerConfig(ModelParallelConfig):
     dsa_sparse_attention_recompute: bool = False
     """Whether to recompute sparse DSA attention during backward to reduce activation memory."""
 
+    dsa_sparse_attention_use_gather: bool = False
+    """Whether to use the gather-based sparse DSA attention backend instead of the dense-mask reference path."""
+
+    dsa_sparse_attention_query_chunk_size: Optional[int] = None
+    """Optional query chunk size for sparse DSA attention. If unset, process all queries at once."""
+
     dsa_indexer_use_sparse_loss: bool = False
     """Whether to use sparse DSA indexer loss. If True, the indexer loss will be computed using the
     top-k indices."""

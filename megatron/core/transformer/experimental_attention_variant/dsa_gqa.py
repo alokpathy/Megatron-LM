@@ -73,6 +73,25 @@ def _build_shifted_causal_mask(
     )
 
 
+def _build_selected_causal_mask(
+    topk_indices: torch.Tensor, query_start_position: int = 0
+) -> torch.Tensor:
+    """Build a causal mask only on the selected top-k support."""
+    batch_size, query_length, _ = topk_indices.shape
+    query_positions = torch.arange(
+        query_start_position,
+        query_start_position + query_length,
+        device=topk_indices.device,
+        dtype=topk_indices.dtype,
+    )
+    invalid = topk_indices > query_positions.view(1, query_length, 1)
+    return torch.zeros(
+        (batch_size, query_length, topk_indices.size(-1)),
+        dtype=torch.float32,
+        device=topk_indices.device,
+    ).masked_fill(invalid, float("-inf"))
+
+
 def compute_gqa_dsa_indexer_loss(
     index_scores: torch.Tensor,
     topk_indices: torch.Tensor,
@@ -126,7 +145,7 @@ def compute_gqa_dsa_indexer_loss(
     return kl_per_element.sum(dim=-1).mean() * loss_coeff
 
 
-def unfused_grouped_dsa_fn(
+def _dense_grouped_dsa_fn(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
@@ -134,10 +153,9 @@ def unfused_grouped_dsa_fn(
     softmax_scale: float,
     mask: Optional[torch.Tensor] = None,
 ):
-    """Reference grouped-query sparse attention with one top-k set per token."""
+    """Dense-mask reference grouped-query sparse attention."""
     sq, b, np, hn = query.size()
     skv = key.size(0)
-
     key, value = _repeat_grouped_key_value(key, value, np)
     hnv = value.size(3)
 
@@ -150,7 +168,7 @@ def unfused_grouped_dsa_fn(
     index_mask.scatter_(-1, topk_indices, 0)
     if mask is None:
         mask = torch.triu(
-            torch.full((sq, skv), float('-inf'), dtype=torch.float32, device=index_mask.device),
+            torch.full((sq, skv), float("-inf"), dtype=torch.float32, device=index_mask.device),
             diagonal=1,
         )
     index_mask = index_mask + mask.view(1, sq, skv)
@@ -162,6 +180,118 @@ def unfused_grouped_dsa_fn(
     output = torch.bmm(attention_scores.to(value.dtype), value)
     output = output.reshape(b, np, sq, hnv).permute(2, 0, 1, 3).contiguous()
     return output.reshape(sq, b, np * hnv)
+
+
+def _sparse_grouped_dsa_fn(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    topk_indices: torch.Tensor,
+    softmax_scale: float,
+    mask: Optional[torch.Tensor] = None,
+    query_chunk_size: Optional[int] = None,
+):
+    """Gather-based grouped-query sparse attention."""
+    sq, b, np, hn = query.size()
+    skv = key.size(0)
+    num_query_groups = key.size(2)
+    assert np % num_query_groups == 0, (
+        f"num_query_heads ({np}) must be divisible by num_query_groups ({num_query_groups})."
+    )
+    repeat_factor = np // num_query_groups
+    topk = topk_indices.size(-1)
+    if query_chunk_size is None or query_chunk_size <= 0:
+        query_chunk_size = sq
+    else:
+        query_chunk_size = min(query_chunk_size, sq)
+
+    query = query.permute(1, 2, 0, 3).unflatten(1, (num_query_groups, repeat_factor))
+    key = key.permute(1, 2, 0, 3)
+    value = value.permute(1, 2, 0, 3)
+    hnv = value.size(-1)
+
+    output = value.new_empty((b, num_query_groups, repeat_factor, sq, hnv))
+
+    for q_start in range(0, sq, query_chunk_size):
+        q_end = min(q_start + query_chunk_size, sq)
+        chunk_len = q_end - q_start
+        topk_indices_chunk = topk_indices[:, q_start:q_end, :]
+        if mask is None:
+            selected_mask = _build_selected_causal_mask(
+                topk_indices_chunk, query_start_position=q_start
+            )
+        elif mask.dim() == 2:
+            selected_mask = mask[q_start:q_end].unsqueeze(0).expand(b, chunk_len, skv).gather(2, topk_indices_chunk)
+        else:
+            selected_mask = mask[:, q_start:q_end, :].gather(2, topk_indices_chunk)
+        if selected_mask.dtype == torch.bool:
+            selected_mask = torch.zeros(
+                selected_mask.shape,
+                dtype=torch.float32,
+                device=selected_mask.device,
+            ).masked_fill(selected_mask, float("-inf"))
+        selected_mask = selected_mask.unsqueeze(1)
+
+        key_gather_index = topk_indices_chunk[:, :, :, None].expand(b, chunk_len, topk, hn)
+        value_gather_index = topk_indices_chunk[:, :, :, None].expand(b, chunk_len, topk, hnv)
+
+        for group_idx in range(num_query_groups):
+            key_group = key[:, group_idx, :, :]
+            value_group = value[:, group_idx, :, :]
+            gathered_key = torch.gather(
+                key_group[:, None, :, :].expand(b, chunk_len, skv, hn),
+                2,
+                key_gather_index,
+            )
+            gathered_value = torch.gather(
+                value_group[:, None, :, :].expand(b, chunk_len, skv, hnv),
+                2,
+                value_gather_index,
+            )
+            query_group = query[:, group_idx, :, q_start:q_end, :]
+            attention_scores = (
+                torch.einsum("brsh,bskh->brsk", query_group.float(), gathered_key.float())
+                * softmax_scale
+            )
+            attention_scores = attention_scores + selected_mask
+            attention_probs = torch.nn.functional.softmax(attention_scores, dim=-1, dtype=torch.float32)
+            output[:, group_idx, :, q_start:q_end, :] = torch.einsum(
+                "brsk,bskd->brsd", attention_probs.to(gathered_value.dtype), gathered_value
+            )
+
+    output = output.view(b, np, sq, hnv).permute(2, 0, 1, 3).contiguous()
+    return output.reshape(sq, b, np * hnv)
+
+
+def unfused_grouped_dsa_fn(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    topk_indices: torch.Tensor,
+    softmax_scale: float,
+    mask: Optional[torch.Tensor] = None,
+    query_chunk_size: Optional[int] = None,
+    use_gather: bool = False,
+):
+    """Reference grouped-query sparse attention with optional gather-based backend."""
+    if use_gather:
+        return _sparse_grouped_dsa_fn(
+            query,
+            key,
+            value,
+            topk_indices,
+            softmax_scale,
+            mask=mask,
+            query_chunk_size=query_chunk_size,
+        )
+    return _dense_grouped_dsa_fn(
+        query,
+        key,
+        value,
+        topk_indices,
+        softmax_scale,
+        mask=mask,
+    )
 
 
 @dataclass
@@ -458,19 +588,25 @@ class DSGQACoreAttention(MegatronModule):
 
         sq, b, _, _ = query.size()
         skv = key.size(0)
+        sparse_attention_use_gather = getattr(self.config, "dsa_sparse_attention_use_gather", False)
 
         hidden_states = hidden_states.detach()
 
         if attn_mask_type is not None:
             assert attn_mask_type == AttnMaskType.causal, 'Only causal mask is supported for now'
-            float_mask = torch.triu(
+            routing_mask = torch.triu(
                 torch.full((sq, skv), float('-inf'), dtype=torch.float32, device=query.device),
                 diagonal=1,
             )
+            sparse_attention_mask = None if sparse_attention_use_gather else routing_mask
         else:
             assert attention_mask.shape == (b, 1, sq, skv), 'attention_mask shape mismatch'
-            mask = attention_mask.squeeze(1)
-            float_mask = torch.zeros_like(mask, dtype=torch.float32).masked_fill(mask, float('-inf'))
+            sparse_attention_mask = attention_mask.squeeze(1)
+            routing_mask = torch.zeros_like(
+                sparse_attention_mask, dtype=torch.float32
+            ).masked_fill(sparse_attention_mask, float('-inf'))
+            if not sparse_attention_use_gather:
+                sparse_attention_mask = routing_mask
 
         indexer_loss_coeff = getattr(self.config, 'dsa_indexer_loss_coeff', 0.0) or 0.0
         if self.training and torch.is_grad_enabled():
@@ -478,7 +614,7 @@ class DSGQACoreAttention(MegatronModule):
                 hidden_states, use_rope=use_indexer_rope, packed_seq_params=packed_seq_params
             )
             index_scores, topk_indices = fused_qk_topk_naive(
-                q_index, k_index, weights, self.indexer.index_topk, float_mask
+                q_index, k_index, weights, self.indexer.index_topk, routing_mask
             )
 
             indexer_loss = None
@@ -515,6 +651,12 @@ class DSGQACoreAttention(MegatronModule):
                 )
 
             recompute_sparse_attention = getattr(self.config, "dsa_sparse_attention_recompute", False)
+            sparse_attention_use_gather = getattr(
+                self.config, "dsa_sparse_attention_use_gather", False
+            )
+            sparse_attention_query_chunk_size = getattr(
+                self.config, "dsa_sparse_attention_query_chunk_size", None
+            )
             if recompute_sparse_attention and (
                 query.requires_grad or key.requires_grad or value.requires_grad
             ):
@@ -529,7 +671,9 @@ class DSGQACoreAttention(MegatronModule):
                         value_tensor,
                         topk_indices,
                         self.softmax_scale,
-                        mask=float_mask,
+                        mask=sparse_attention_mask,
+                        query_chunk_size=sparse_attention_query_chunk_size,
+                        use_gather=sparse_attention_use_gather,
                     )
 
                 output = torch_checkpoint.checkpoint(
@@ -541,7 +685,14 @@ class DSGQACoreAttention(MegatronModule):
                 )
             else:
                 output = unfused_grouped_dsa_fn(
-                    query, key, value, topk_indices, self.softmax_scale, mask=float_mask
+                    query,
+                    key,
+                    value,
+                    topk_indices,
+                    self.softmax_scale,
+                    mask=sparse_attention_mask,
+                    query_chunk_size=sparse_attention_query_chunk_size,
+                    use_gather=sparse_attention_use_gather,
                 )
             if indexer_loss is not None:
                 output = DSAIndexerLossAutoScaler.apply(output, indexer_loss)
@@ -550,10 +701,19 @@ class DSGQACoreAttention(MegatronModule):
         _, topk_indices = self.indexer.forward_with_scores(
             hidden_states,
             use_rope=use_indexer_rope,
-            mask=float_mask,
+            mask=routing_mask,
             packed_seq_params=packed_seq_params,
         )
-        return unfused_grouped_dsa_fn(query, key, value, topk_indices, self.softmax_scale, mask=float_mask)
+        return unfused_grouped_dsa_fn(
+            query,
+            key,
+            value,
+            topk_indices,
+            self.softmax_scale,
+            mask=sparse_attention_mask,
+            query_chunk_size=getattr(self.config, "dsa_sparse_attention_query_chunk_size", None),
+            use_gather=sparse_attention_use_gather,
+        )
 
     def forward_dynamic(
         self,
@@ -636,6 +796,8 @@ class DSGQACoreAttention(MegatronModule):
                 topk_indices,
                 self.softmax_scale,
                 mask=request_mask,
+                query_chunk_size=getattr(self.config, "dsa_sparse_attention_query_chunk_size", None),
+                use_gather=getattr(self.config, "dsa_sparse_attention_use_gather", False),
             )
 
         if q_cursor != inference_context.active_token_count:
