@@ -1,4 +1,5 @@
 import torch
+import torch.utils.checkpoint as torch_checkpoint
 
 from megatron.core.models.mamba.mamba_layer_specs import mamba_stack_spec
 from megatron.core.transformer.experimental_attention_variant.dsa import fused_qk_topk_naive
@@ -94,6 +95,71 @@ def test_unfused_grouped_dsa_fn_output_shape():
     assert output.dtype == query.dtype
 
 
+def test_unfused_grouped_dsa_fn_recompute_matches_normal():
+    torch.manual_seed(123)
+
+    seqlen = 6
+    batch_size = 2
+    num_heads = 8
+    num_query_groups = 2
+    head_dim = 16
+    topk = 3
+
+    query = torch.randn(
+        seqlen, batch_size, num_heads, head_dim, dtype=torch.float32, requires_grad=True
+    )
+    key = torch.randn(
+        seqlen, batch_size, num_query_groups, head_dim, dtype=torch.float32, requires_grad=True
+    )
+    value = torch.randn(
+        seqlen, batch_size, num_query_groups, head_dim, dtype=torch.float32, requires_grad=True
+    )
+    topk_indices = torch.randint(0, seqlen, (batch_size, seqlen, topk))
+    mask = torch.zeros(batch_size, seqlen, seqlen, dtype=torch.float32)
+    mask[:, :, -1] = float("-inf")
+
+    normal_output = unfused_grouped_dsa_fn(
+        query=query,
+        key=key,
+        value=value,
+        topk_indices=topk_indices,
+        softmax_scale=head_dim**-0.5,
+        mask=mask,
+    )
+    normal_output.sum().backward()
+    normal_grads = (query.grad.clone(), key.grad.clone(), value.grad.clone())
+
+    query.grad = None
+    key.grad = None
+    value.grad = None
+
+    def _compute_recompute_output(
+        query_tensor: torch.Tensor, key_tensor: torch.Tensor, value_tensor: torch.Tensor
+    ) -> torch.Tensor:
+        return unfused_grouped_dsa_fn(
+            query=query_tensor,
+            key=key_tensor,
+            value=value_tensor,
+            topk_indices=topk_indices,
+            softmax_scale=head_dim**-0.5,
+            mask=mask,
+        )
+
+    recompute_output = torch_checkpoint.checkpoint(
+        _compute_recompute_output,
+        query,
+        key,
+        value,
+        use_reentrant=False,
+    )
+    recompute_output.sum().backward()
+
+    torch.testing.assert_close(recompute_output, normal_output)
+    torch.testing.assert_close(query.grad, normal_grads[0])
+    torch.testing.assert_close(key.grad, normal_grads[1])
+    torch.testing.assert_close(value.grad, normal_grads[2])
+
+
 def test_fused_qk_topk_naive_caps_topk_by_key_length():
     torch.manual_seed(123)
 
@@ -105,6 +171,53 @@ def test_fused_qk_topk_naive_caps_topk_by_key_length():
 
     assert topk_indices.shape == (1, 2, 4)
     assert torch.all((topk_indices >= 0) & (topk_indices < 5))
+
+
+def test_compute_gqa_dsa_indexer_loss_recompute_matches_normal():
+    torch.manual_seed(123)
+
+    batch_size = 2
+    seqlen = 8
+    num_heads = 8
+    num_query_groups = 2
+    head_dim = 16
+    topk = 4
+
+    index_scores = torch.randn(
+        batch_size, seqlen, seqlen, dtype=torch.float32, requires_grad=True
+    )
+    topk_indices = index_scores.detach().topk(topk, dim=-1).indices
+    query = torch.randn(seqlen, batch_size, num_heads, head_dim, dtype=torch.float32)
+    key = torch.randn(seqlen, batch_size, num_query_groups, head_dim, dtype=torch.float32)
+    pg_collection = _DummyPGCollection()
+
+    def _compute_loss(index_scores_tensor):
+        return compute_gqa_dsa_indexer_loss(
+            index_scores=index_scores_tensor,
+            topk_indices=topk_indices,
+            query=query,
+            key=key,
+            softmax_scale=head_dim**-0.5,
+            loss_coeff=0.7,
+            sparse_loss=True,
+            pg_collection=pg_collection,
+        )
+
+    normal_loss = _compute_loss(index_scores)
+    normal_loss.backward()
+    normal_grad = index_scores.grad.clone()
+
+    index_scores.grad = None
+
+    recompute_loss = torch_checkpoint.checkpoint(
+        _compute_loss,
+        index_scores,
+        use_reentrant=False,
+    )
+    recompute_loss.backward()
+
+    torch.testing.assert_close(recompute_loss, normal_loss)
+    torch.testing.assert_close(index_scores.grad, normal_grad)
 
 
 def test_build_shifted_causal_mask_respects_query_offset():

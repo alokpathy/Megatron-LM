@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Optional, Tuple, Union
 
 import torch
+import torch.utils.checkpoint as torch_checkpoint
 from megatron.core.extensions.transformer_engine import TELinear, TENorm
 from megatron.core.models.common.embeddings import (
     RotaryEmbedding,
@@ -482,23 +483,66 @@ class DSGQACoreAttention(MegatronModule):
 
             indexer_loss = None
             if indexer_loss_coeff > 0:
-                indexer_loss = compute_gqa_dsa_indexer_loss(
-                    index_scores,
-                    topk_indices,
-                    query.detach(),
-                    key.detach(),
-                    self.softmax_scale,
-                    indexer_loss_coeff,
-                    getattr(self.config, "dsa_indexer_use_sparse_loss", False),
-                    self.indexer.pg_collection,
-                )
+                sparse_indexer_loss = getattr(self.config, "dsa_indexer_use_sparse_loss", False)
+                recompute_indexer_loss = getattr(self.config, "dsa_indexer_loss_recompute", False)
+                query_detached = query.detach()
+                key_detached = key.detach()
+
+                def _compute_indexer_loss(index_scores_tensor: torch.Tensor) -> torch.Tensor:
+                    return compute_gqa_dsa_indexer_loss(
+                        index_scores_tensor,
+                        topk_indices,
+                        query_detached,
+                        key_detached,
+                        self.softmax_scale,
+                        indexer_loss_coeff,
+                        sparse_indexer_loss,
+                        self.indexer.pg_collection,
+                    )
+
+                if recompute_indexer_loss and index_scores.requires_grad:
+                    indexer_loss = torch_checkpoint.checkpoint(
+                        _compute_indexer_loss,
+                        index_scores,
+                        use_reentrant=False,
+                    )
+                else:
+                    indexer_loss = _compute_indexer_loss(index_scores)
                 DSAIndexerLossLoggingHelper.save_loss_to_tracker(
                     loss=indexer_loss,
                     layer_number=self.layer_number,
                     num_layers=self.config.num_layers,
                 )
 
-            output = unfused_grouped_dsa_fn(query, key, value, topk_indices, self.softmax_scale)
+            recompute_sparse_attention = getattr(self.config, "dsa_sparse_attention_recompute", False)
+            if recompute_sparse_attention and (
+                query.requires_grad or key.requires_grad or value.requires_grad
+            ):
+                def _compute_sparse_attention(
+                    query_tensor: torch.Tensor,
+                    key_tensor: torch.Tensor,
+                    value_tensor: torch.Tensor,
+                ) -> torch.Tensor:
+                    return unfused_grouped_dsa_fn(
+                        query_tensor,
+                        key_tensor,
+                        value_tensor,
+                        topk_indices,
+                        self.softmax_scale,
+                        mask=float_mask,
+                    )
+
+                output = torch_checkpoint.checkpoint(
+                    _compute_sparse_attention,
+                    query,
+                    key,
+                    value,
+                    use_reentrant=False,
+                )
+            else:
+                output = unfused_grouped_dsa_fn(
+                    query, key, value, topk_indices, self.softmax_scale, mask=float_mask
+                )
             if indexer_loss is not None:
                 output = DSAIndexerLossAutoScaler.apply(output, indexer_loss)
             return output
@@ -509,7 +553,7 @@ class DSGQACoreAttention(MegatronModule):
             mask=float_mask,
             packed_seq_params=packed_seq_params,
         )
-        return unfused_grouped_dsa_fn(query, key, value, topk_indices, self.softmax_scale)
+        return unfused_grouped_dsa_fn(query, key, value, topk_indices, self.softmax_scale, mask=float_mask)
 
     def forward_dynamic(
         self,
