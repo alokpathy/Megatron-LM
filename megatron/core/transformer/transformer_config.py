@@ -286,6 +286,12 @@ class TransformerConfig(ModelParallelConfig):
     dsa_indexer_topk: Optional[int] = None
     """Number of top-k tokens to select in DSA indexer."""
 
+    dsa_indexer_topk_key_chunk_size: Optional[int] = None
+    """Optional key chunk size for exact streamed DSA top-k routing. If unset, use dense routing."""
+
+    dsa_indexer_topk_recompute: bool = False
+    """Whether to recompute chunked DSA top-k routing during backward to reduce activation memory."""
+
     dsa_indexer_loss_coeff: Optional[float] = None
     """Coefficient for the DSA indexer KL divergence loss. Set to 0 to disable indexer loss."""
 
@@ -2171,6 +2177,46 @@ class TransformerConfig(ModelParallelConfig):
             )
             assert self.dsa_indexer_topk is not None and self.dsa_indexer_topk > 0, (
                 "dsa_indexer_topk must be set to a positive integer when using DSA."
+            )
+            assert (
+                self.dsa_indexer_topk_key_chunk_size is None
+                or self.dsa_indexer_topk_key_chunk_size > 0
+            ), "dsa_indexer_topk_key_chunk_size must be a positive integer when set."
+            assert (
+                not self.dsa_indexer_sparse_loss_use_topk_only or self.dsa_indexer_use_sparse_loss
+            ), (
+                "dsa_indexer_sparse_loss_use_topk_only requires dsa_indexer_use_sparse_loss."
+            )
+            assert (
+                self.dsa_indexer_loss_query_chunk_size is None
+                or self.dsa_indexer_loss_query_chunk_size > 0
+            ), "dsa_indexer_loss_query_chunk_size must be a positive integer when set."
+            assert (
+                self.dsa_sparse_attention_query_chunk_size is None
+                or self.dsa_sparse_attention_query_chunk_size > 0
+            ), "dsa_sparse_attention_query_chunk_size must be a positive integer when set."
+            assert (
+                self.dsa_indexer_loss_query_chunk_size is None
+                or self.dsa_indexer_sparse_loss_use_topk_only
+            ), (
+                "dsa_indexer_loss_query_chunk_size requires "
+                "dsa_indexer_sparse_loss_use_topk_only."
+            )
+            assert (
+                not self.dsa_indexer_topk_recompute
+                or (
+                    self.dsa_indexer_topk_key_chunk_size is not None
+                    and self.dsa_indexer_topk_key_chunk_size > 0
+                )
+            ), (
+                "dsa_indexer_topk_recompute requires dsa_indexer_topk_key_chunk_size."
+            )
+            assert (
+                self.dsa_sparse_attention_query_chunk_size is None
+                or self.dsa_sparse_attention_use_gather
+            ), (
+                "dsa_sparse_attention_query_chunk_size requires "
+                "dsa_sparse_attention_use_gather."
             )
             assert (
                 self.context_parallel_size == 1

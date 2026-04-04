@@ -3029,6 +3029,17 @@ def _add_experimental_attention_variant_args(parser):
         help='Number of source tokens selected per query token by DSA.',
     )
     _maybe_add_argument(
+        '--dsa-indexer-topk-key-chunk-size',
+        type=int,
+        default=None,
+        help='Stream DSA top-k routing over this many keys per chunk. If unset, use dense routing.',
+    )
+    _maybe_add_argument(
+        '--dsa-indexer-topk-recompute',
+        action='store_true',
+        help='Recompute chunked DSA top-k routing during backward to reduce activation memory.',
+    )
+    _maybe_add_argument(
         '--dsa-indexer-loss-coeff',
         type=float,
         default=None,

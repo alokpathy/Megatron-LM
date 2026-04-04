@@ -24,6 +24,7 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.experimental_attention_variant.dsa import (
     DSAIndexerLossAutoScaler,
     DSAIndexerLossLoggingHelper,
+    fused_qk_topk_chunked,
     fused_qk_topk_naive,
     rotate_activation,
 )
@@ -93,7 +94,7 @@ def _build_selected_causal_mask(
 
 
 def compute_gqa_dsa_indexer_loss(
-    index_scores: torch.Tensor,
+    index_scores: Optional[torch.Tensor],
     topk_indices: torch.Tensor,
     query: torch.Tensor,
     key: torch.Tensor,
@@ -103,12 +104,26 @@ def compute_gqa_dsa_indexer_loss(
     pg_collection: ProcessGroupCollection,
     sparse_loss_use_topk_only: bool = False,
     query_chunk_size: Optional[int] = None,
+    selected_index_scores: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Compute DSA indexer KL loss for grouped-query attention."""
     sq, b, np, hn = query.size()
     sk, _, ng, _ = key.size()
-    assert sq == index_scores.size(1), "Query sequence length must match index_scores."
-    assert sk == index_scores.size(2), "Key sequence length must match index_scores."
+    if index_scores is None and selected_index_scores is None:
+        raise AssertionError("Either index_scores or selected_index_scores must be provided.")
+    if index_scores is not None:
+        assert sq == index_scores.size(1), "Query sequence length must match index_scores."
+        assert sk == index_scores.size(2), "Key sequence length must match index_scores."
+    if selected_index_scores is not None:
+        assert sparse_loss and sparse_loss_use_topk_only, (
+            "selected_index_scores is only supported for topk-only sparse loss."
+        )
+        assert sq == selected_index_scores.size(1), (
+            "Query sequence length must match selected_index_scores."
+        )
+        assert topk_indices.size(-1) == selected_index_scores.size(-1), (
+            "selected_index_scores and topk_indices must have matching top-k dimension."
+        )
 
     if np != ng:
         assert np % ng == 0, f"num_query_heads ({np}) must be divisible by num_query_groups ({ng})."
@@ -120,10 +135,12 @@ def compute_gqa_dsa_indexer_loss(
     else:
         query_chunk_size = min(query_chunk_size, sq)
 
+    loss_ref = index_scores if index_scores is not None else selected_index_scores
+
     if sparse_loss and sparse_loss_use_topk_only and query_chunk_size < sq:
         query = query.permute(1, 2, 0, 3)
         key = key.permute(1, 2, 0, 3)
-        total_kl = index_scores.new_zeros((), dtype=torch.float32)
+        total_kl = loss_ref.new_zeros((), dtype=torch.float32)
         total_positions = 0
         topk = topk_indices.size(-1)
 
@@ -156,11 +173,11 @@ def compute_gqa_dsa_indexer_loss(
                 torch.distributed.all_reduce(teacher_scores.contiguous(), group=pg_collection.tp)
             teacher_scores = teacher_scores / teacher_scores.sum(dim=-1, keepdim=True)
 
-            student_scores = torch.nn.functional.softmax(
-                index_scores[:, q_start:q_end, :].gather(-1, topk_indices_chunk),
-                dim=-1,
-                dtype=torch.float32,
-            )
+            if selected_index_scores is not None:
+                student_logits = selected_index_scores[:, q_start:q_end, :]
+            else:
+                student_logits = index_scores[:, q_start:q_end, :].gather(-1, topk_indices_chunk)
+            student_scores = torch.nn.functional.softmax(student_logits, dim=-1, dtype=torch.float32)
             kl_per_element = teacher_scores * (
                 torch.log(teacher_scores + 1e-10) - torch.log(student_scores + 1e-10)
             )
@@ -186,9 +203,14 @@ def compute_gqa_dsa_indexer_loss(
         attention_scores = torch.nn.functional.softmax(
             attention_scores, dim=-1, dtype=torch.float32
         )
-        index_scores = torch.nn.functional.softmax(
-            index_scores.gather(-1, topk_indices), dim=-1, dtype=torch.float32
-        )
+        if selected_index_scores is not None:
+            index_scores = torch.nn.functional.softmax(
+                selected_index_scores, dim=-1, dtype=torch.float32
+            )
+        else:
+            index_scores = torch.nn.functional.softmax(
+                index_scores.gather(-1, topk_indices), dim=-1, dtype=torch.float32
+            )
         attention_scores = attention_scores.sum(dim=1)
     else:
         query = query.permute(1, 2, 0, 3).reshape(b * np, sq, hn)
@@ -576,6 +598,9 @@ class DSGQAIndexer(MegatronModule):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         assert packed_seq_params is None, "Packed sequence is not supported for DSA-GQA."
         q, k, weights = self.forward_before_topk(hidden_states, use_rope, packed_seq_params)
+        key_chunk_size = getattr(self.config, "dsa_indexer_topk_key_chunk_size", None)
+        if key_chunk_size is not None and key_chunk_size > 0:
+            return fused_qk_topk_chunked(q, k, weights, self.index_topk, mask, key_chunk_size)
         return fused_qk_topk_naive(q, k, weights, self.index_topk, mask)
 
     def forward_before_topk_dynamic(
@@ -689,45 +714,114 @@ class DSGQACoreAttention(MegatronModule):
 
         indexer_loss_coeff = getattr(self.config, 'dsa_indexer_loss_coeff', 0.0) or 0.0
         if self.training and torch.is_grad_enabled():
+            sparse_indexer_loss = getattr(self.config, "dsa_indexer_use_sparse_loss", False)
+            sparse_indexer_loss_use_topk_only = getattr(
+                self.config, "dsa_indexer_sparse_loss_use_topk_only", False
+            )
+            recompute_indexer_loss = getattr(self.config, "dsa_indexer_loss_recompute", False)
             q_index, k_index, weights = self.indexer.forward_before_topk(
                 hidden_states, use_rope=use_indexer_rope, packed_seq_params=packed_seq_params
             )
-            index_scores, topk_indices = fused_qk_topk_naive(
-                q_index, k_index, weights, self.indexer.index_topk, routing_mask
-            )
-
-            indexer_loss = None
-            if indexer_loss_coeff > 0:
-                sparse_indexer_loss = getattr(self.config, "dsa_indexer_use_sparse_loss", False)
-                sparse_indexer_loss_use_topk_only = getattr(
-                    self.config, "dsa_indexer_sparse_loss_use_topk_only", False
+            key_chunk_size = getattr(self.config, "dsa_indexer_topk_key_chunk_size", None)
+            recompute_topk = getattr(self.config, "dsa_indexer_topk_recompute", False)
+            use_chunked_topk = (
+                key_chunk_size is not None
+                and key_chunk_size > 0
+                and (
+                    indexer_loss_coeff <= 0
+                    or (sparse_indexer_loss and sparse_indexer_loss_use_topk_only)
                 )
-                recompute_indexer_loss = getattr(self.config, "dsa_indexer_loss_recompute", False)
-                query_detached = query.detach()
-                key_detached = key.detach()
-
-                def _compute_indexer_loss(index_scores_tensor: torch.Tensor) -> torch.Tensor:
-                    return compute_gqa_dsa_indexer_loss(
-                        index_scores_tensor,
-                        topk_indices,
-                        query_detached,
-                        key_detached,
-                        self.softmax_scale,
-                        indexer_loss_coeff,
-                        sparse_indexer_loss,
-                        self.indexer.pg_collection,
-                        sparse_indexer_loss_use_topk_only,
-                        getattr(self.config, "dsa_indexer_loss_query_chunk_size", None),
+            )
+            if use_chunked_topk:
+                def _compute_chunked_topk(
+                    q_index_tensor: torch.Tensor,
+                    k_index_tensor: torch.Tensor,
+                    weights_tensor: torch.Tensor,
+                ) -> Tuple[torch.Tensor, torch.Tensor]:
+                    return fused_qk_topk_chunked(
+                        q_index_tensor,
+                        k_index_tensor,
+                        weights_tensor,
+                        self.indexer.index_topk,
+                        routing_mask,
+                        key_chunk_size,
                     )
 
-                if recompute_indexer_loss and index_scores.requires_grad:
-                    indexer_loss = torch_checkpoint.checkpoint(
-                        _compute_indexer_loss,
-                        index_scores,
+                if recompute_topk and (
+                    q_index.requires_grad or k_index.requires_grad or weights.requires_grad
+                ):
+                    topk_scores, topk_indices = torch_checkpoint.checkpoint(
+                        _compute_chunked_topk,
+                        q_index,
+                        k_index,
+                        weights,
                         use_reentrant=False,
                     )
                 else:
-                    indexer_loss = _compute_indexer_loss(index_scores)
+                    topk_scores, topk_indices = _compute_chunked_topk(
+                        q_index, k_index, weights
+                    )
+                index_scores = None
+            else:
+                index_scores, topk_indices = fused_qk_topk_naive(
+                    q_index, k_index, weights, self.indexer.index_topk, routing_mask
+                )
+                topk_scores = None
+
+            indexer_loss = None
+            if indexer_loss_coeff > 0:
+                query_detached = query.detach()
+                key_detached = key.detach()
+
+                if use_chunked_topk and sparse_indexer_loss and sparse_indexer_loss_use_topk_only:
+                    def _compute_sparse_topk_only_indexer_loss(
+                        selected_scores_tensor: torch.Tensor,
+                    ) -> torch.Tensor:
+                        return compute_gqa_dsa_indexer_loss(
+                            None,
+                            topk_indices,
+                            query_detached,
+                            key_detached,
+                            self.softmax_scale,
+                            indexer_loss_coeff,
+                            sparse_indexer_loss,
+                            self.indexer.pg_collection,
+                            sparse_indexer_loss_use_topk_only,
+                            getattr(self.config, "dsa_indexer_loss_query_chunk_size", None),
+                            selected_index_scores=selected_scores_tensor,
+                        )
+
+                    if recompute_indexer_loss and topk_scores.requires_grad:
+                        indexer_loss = torch_checkpoint.checkpoint(
+                            _compute_sparse_topk_only_indexer_loss,
+                            topk_scores,
+                            use_reentrant=False,
+                        )
+                    else:
+                        indexer_loss = _compute_sparse_topk_only_indexer_loss(topk_scores)
+                else:
+                    def _compute_indexer_loss(index_scores_tensor: torch.Tensor) -> torch.Tensor:
+                        return compute_gqa_dsa_indexer_loss(
+                            index_scores_tensor,
+                            topk_indices,
+                            query_detached,
+                            key_detached,
+                            self.softmax_scale,
+                            indexer_loss_coeff,
+                            sparse_indexer_loss,
+                            self.indexer.pg_collection,
+                            sparse_indexer_loss_use_topk_only,
+                            getattr(self.config, "dsa_indexer_loss_query_chunk_size", None),
+                        )
+
+                    if recompute_indexer_loss and index_scores.requires_grad:
+                        indexer_loss = torch_checkpoint.checkpoint(
+                            _compute_indexer_loss,
+                            index_scores,
+                            use_reentrant=False,
+                        )
+                    else:
+                        indexer_loss = _compute_indexer_loss(index_scores)
                 DSAIndexerLossLoggingHelper.save_loss_to_tracker(
                     loss=indexer_loss,
                     layer_number=self.layer_number,
@@ -866,13 +960,24 @@ class DSGQACoreAttention(MegatronModule):
                 query_length, key_length, request_offset, request_query.device
             )
 
-            _, topk_indices = fused_qk_topk_naive(
-                request_q_index,
-                request_index_key,
-                request_weights,
-                self.indexer.index_topk,
-                request_mask,
-            )
+            key_chunk_size = getattr(self.config, "dsa_indexer_topk_key_chunk_size", None)
+            if key_chunk_size is not None and key_chunk_size > 0:
+                _, topk_indices = fused_qk_topk_chunked(
+                    request_q_index,
+                    request_index_key,
+                    request_weights,
+                    self.indexer.index_topk,
+                    request_mask,
+                    key_chunk_size,
+                )
+            else:
+                _, topk_indices = fused_qk_topk_naive(
+                    request_q_index,
+                    request_index_key,
+                    request_weights,
+                    self.indexer.index_topk,
+                    request_mask,
+                )
             output[query_start:query_end] = unfused_grouped_dsa_fn(
                 request_query,
                 request_key,
