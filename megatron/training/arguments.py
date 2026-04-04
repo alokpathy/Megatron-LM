@@ -1897,6 +1897,9 @@ def _add_network_size_args(parser):
         "use_te_rng_tracker",
         "log_max_attention_logit",
         "barrier_with_L1_time",
+        "rope_type",
+        "rotary_base",
+        "rotary_percent",
         # args uses same var with a different name
         "num_moe_experts",
         "fp8_param",
@@ -2991,7 +2994,56 @@ def _add_mla_args(parser):
     return parser
 
 def _add_experimental_attention_variant_args(parser):
+    def _has_option_string(option_string):
+        return any(option_string in action.option_strings for action in parser._actions)
+
+    def _maybe_add_argument(*option_strings, **kwargs):
+        if any(_has_option_string(option_string) for option_string in option_strings):
+            return
+        group.add_argument(*option_strings, **kwargs)
+
     group = parser.add_argument_group(title="experimental_attention_variant")
+    _maybe_add_argument(
+        '--experimental-attention-variant',
+        type=str,
+        default=None,
+        choices=['gated_delta_net', 'dsa'],
+        help='Select an experimental attention variant.',
+    )
+    _maybe_add_argument(
+        '--dsa-indexer-n-heads',
+        type=int,
+        default=None,
+        help='Number of indexer heads to use for DSA.',
+    )
+    _maybe_add_argument(
+        '--dsa-indexer-head-dim',
+        type=int,
+        default=None,
+        help='Dimension per DSA indexer head.',
+    )
+    _maybe_add_argument(
+        '--dsa-indexer-topk',
+        type=int,
+        default=None,
+        help='Number of source tokens selected per query token by DSA.',
+    )
+    _maybe_add_argument(
+        '--dsa-indexer-loss-coeff',
+        type=float,
+        default=None,
+        help='KL loss coefficient for training the DSA indexer.',
+    )
+    _maybe_add_argument(
+        '--dsa-indexer-use-sparse-loss',
+        action='store_true',
+        help='Train the DSA indexer with KL loss restricted to the selected top-k support.',
+    )
+    _maybe_add_argument(
+        '--dsa-indexer-use-hadamard',
+        action='store_true',
+        help='Apply Hadamard rotation to DSA indexer queries and keys.',
+    )
     # Linear attention
     group.add_argument('--linear-attention-freq', type=la_freq_type, default=None,
                        help='Frequency between LA (linear attention) layers and'
