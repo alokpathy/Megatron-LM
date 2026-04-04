@@ -3061,6 +3061,17 @@ def _add_experimental_attention_variant_args(parser):
         help='Train the DSA indexer with KL loss restricted to the selected top-k support.',
     )
     _maybe_add_argument(
+        '--dsa-indexer-sparse-loss-use-topk-only',
+        action='store_true',
+        help='When using sparse DSA indexer loss, compute teacher/student KL only on the selected top-k support.',
+    )
+    _maybe_add_argument(
+        '--dsa-indexer-loss-query-chunk-size',
+        type=int,
+        default=None,
+        help='Optional query chunk size for the top-k-only sparse DSA indexer loss path.',
+    )
+    _maybe_add_argument(
         '--dsa-indexer-use-hadamard',
         action='store_true',
         help='Apply Hadamard rotation to DSA indexer queries and keys.',

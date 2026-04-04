@@ -305,6 +305,12 @@ class TransformerConfig(ModelParallelConfig):
     """Whether to use sparse DSA indexer loss. If True, the indexer loss will be computed using the
     top-k indices."""
 
+    dsa_indexer_sparse_loss_use_topk_only: bool = False
+    """When using sparse DSA indexer loss, compute KL only on the selected top-k support."""
+
+    dsa_indexer_loss_query_chunk_size: Optional[int] = None
+    """Optional query chunk size for the DSA indexer loss top-k-only sparse KL path."""
+
     dsa_indexer_use_hadamard: bool = False
     """Whether to apply Hadamard rotation to DSA indexer queries and keys."""
 

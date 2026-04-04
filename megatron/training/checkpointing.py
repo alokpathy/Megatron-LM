@@ -133,6 +133,8 @@ def check_checkpoint_args(checkpoint_args):
     _compare('dsa_sparse_attention_use_gather', default=False)
     _compare('dsa_sparse_attention_query_chunk_size')
     _compare('dsa_indexer_use_sparse_loss', default=False)
+    _compare('dsa_indexer_sparse_loss_use_topk_only', default=False)
+    _compare('dsa_indexer_loss_query_chunk_size')
     _compare('dsa_indexer_use_hadamard', default=False)
     if args.vocab_file:
         _compare('max_position_embeddings')
@@ -1467,6 +1469,8 @@ def load_args_from_checkpoint(
     _set_arg('dsa_sparse_attention_use_gather', force=True)
     _set_arg('dsa_sparse_attention_query_chunk_size', force=True)
     _set_arg('dsa_indexer_use_sparse_loss', force=True)
+    _set_arg('dsa_indexer_sparse_loss_use_topk_only', force=True)
+    _set_arg('dsa_indexer_loss_query_chunk_size', force=True)
     _set_arg('dsa_indexer_use_hadamard', force=True)
 
     # Legacy MTP pattern for old checkpoints

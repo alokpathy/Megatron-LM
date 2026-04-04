@@ -101,6 +101,8 @@ def compute_gqa_dsa_indexer_loss(
     loss_coeff: float,
     sparse_loss: bool,
     pg_collection: ProcessGroupCollection,
+    sparse_loss_use_topk_only: bool = False,
+    query_chunk_size: Optional[int] = None,
 ) -> torch.Tensor:
     """Compute DSA indexer KL loss for grouped-query attention."""
     sq, b, np, hn = query.size()
@@ -113,28 +115,105 @@ def compute_gqa_dsa_indexer_loss(
         repeat_factor = np // ng
         key = key.repeat_interleave(repeat_factor, dim=2)
 
-    query = query.permute(1, 2, 0, 3).reshape(b * np, sq, hn)
-    key = key.permute(1, 2, 3, 0).reshape(b * np, hn, sk)
-    attention_scores = torch.bmm(query.float(), key.float()) * softmax_scale
-    attention_scores = attention_scores.reshape(b, np, sq, sk)
+    if query_chunk_size is None or query_chunk_size <= 0:
+        query_chunk_size = sq
+    else:
+        query_chunk_size = min(query_chunk_size, sq)
 
-    causal_mask = torch.triu(
-        torch.full((sq, sk), float('-inf'), dtype=torch.float32, device=attention_scores.device),
-        diagonal=1,
-    )
-    index_mask = torch.full(
-        (b, sq, sk), float("-inf"), dtype=torch.float32, device=attention_scores.device
-    ).scatter_(-1, topk_indices, 0)
+    if sparse_loss and sparse_loss_use_topk_only and query_chunk_size < sq:
+        query = query.permute(1, 2, 0, 3)
+        key = key.permute(1, 2, 0, 3)
+        total_kl = index_scores.new_zeros((), dtype=torch.float32)
+        total_positions = 0
+        topk = topk_indices.size(-1)
 
-    attention_scores = attention_scores + causal_mask.view(1, 1, sq, sk)
-    if sparse_loss:
-        attention_scores = attention_scores + index_mask.view(b, 1, sq, sk)
-        index_scores = index_scores + index_mask
+        for q_start in range(0, sq, query_chunk_size):
+            q_end = min(q_start + query_chunk_size, sq)
+            chunk_len = q_end - q_start
+            query_chunk = query[:, :, q_start:q_end, :]
+            topk_indices_chunk = topk_indices[:, q_start:q_end, :]
+            gather_index = topk_indices_chunk[:, None, :, :, None].expand(
+                b, np, chunk_len, topk, hn
+            )
+            selected_key = torch.gather(
+                key[:, :, None, :, :].expand(b, np, chunk_len, sk, hn),
+                3,
+                gather_index,
+            )
+            selected_causal_mask = _build_selected_causal_mask(
+                topk_indices_chunk, query_start_position=q_start
+            ).unsqueeze(1)
+            teacher_scores = (
+                torch.einsum("bnsh,bnskh->bnsk", query_chunk.float(), selected_key.float())
+                * softmax_scale
+            )
+            teacher_scores = teacher_scores + selected_causal_mask
+            teacher_scores = torch.nn.functional.softmax(
+                teacher_scores, dim=-1, dtype=torch.float32
+            )
+            teacher_scores = teacher_scores.sum(dim=1)
+            if pg_collection.tp.size() > 1:
+                torch.distributed.all_reduce(teacher_scores.contiguous(), group=pg_collection.tp)
+            teacher_scores = teacher_scores / teacher_scores.sum(dim=-1, keepdim=True)
 
-    attention_scores = torch.nn.functional.softmax(attention_scores, dim=-1, dtype=torch.float32)
-    index_scores = torch.nn.functional.softmax(index_scores, dim=-1, dtype=torch.float32)
+            student_scores = torch.nn.functional.softmax(
+                index_scores[:, q_start:q_end, :].gather(-1, topk_indices_chunk),
+                dim=-1,
+                dtype=torch.float32,
+            )
+            kl_per_element = teacher_scores * (
+                torch.log(teacher_scores + 1e-10) - torch.log(student_scores + 1e-10)
+            )
+            total_kl = total_kl + kl_per_element.sum()
+            total_positions += b * chunk_len
 
-    attention_scores = attention_scores.sum(dim=1)
+        return total_kl / total_positions * loss_coeff
+    elif sparse_loss and sparse_loss_use_topk_only:
+        query = query.permute(1, 2, 0, 3)
+        key = key.permute(1, 2, 0, 3)
+        topk = topk_indices.size(-1)
+        gather_index = topk_indices[:, None, :, :, None].expand(b, np, sq, topk, hn)
+        selected_key = torch.gather(
+            key[:, :, None, :, :].expand(b, np, sq, sk, hn),
+            3,
+            gather_index,
+        )
+        selected_causal_mask = _build_selected_causal_mask(topk_indices).unsqueeze(1)
+        attention_scores = (
+            torch.einsum("bnsh,bnskh->bnsk", query.float(), selected_key.float()) * softmax_scale
+        )
+        attention_scores = attention_scores + selected_causal_mask
+        attention_scores = torch.nn.functional.softmax(
+            attention_scores, dim=-1, dtype=torch.float32
+        )
+        index_scores = torch.nn.functional.softmax(
+            index_scores.gather(-1, topk_indices), dim=-1, dtype=torch.float32
+        )
+        attention_scores = attention_scores.sum(dim=1)
+    else:
+        query = query.permute(1, 2, 0, 3).reshape(b * np, sq, hn)
+        key = key.permute(1, 2, 3, 0).reshape(b * np, hn, sk)
+        attention_scores = torch.bmm(query.float(), key.float()) * softmax_scale
+        attention_scores = attention_scores.reshape(b, np, sq, sk)
+
+        causal_mask = torch.triu(
+            torch.full((sq, sk), float('-inf'), dtype=torch.float32, device=attention_scores.device),
+            diagonal=1,
+        )
+        index_mask = torch.full(
+            (b, sq, sk), float("-inf"), dtype=torch.float32, device=attention_scores.device
+        ).scatter_(-1, topk_indices, 0)
+
+        attention_scores = attention_scores + causal_mask.view(1, 1, sq, sk)
+        if sparse_loss:
+            attention_scores = attention_scores + index_mask.view(b, 1, sq, sk)
+            index_scores = index_scores + index_mask
+
+        attention_scores = torch.nn.functional.softmax(attention_scores, dim=-1, dtype=torch.float32)
+        index_scores = torch.nn.functional.softmax(index_scores, dim=-1, dtype=torch.float32)
+
+        attention_scores = attention_scores.sum(dim=1)
+
     if pg_collection.tp.size() > 1:
         torch.distributed.all_reduce(attention_scores.contiguous(), group=pg_collection.tp)
     attention_scores = attention_scores / attention_scores.sum(dim=-1, keepdim=True)
@@ -620,6 +699,9 @@ class DSGQACoreAttention(MegatronModule):
             indexer_loss = None
             if indexer_loss_coeff > 0:
                 sparse_indexer_loss = getattr(self.config, "dsa_indexer_use_sparse_loss", False)
+                sparse_indexer_loss_use_topk_only = getattr(
+                    self.config, "dsa_indexer_sparse_loss_use_topk_only", False
+                )
                 recompute_indexer_loss = getattr(self.config, "dsa_indexer_loss_recompute", False)
                 query_detached = query.detach()
                 key_detached = key.detach()
@@ -634,6 +716,8 @@ class DSGQACoreAttention(MegatronModule):
                         indexer_loss_coeff,
                         sparse_indexer_loss,
                         self.indexer.pg_collection,
+                        sparse_indexer_loss_use_topk_only,
+                        getattr(self.config, "dsa_indexer_loss_query_chunk_size", None),
                     )
 
                 if recompute_indexer_loss and index_scores.requires_grad:
