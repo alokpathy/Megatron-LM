@@ -3030,21 +3030,13 @@ def train(
             params_norm = calc_params_l2_norm(model)
         writer = get_tensorboard_writer()
         wandb_writer = get_wandb_writer()
-        if (
-            grad_norm is not None
-            and iteration % args.tensorboard_log_interval == 0
-            and (writer or wandb_writer)
-        ):
+        if grad_norm is not None and iteration % args.tensorboard_log_interval == 0:
             indexer_grad_norm, non_indexer_grad_norm = calc_dsa_split_grad_norms(model, optimizer)
             indexer_grad_norm = reduce_max_stat_across_model_parallel_group(indexer_grad_norm)
             non_indexer_grad_norm = reduce_max_stat_across_model_parallel_group(
                 non_indexer_grad_norm
             )
-        if (
-            num_zeros_in_grad is not None
-            and iteration % args.tensorboard_log_interval == 0
-            and (writer or wandb_writer)
-        ):
+        if num_zeros_in_grad is not None and iteration % args.tensorboard_log_interval == 0:
             (
                 indexer_num_zeros_in_grad,
                 non_indexer_num_zeros_in_grad,
