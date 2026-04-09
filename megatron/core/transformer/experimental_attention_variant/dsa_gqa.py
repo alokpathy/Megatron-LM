@@ -824,6 +824,7 @@ class DSGQACoreAttention(MegatronModule):
                         indexer_loss = _compute_indexer_loss(index_scores)
                 DSAIndexerLossLoggingHelper.save_loss_to_tracker(
                     loss=indexer_loss,
+                    raw_loss=indexer_loss / indexer_loss_coeff,
                     layer_number=self.layer_number,
                     num_layers=self.config.num_layers,
                 )

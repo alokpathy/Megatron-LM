@@ -36,6 +36,7 @@ from megatron.training import get_args, get_timers, get_adlr_autoresume
 from megatron.core import mpu
 from megatron.core.datasets.utils import get_blend_from_list
 from megatron.core.tensor_parallel import param_is_not_tensor_parallel_duplicate
+from megatron.core.optimizer.clip_grads import count_zeros_fp32, get_grad_norm_fp32
 from megatron.core.utils import (
     get_batch_on_this_cp_rank,
     get_data_parallel_group_if_dtensor,
@@ -259,6 +260,126 @@ def reduce_max_stat_across_model_parallel_group(stat: float) -> float | None:
         return None
     else:
         return stat.item()
+
+
+@torch.no_grad()
+def calc_dsa_split_grad_norms(model, optimizer) -> tuple[float, float]:
+    """Calculate separate grad norms for DSA indexer params and all other params."""
+    if not isinstance(model, list):
+        model = [model]
+
+    if hasattr(optimizer, "chained_optimizers"):
+        indexer_norm_sq = 0.0
+        non_indexer_norm_sq = 0.0
+        for child_optimizer in optimizer.chained_optimizers:
+            child_indexer_norm, child_non_indexer_norm = calc_dsa_split_grad_norms(
+                model, child_optimizer
+            )
+            indexer_norm_sq += child_indexer_norm**2
+            non_indexer_norm_sq += child_non_indexer_norm**2
+        return indexer_norm_sq**0.5, non_indexer_norm_sq**0.5
+
+    optimizer_param_ids = {id(param) for param in optimizer.get_parameters()}
+    seen_param_ids = set()
+    tp_group = getattr(optimizer, 'tp_group', None)
+    use_decoupled_grad = optimizer.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8
+
+    indexer_grads = []
+    non_indexer_grads = []
+
+    for model_chunk in model:
+        for name, param in model_chunk.named_parameters():
+            param_id = id(param)
+            if param_id in seen_param_ids:
+                continue
+            seen_param_ids.add(param_id)
+
+            if param_id not in optimizer_param_ids:
+                continue
+
+            if getattr(param, "__fsdp_param__", False):
+                grad = param.grad._local_tensor if param.grad is not None else None
+            elif use_decoupled_grad:
+                grad = param.decoupled_grad if hasattr(param, "decoupled_grad") else None
+            else:
+                grad = param.grad
+
+            if grad is None:
+                continue
+            if not param_is_not_shared(param):
+                continue
+            if not param_is_not_tensor_parallel_duplicate(param, tp_group=tp_group):
+                continue
+
+            if name.startswith("indexer.") or ".indexer." in name:
+                indexer_grads.append(grad)
+            else:
+                non_indexer_grads.append(grad)
+
+    grad_stats_parallel_group = optimizer.get_grad_stats_parallel_group()
+    indexer_grad_norm = get_grad_norm_fp32(
+        indexer_grads, grad_stats_parallel_group=grad_stats_parallel_group
+    )
+    non_indexer_grad_norm = get_grad_norm_fp32(
+        non_indexer_grads, grad_stats_parallel_group=grad_stats_parallel_group
+    )
+    return indexer_grad_norm, non_indexer_grad_norm
+
+
+@torch.no_grad()
+def calc_dsa_split_grad_num_zeros(model, optimizer) -> tuple[float, float]:
+    """Calculate separate grad zero counts for DSA indexer params and all other params."""
+    if not isinstance(model, list):
+        model = [model]
+
+    if hasattr(optimizer, "chained_optimizers"):
+        indexer_num_zeros = 0.0
+        non_indexer_num_zeros = 0.0
+        for child_optimizer in optimizer.chained_optimizers:
+            child_indexer_num_zeros, child_non_indexer_num_zeros = calc_dsa_split_grad_num_zeros(
+                model, child_optimizer
+            )
+            indexer_num_zeros += child_indexer_num_zeros
+            non_indexer_num_zeros += child_non_indexer_num_zeros
+        return indexer_num_zeros, non_indexer_num_zeros
+
+    optimizer_param_ids = {id(param) for param in optimizer.get_parameters()}
+    seen_param_ids = set()
+
+    indexer_params = []
+    non_indexer_params = []
+
+    for model_chunk in model:
+        for name, param in model_chunk.named_parameters():
+            param_id = id(param)
+            if param_id in seen_param_ids:
+                continue
+            seen_param_ids.add(param_id)
+
+            if param_id not in optimizer_param_ids:
+                continue
+
+            if name.startswith("indexer.") or ".indexer." in name:
+                indexer_params.append(param)
+            else:
+                non_indexer_params.append(param)
+
+    grad_stats_parallel_group = optimizer.get_grad_stats_parallel_group()
+    use_decoupled_grad = optimizer.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8
+    tp_group = getattr(optimizer, 'tp_group', None)
+    indexer_num_zeros = count_zeros_fp32(
+        indexer_params,
+        grad_stats_parallel_group=grad_stats_parallel_group,
+        use_decoupled_grad=use_decoupled_grad,
+        tp_group=tp_group,
+    )
+    non_indexer_num_zeros = count_zeros_fp32(
+        non_indexer_params,
+        grad_stats_parallel_group=grad_stats_parallel_group,
+        use_decoupled_grad=use_decoupled_grad,
+        tp_group=tp_group,
+    )
+    return indexer_num_zeros, non_indexer_num_zeros
 
 
 def logical_and_across_model_parallel_group(input: bool) -> bool:
