@@ -279,13 +279,14 @@ def calc_dsa_split_grad_norms(model, optimizer) -> tuple[float, float]:
             non_indexer_norm_sq += child_non_indexer_norm**2
         return indexer_norm_sq**0.5, non_indexer_norm_sq**0.5
 
-    optimizer_param_ids = {id(param) for param in optimizer.get_parameters()}
-    seen_param_ids = set()
     tp_group = getattr(optimizer, 'tp_group', None)
     use_decoupled_grad = optimizer.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8
 
     indexer_grads = []
     non_indexer_grads = []
+
+    param_to_optim_param = _get_model_to_optimizer_param_map(optimizer)
+    seen_param_ids = set()
 
     for model_chunk in model:
         for name, param in model_chunk.named_parameters():
@@ -294,15 +295,18 @@ def calc_dsa_split_grad_norms(model, optimizer) -> tuple[float, float]:
                 continue
             seen_param_ids.add(param_id)
 
-            if param_id not in optimizer_param_ids:
+            optim_param = param_to_optim_param.get(param)
+            if optim_param is None:
                 continue
 
-            if getattr(param, "__fsdp_param__", False):
-                grad = param.grad._local_tensor if param.grad is not None else None
+            if getattr(optim_param, "__fsdp_param__", False):
+                grad = optim_param.grad._local_tensor if optim_param.grad is not None else None
             elif use_decoupled_grad:
-                grad = param.decoupled_grad if hasattr(param, "decoupled_grad") else None
+                grad = (
+                    optim_param.decoupled_grad if hasattr(optim_param, "decoupled_grad") else None
+                )
             else:
-                grad = param.grad
+                grad = optim_param.grad
 
             if grad is None:
                 continue
@@ -343,7 +347,7 @@ def calc_dsa_split_grad_num_zeros(model, optimizer) -> tuple[float, float]:
             non_indexer_num_zeros += child_non_indexer_num_zeros
         return indexer_num_zeros, non_indexer_num_zeros
 
-    optimizer_param_ids = {id(param) for param in optimizer.get_parameters()}
+    param_to_optim_param = _get_model_to_optimizer_param_map(optimizer)
     seen_param_ids = set()
 
     indexer_params = []
@@ -356,13 +360,14 @@ def calc_dsa_split_grad_num_zeros(model, optimizer) -> tuple[float, float]:
                 continue
             seen_param_ids.add(param_id)
 
-            if param_id not in optimizer_param_ids:
+            optim_param = param_to_optim_param.get(param)
+            if optim_param is None:
                 continue
 
             if name.startswith("indexer.") or ".indexer." in name:
-                indexer_params.append(param)
+                indexer_params.append(optim_param)
             else:
-                non_indexer_params.append(param)
+                non_indexer_params.append(optim_param)
 
     grad_stats_parallel_group = optimizer.get_grad_stats_parallel_group()
     use_decoupled_grad = optimizer.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8
@@ -380,6 +385,43 @@ def calc_dsa_split_grad_num_zeros(model, optimizer) -> tuple[float, float]:
         tp_group=tp_group,
     )
     return indexer_num_zeros, non_indexer_num_zeros
+
+
+def _get_model_to_optimizer_param_map(optimizer) -> dict:
+    """Map model params to the optimizer params that own their gradients."""
+    param_map = {}
+
+    if hasattr(optimizer, "model_float16_groups"):
+        if optimizer.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
+            _add_param_group_mapping(param_map, optimizer.model_float16_groups, optimizer.shard_float16_groups)
+        else:
+            _add_param_group_mapping(
+                param_map, optimizer.model_float16_groups, optimizer.shard_fp32_from_float16_groups
+            )
+        _add_param_group_mapping(param_map, optimizer.model_fp32_groups, optimizer.shard_fp32_groups)
+        return param_map
+
+    for param in optimizer.get_parameters():
+        param_map[param] = param
+
+    for group in getattr(optimizer, "float16_groups", []):
+        for param in group:
+            main_param = getattr(param, "main_param", None)
+            if main_param is not None:
+                param_map[param] = main_param
+
+    for group in getattr(optimizer, "fp32_from_fp32_groups", []):
+        for param in group:
+            param_map[param] = param
+
+    return param_map
+
+
+def _add_param_group_mapping(param_map: dict, model_groups: list, optim_groups: list):
+    """Add aligned model-param to optimizer-param group mappings."""
+    for model_group, optim_group in zip(model_groups, optim_groups):
+        for model_param, optim_param in zip(model_group, optim_group):
+            param_map[model_param] = optim_param
 
 
 def logical_and_across_model_parallel_group(input: bool) -> bool:
