@@ -3029,6 +3029,13 @@ def _add_experimental_attention_variant_args(parser):
         help='Number of source tokens selected per query token by DSA.',
     )
     _maybe_add_argument(
+        '--dsa-kernel-backend',
+        type=str,
+        default='reference',
+        choices=['reference', 'triton-min-memory'],
+        help='DSA-GQA backend. triton-min-memory recomputes DSA routing and sparse attention.',
+    )
+    _maybe_add_argument(
         '--dsa-indexer-topk-key-chunk-size',
         type=int,
         default=None,

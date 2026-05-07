@@ -1436,7 +1436,7 @@ def load_args_from_checkpoint(
             print_rank_0(f"Checkpoint did not provide arguments {arg_name}")
 
     # Model args.
-    _set_arg('num_layers')
+    # _set_arg('num_layers')
     _set_arg('hidden_size')
     _set_arg('ffn_hidden_size')
     _set_arg('seq_length')
@@ -1465,6 +1465,7 @@ def load_args_from_checkpoint(
     _set_arg('dsa_indexer_n_heads', force=True)
     _set_arg('dsa_indexer_head_dim', force=True)
     _set_arg('dsa_indexer_topk', force=True)
+    # _set_arg('dsa_kernel_backend', force=True)
     _set_arg('dsa_indexer_topk_key_chunk_size', force=True)
     _set_arg('dsa_indexer_topk_recompute', force=True)
     _set_arg('dsa_indexer_loss_coeff', force=True)

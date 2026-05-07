@@ -286,6 +286,9 @@ class TransformerConfig(ModelParallelConfig):
     dsa_indexer_topk: Optional[int] = None
     """Number of top-k tokens to select in DSA indexer."""
 
+    dsa_kernel_backend: Literal['reference', 'triton-min-memory'] = 'reference'
+    """DSA-GQA kernel backend. The min-memory backend recomputes routing and attention."""
+
     dsa_indexer_topk_key_chunk_size: Optional[int] = None
     """Optional key chunk size for exact streamed DSA top-k routing. If unset, use dense routing."""
 
@@ -2182,6 +2185,9 @@ class TransformerConfig(ModelParallelConfig):
                 self.dsa_indexer_topk_key_chunk_size is None
                 or self.dsa_indexer_topk_key_chunk_size > 0
             ), "dsa_indexer_topk_key_chunk_size must be a positive integer when set."
+            assert self.dsa_kernel_backend in ('reference', 'triton-min-memory'), (
+                "dsa_kernel_backend must be either 'reference' or 'triton-min-memory'."
+            )
             assert (
                 not self.dsa_indexer_sparse_loss_use_topk_only or self.dsa_indexer_use_sparse_loss
             ), (
@@ -2214,9 +2220,10 @@ class TransformerConfig(ModelParallelConfig):
             assert (
                 self.dsa_sparse_attention_query_chunk_size is None
                 or self.dsa_sparse_attention_use_gather
+                or self.dsa_kernel_backend == 'triton-min-memory'
             ), (
                 "dsa_sparse_attention_query_chunk_size requires "
-                "dsa_sparse_attention_use_gather."
+                "dsa_sparse_attention_use_gather or dsa_kernel_backend='triton-min-memory'."
             )
             assert (
                 self.context_parallel_size == 1
@@ -2225,6 +2232,15 @@ class TransformerConfig(ModelParallelConfig):
                 "Currently sequence parallelism is not supported by DSAttention."
             )
             assert not self.apply_rope_fusion, "RoPE fusion is not supported for DSAttention"
+            if self.dsa_kernel_backend == 'triton-min-memory':
+                assert self.dsa_indexer_use_sparse_loss, (
+                    "dsa_kernel_backend='triton-min-memory' requires "
+                    "dsa_indexer_use_sparse_loss."
+                )
+                assert self.dsa_indexer_use_hadamard, (
+                    "dsa_kernel_backend='triton-min-memory' requires "
+                    "dsa_indexer_use_hadamard to match the DeepSeek indexer."
+                )
 
         if self.inference_fuse_tp_communication:
             assert self.transformer_impl == "inference_optimized", (

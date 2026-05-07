@@ -28,6 +28,9 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
     fused_qk_topk_naive,
     rotate_activation,
 )
+from megatron.core.transformer.experimental_attention_variant.dsa_min_memory import (
+    dsa_min_memory_gqa,
+)
 from megatron.core.utils import is_using_quantization_scales
 
 
@@ -272,7 +275,19 @@ def _dense_grouped_dsa_fn(
             torch.full((sq, skv), float("-inf"), dtype=torch.float32, device=index_mask.device),
             diagonal=1,
         )
-    index_mask = index_mask + mask.view(1, sq, skv)
+    elif mask.dtype == torch.bool:
+        mask = torch.zeros(
+            mask.shape,
+            dtype=torch.float32,
+            device=mask.device,
+        ).masked_fill(mask, float("-inf"))
+    else:
+        mask = mask.to(dtype=torch.float32, device=index_mask.device)
+    if mask.dim() == 2:
+        mask = mask.view(1, sq, skv)
+    else:
+        assert mask.shape == (b, sq, skv), "mask shape must be [sq, skv] or [b, sq, skv]"
+    index_mask = index_mask + mask
     attention_scores = attention_scores + index_mask.unsqueeze(1)
     attention_scores = torch.nn.functional.softmax(attention_scores, dim=-1, dtype=torch.float32)
 
@@ -692,6 +707,20 @@ class DSGQACoreAttention(MegatronModule):
 
         sq, b, _, _ = query.size()
         skv = key.size(0)
+        dsa_kernel_backend = getattr(self.config, "dsa_kernel_backend", "reference")
+        if dsa_kernel_backend == "triton-min-memory":
+            return self._forward_min_memory(
+                query=query,
+                key=key,
+                value=value,
+                attention_mask=attention_mask,
+                hidden_states=hidden_states,
+                use_indexer_rope=use_indexer_rope,
+                attn_mask_type=attn_mask_type,
+                attention_bias=attention_bias,
+                packed_seq_params=packed_seq_params,
+            )
+
         sparse_attention_use_gather = getattr(self.config, "dsa_sparse_attention_use_gather", False)
 
         hidden_states = hidden_states.detach()
@@ -893,6 +922,90 @@ class DSGQACoreAttention(MegatronModule):
             query_chunk_size=getattr(self.config, "dsa_sparse_attention_query_chunk_size", None),
             use_gather=sparse_attention_use_gather,
         )
+
+    def _forward_min_memory(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attention_mask: torch.Tensor,
+        hidden_states: torch.Tensor,
+        use_indexer_rope: bool = False,
+        attn_mask_type: AttnMaskType = None,
+        attention_bias: torch.Tensor = None,
+        packed_seq_params: PackedSeqParams = None,
+    ) -> torch.Tensor:
+        """Training-only minimum-activation DSA-GQA path."""
+        del attention_mask
+        assert attention_bias is None, "attention_bias is not supported for DSA-GQA."
+        assert packed_seq_params is None, "Packed sequence is not supported for DSA-GQA."
+        if not self.training or not torch.is_grad_enabled():
+            raise NotImplementedError(
+                "dsa_kernel_backend='triton-min-memory' currently supports training only."
+            )
+        if attn_mask_type != AttnMaskType.causal:
+            raise NotImplementedError(
+                "dsa_kernel_backend='triton-min-memory' only supports causal fixed-length batches."
+            )
+        if query.size(0) != key.size(0) or key.size(0) != hidden_states.size(0):
+            raise NotImplementedError(
+                "dsa_kernel_backend='triton-min-memory' requires full-sequence self attention."
+            )
+        if getattr(self.config, "dsa_sparse_attention_use_gather", False):
+            raise NotImplementedError(
+                "dsa_kernel_backend='triton-min-memory' bypasses the reference gather backend; "
+                "do not set dsa_sparse_attention_use_gather."
+            )
+        if not getattr(self.config, "dsa_indexer_use_sparse_loss", False):
+            raise NotImplementedError(
+                "dsa_kernel_backend='triton-min-memory' requires dsa_indexer_use_sparse_loss."
+            )
+        if not getattr(self.config, "dsa_indexer_use_hadamard", False):
+            raise NotImplementedError(
+                "dsa_kernel_backend='triton-min-memory' requires dsa_indexer_use_hadamard."
+            )
+        if self.config.fp8 is not None or self.config.fp8_param or is_using_quantization_scales(
+            self.config
+        ):
+            raise NotImplementedError(
+                "dsa_kernel_backend='triton-min-memory' does not yet support quantized/FP8 "
+                "indexer projections."
+            )
+        if self.config.layernorm_zero_centered_gamma:
+            raise NotImplementedError(
+                "dsa_kernel_backend='triton-min-memory' does not yet support "
+                "layernorm_zero_centered_gamma in the DSA indexer norm."
+            )
+
+        indexer_loss_coeff = getattr(self.config, "dsa_indexer_loss_coeff", 0.0) or 0.0
+        if indexer_loss_coeff <= 0:
+            raise NotImplementedError(
+                "dsa_kernel_backend='triton-min-memory' expects dsa_indexer_loss_coeff > 0 "
+                "for indexer training."
+            )
+
+        output, indexer_loss = dsa_min_memory_gqa(
+            query=query,
+            key=key,
+            value=value,
+            hidden_states=hidden_states.detach(),
+            indexer=self.indexer,
+            softmax_scale=self.softmax_scale,
+            loss_coeff=indexer_loss_coeff,
+            use_indexer_rope=use_indexer_rope,
+            query_chunk_size=(
+                getattr(self.config, "dsa_sparse_attention_query_chunk_size", None)
+                or getattr(self.config, "dsa_indexer_loss_query_chunk_size", None)
+            ),
+            key_chunk_size=getattr(self.config, "dsa_indexer_topk_key_chunk_size", None),
+        )
+        DSAIndexerLossLoggingHelper.save_loss_to_tracker(
+            loss=indexer_loss,
+            raw_loss=indexer_loss / indexer_loss_coeff,
+            layer_number=self.layer_number,
+            num_layers=self.config.num_layers,
+        )
+        return DSAIndexerLossAutoScaler.apply(output, indexer_loss)
 
     def forward_dynamic(
         self,

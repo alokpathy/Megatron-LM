@@ -1,6 +1,9 @@
 import torch
+import torch.nn.functional as F
 import torch.utils.checkpoint as torch_checkpoint
+import pytest
 
+from megatron.core.models.common.embeddings.rope_utils import _apply_rotary_pos_emb_bshd
 from megatron.core.models.mamba.mamba_layer_specs import mamba_stack_spec
 from megatron.core.transformer.experimental_attention_variant.dsa import (
     fused_qk_topk_chunked,
@@ -12,6 +15,11 @@ from megatron.core.transformer.experimental_attention_variant.dsa_gqa import (
     compute_gqa_dsa_indexer_loss,
     unfused_grouped_dsa_fn,
 )
+from megatron.core.transformer.experimental_attention_variant.dsa_min_memory import (
+    DSAMinMemoryGQAFn,
+    _forward_min_memory_impl,
+)
+from megatron.core.transformer.transformer_config import TransformerConfig
 
 
 class _DummyTPGroup:
@@ -23,9 +31,439 @@ class _DummyPGCollection:
     tp = _DummyTPGroup()
 
 
+class _DummyRotary:
+    def __init__(self, rotary_dim: int, rotary_interleaved: bool = False):
+        self.inv_freq = 1.0 / (
+            10000 ** (torch.arange(0, rotary_dim, 2, dtype=torch.float32) / rotary_dim)
+        )
+        self.rotary_interleaved = rotary_interleaved
+        self.seq_len_interpolation_factor = None
+
+
 def test_mamba_stack_spec_uses_dsa_grouped_self_attention():
     attention_module = mamba_stack_spec.submodules.attention_layer.submodules.self_attention.module
     assert attention_module is DSGroupedSelfAttention
+
+
+def _causal_mask(seqlen: int, device: torch.device):
+    return torch.triu(
+        torch.full((seqlen, seqlen), float("-inf"), dtype=torch.float32, device=device),
+        diagonal=1,
+    )
+
+
+def _causal_index_scores(index_scores: torch.Tensor):
+    masked_scores = index_scores + _causal_mask(
+        index_scores.size(1), index_scores.device
+    ).view(1, index_scores.size(1), index_scores.size(2))
+    return masked_scores.detach().requires_grad_(index_scores.requires_grad)
+
+
+def _random_topk_indices(batch_size: int, seqlen: int, topk: int):
+    return torch.randn(batch_size, seqlen, seqlen).topk(topk, dim=-1).indices
+
+
+def _rotary_freqs(rotary, seqlen: int, rotary_dim: int):
+    positions = torch.arange(seqlen, dtype=rotary.inv_freq.dtype, device=rotary.inv_freq.device)
+    freqs = torch.outer(positions, rotary.inv_freq[: rotary_dim // 2])
+    if not rotary.rotary_interleaved:
+        freqs = torch.cat((freqs, freqs), dim=-1)
+    else:
+        freqs = torch.stack((freqs, freqs), dim=-1).flatten(start_dim=-2)
+    return freqs[:, None, None, :]
+
+
+def _apply_reference_indexer_rope(
+    x: torch.Tensor, rotary, config_rotary_interleaved: bool, rotary_dim: int
+):
+    x_nope, x_pe = torch.split(x, [x.size(-1) - rotary_dim, rotary_dim], dim=-1)
+    x_pe = _apply_rotary_pos_emb_bshd(
+        x_pe,
+        _rotary_freqs(rotary, x.size(0), rotary_dim),
+        rotary_interleaved=config_rotary_interleaved,
+        multi_latent_attention=False,
+        mscale=1.0,
+    )
+    return torch.cat([x_nope, x_pe], dim=-1)
+
+
+def test_transformer_config_accepts_min_memory_backend():
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=32,
+        num_attention_heads=4,
+        experimental_attention_variant="dsa",
+        dsa_indexer_n_heads=2,
+        dsa_indexer_head_dim=8,
+        dsa_indexer_topk=4,
+        dsa_kernel_backend="triton-min-memory",
+        dsa_indexer_loss_coeff=0.1,
+        dsa_indexer_use_sparse_loss=True,
+        dsa_indexer_sparse_loss_use_topk_only=True,
+        dsa_sparse_attention_query_chunk_size=2,
+        dsa_indexer_use_hadamard=True,
+    )
+
+    assert config.dsa_kernel_backend == "triton-min-memory"
+
+
+def test_transformer_config_min_memory_accepts_sparse_loss_without_topk_only_flag():
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=32,
+        num_attention_heads=4,
+        experimental_attention_variant="dsa",
+        dsa_indexer_n_heads=2,
+        dsa_indexer_head_dim=8,
+        dsa_indexer_topk=4,
+        dsa_kernel_backend="triton-min-memory",
+        dsa_indexer_loss_coeff=0.1,
+        dsa_indexer_use_sparse_loss=True,
+        dsa_indexer_use_hadamard=True,
+    )
+
+    assert config.dsa_indexer_use_sparse_loss
+    assert not config.dsa_indexer_sparse_loss_use_topk_only
+
+
+def test_transformer_config_min_memory_requires_sparse_loss():
+    with pytest.raises(AssertionError, match="dsa_indexer_use_sparse_loss"):
+        TransformerConfig(
+            num_layers=1,
+            hidden_size=32,
+            num_attention_heads=4,
+            experimental_attention_variant="dsa",
+            dsa_indexer_n_heads=2,
+            dsa_indexer_head_dim=8,
+            dsa_indexer_topk=4,
+            dsa_kernel_backend="triton-min-memory",
+            dsa_indexer_loss_coeff=0.1,
+            dsa_indexer_use_hadamard=True,
+        )
+
+
+def test_min_memory_impl_matches_reference_forward_and_loss():
+    torch.manual_seed(123)
+
+    batch_size = 2
+    seqlen = 6
+    hidden_size = 16
+    num_heads = 4
+    num_query_groups = 2
+    head_dim = 8
+    index_heads = 2
+    index_head_dim = 4
+    topk = 3
+    loss_coeff = 0.7
+
+    hidden_states = torch.randn(seqlen, batch_size, hidden_size)
+    query = torch.randn(seqlen, batch_size, num_heads, head_dim)
+    key = torch.randn(seqlen, batch_size, num_query_groups, head_dim)
+    value = torch.randn(seqlen, batch_size, num_query_groups, head_dim)
+    linear_q_weight = torch.randn(index_heads * index_head_dim, hidden_size)
+    linear_k_weight = torch.randn(index_head_dim, hidden_size)
+    k_norm_weight = torch.randn(index_head_dim)
+    k_norm_bias = torch.randn(index_head_dim)
+    linear_weights_weight = torch.randn(index_heads, hidden_size)
+    pg_collection = _DummyPGCollection()
+
+    q_index = F.linear(hidden_states, linear_q_weight).reshape(
+        seqlen, batch_size, index_heads, index_head_dim
+    )
+    k_index = F.layer_norm(
+        F.linear(hidden_states, linear_k_weight),
+        (index_head_dim,),
+        k_norm_weight,
+        k_norm_bias,
+    )
+    weights = F.linear(hidden_states, linear_weights_weight)
+    weights = weights * (index_heads**-0.5) * (index_head_dim**-0.5)
+    index_scores, topk_indices = fused_qk_topk_naive(
+        q_index, k_index, weights, topk, _causal_mask(seqlen, hidden_states.device)
+    )
+    reference_output = unfused_grouped_dsa_fn(
+        query,
+        key,
+        value,
+        topk_indices,
+        head_dim**-0.5,
+        use_gather=True,
+    )
+    reference_loss = compute_gqa_dsa_indexer_loss(
+        index_scores=None,
+        topk_indices=topk_indices,
+        query=query,
+        key=key,
+        softmax_scale=head_dim**-0.5,
+        loss_coeff=loss_coeff,
+        sparse_loss=True,
+        pg_collection=pg_collection,
+        sparse_loss_use_topk_only=True,
+        selected_index_scores=index_scores.gather(-1, topk_indices),
+    )
+
+    output, loss = _forward_min_memory_impl(
+        query,
+        key,
+        value,
+        hidden_states,
+        linear_q_weight,
+        linear_k_weight,
+        k_norm_weight,
+        k_norm_bias,
+        True,
+        linear_weights_weight,
+        1e-5,
+        index_heads,
+        index_head_dim,
+        topk,
+        0,
+        None,
+        False,
+        False,
+        head_dim**-0.5,
+        loss_coeff,
+        2,
+        3,
+        pg_collection,
+        compute_loss=True,
+    )
+
+    torch.testing.assert_close(output, reference_output)
+    torch.testing.assert_close(loss, reference_loss)
+
+
+def test_min_memory_impl_matches_reference_rope_interleaved_layout():
+    torch.manual_seed(123)
+
+    batch_size = 2
+    seqlen = 6
+    hidden_size = 14
+    num_heads = 4
+    num_query_groups = 2
+    head_dim = 4
+    index_heads = 2
+    index_head_dim = 6
+    rotary_dim = 4
+    topk = 3
+    loss_coeff = 0.7
+    config_rotary_interleaved = True
+
+    hidden_states = torch.randn(seqlen, batch_size, hidden_size)
+    query = torch.randn(seqlen, batch_size, num_heads, head_dim)
+    key = torch.randn(seqlen, batch_size, num_query_groups, head_dim)
+    value = torch.randn(seqlen, batch_size, num_query_groups, head_dim)
+    linear_q_weight = torch.randn(index_heads * index_head_dim, hidden_size)
+    linear_k_weight = torch.randn(index_head_dim, hidden_size)
+    k_norm_weight = torch.randn(index_head_dim)
+    k_norm_bias = torch.randn(index_head_dim)
+    linear_weights_weight = torch.randn(index_heads, hidden_size)
+    pg_collection = _DummyPGCollection()
+    rotary = _DummyRotary(rotary_dim, rotary_interleaved=False)
+
+    q_index = F.linear(hidden_states, linear_q_weight).reshape(
+        seqlen, batch_size, index_heads, index_head_dim
+    )
+    q_index = _apply_reference_indexer_rope(
+        q_index, rotary, config_rotary_interleaved, rotary_dim
+    )
+    k_index = F.layer_norm(
+        F.linear(hidden_states, linear_k_weight),
+        (index_head_dim,),
+        k_norm_weight,
+        k_norm_bias,
+    ).reshape(seqlen, batch_size, 1, index_head_dim)
+    k_index = _apply_reference_indexer_rope(
+        k_index, rotary, config_rotary_interleaved, rotary_dim
+    ).reshape(seqlen, batch_size, index_head_dim)
+    weights = F.linear(hidden_states, linear_weights_weight)
+    weights = weights * (index_heads**-0.5) * (index_head_dim**-0.5)
+
+    index_scores, topk_indices = fused_qk_topk_naive(
+        q_index, k_index, weights, topk, _causal_mask(seqlen, hidden_states.device)
+    )
+    reference_output = unfused_grouped_dsa_fn(
+        query,
+        key,
+        value,
+        topk_indices,
+        head_dim**-0.5,
+        use_gather=True,
+    )
+    reference_loss = compute_gqa_dsa_indexer_loss(
+        index_scores=None,
+        topk_indices=topk_indices,
+        query=query,
+        key=key,
+        softmax_scale=head_dim**-0.5,
+        loss_coeff=loss_coeff,
+        sparse_loss=True,
+        pg_collection=pg_collection,
+        sparse_loss_use_topk_only=True,
+        selected_index_scores=index_scores.gather(-1, topk_indices),
+    )
+
+    output, loss = _forward_min_memory_impl(
+        query,
+        key,
+        value,
+        hidden_states,
+        linear_q_weight,
+        linear_k_weight,
+        k_norm_weight,
+        k_norm_bias,
+        True,
+        linear_weights_weight,
+        1e-5,
+        index_heads,
+        index_head_dim,
+        topk,
+        rotary_dim,
+        rotary,
+        True,
+        False,
+        head_dim**-0.5,
+        loss_coeff,
+        2,
+        3,
+        pg_collection,
+        compute_loss=True,
+        rotary_interleaved=config_rotary_interleaved,
+    )
+
+    torch.testing.assert_close(output, reference_output)
+    torch.testing.assert_close(loss, reference_loss)
+
+
+def test_min_memory_impl_matches_reference_gradients():
+    torch.manual_seed(123)
+
+    batch_size = 2
+    seqlen = 5
+    hidden_size = 12
+    num_heads = 4
+    num_query_groups = 2
+    head_dim = 4
+    index_heads = 2
+    index_head_dim = 4
+    topk = 3
+    loss_coeff = 0.7
+    pg_collection = _DummyPGCollection()
+
+    def _make_tensors():
+        hidden_states = torch.randn(seqlen, batch_size, hidden_size)
+        query = torch.randn(seqlen, batch_size, num_heads, head_dim, requires_grad=True)
+        key = torch.randn(seqlen, batch_size, num_query_groups, head_dim, requires_grad=True)
+        value = torch.randn(seqlen, batch_size, num_query_groups, head_dim, requires_grad=True)
+        linear_q_weight = torch.randn(
+            index_heads * index_head_dim, hidden_size, requires_grad=True
+        )
+        linear_k_weight = torch.randn(index_head_dim, hidden_size, requires_grad=True)
+        k_norm_weight = torch.randn(index_head_dim, requires_grad=True)
+        k_norm_bias = torch.randn(index_head_dim, requires_grad=True)
+        linear_weights_weight = torch.randn(index_heads, hidden_size, requires_grad=True)
+        return (
+            hidden_states,
+            query,
+            key,
+            value,
+            linear_q_weight,
+            linear_k_weight,
+            k_norm_weight,
+            k_norm_bias,
+            linear_weights_weight,
+        )
+
+    min_tensors = _make_tensors()
+    ref_tensors = tuple(t.detach().clone().requires_grad_(t.requires_grad) for t in min_tensors)
+
+    (
+        hidden_states,
+        query,
+        key,
+        value,
+        linear_q_weight,
+        linear_k_weight,
+        k_norm_weight,
+        k_norm_bias,
+        linear_weights_weight,
+    ) = min_tensors
+    output, loss = DSAMinMemoryGQAFn.apply(
+        query,
+        key,
+        value,
+        hidden_states,
+        linear_q_weight,
+        linear_k_weight,
+        k_norm_weight,
+        k_norm_bias,
+        linear_weights_weight,
+        True,
+        1e-5,
+        index_heads,
+        index_head_dim,
+        topk,
+        0,
+        None,
+        False,
+        False,
+        head_dim**-0.5,
+        loss_coeff,
+        2,
+        3,
+        pg_collection,
+    )
+    (output.sum() + loss).backward()
+
+    (
+        ref_hidden_states,
+        ref_query,
+        ref_key,
+        ref_value,
+        ref_linear_q_weight,
+        ref_linear_k_weight,
+        ref_k_norm_weight,
+        ref_k_norm_bias,
+        ref_linear_weights_weight,
+    ) = ref_tensors
+    q_index = F.linear(ref_hidden_states, ref_linear_q_weight).reshape(
+        seqlen, batch_size, index_heads, index_head_dim
+    )
+    k_index = F.layer_norm(
+        F.linear(ref_hidden_states, ref_linear_k_weight),
+        (index_head_dim,),
+        ref_k_norm_weight,
+        ref_k_norm_bias,
+    )
+    weights = F.linear(ref_hidden_states, ref_linear_weights_weight)
+    weights = weights * (index_heads**-0.5) * (index_head_dim**-0.5)
+    index_scores, topk_indices = fused_qk_topk_naive(
+        q_index, k_index, weights, topk, _causal_mask(seqlen, ref_hidden_states.device)
+    )
+    ref_output = unfused_grouped_dsa_fn(
+        ref_query,
+        ref_key,
+        ref_value,
+        topk_indices,
+        head_dim**-0.5,
+        use_gather=True,
+    )
+    ref_loss = compute_gqa_dsa_indexer_loss(
+        index_scores=None,
+        topk_indices=topk_indices,
+        query=ref_query.detach(),
+        key=ref_key.detach(),
+        softmax_scale=head_dim**-0.5,
+        loss_coeff=loss_coeff,
+        sparse_loss=True,
+        pg_collection=pg_collection,
+        sparse_loss_use_topk_only=True,
+        selected_index_scores=index_scores.gather(-1, topk_indices),
+    )
+    (ref_output.sum() + ref_loss).backward()
+
+    for min_tensor, ref_tensor in zip(min_tensors[1:], ref_tensors[1:]):
+        torch.testing.assert_close(min_tensor.grad, ref_tensor.grad)
 
 
 def test_compute_gqa_dsa_indexer_loss_dense_and_sparse():
@@ -38,7 +476,9 @@ def test_compute_gqa_dsa_indexer_loss_dense_and_sparse():
     head_dim = 16
     topk = 4
 
-    index_scores = torch.randn(batch_size, seqlen, seqlen, dtype=torch.float32)
+    index_scores = _causal_index_scores(
+        torch.randn(batch_size, seqlen, seqlen, dtype=torch.float32)
+    )
     topk_indices = index_scores.topk(topk, dim=-1).indices
     query = torch.randn(seqlen, batch_size, num_heads, head_dim, dtype=torch.float32)
     key = torch.randn(seqlen, batch_size, num_query_groups, head_dim, dtype=torch.float32)
@@ -81,8 +521,8 @@ def test_compute_gqa_dsa_indexer_loss_sparse_topk_only_matches_reference():
     head_dim = 16
     topk = 4
 
-    index_scores = torch.randn(
-        batch_size, seqlen, seqlen, dtype=torch.float32, requires_grad=True
+    index_scores = _causal_index_scores(
+        torch.randn(batch_size, seqlen, seqlen, dtype=torch.float32, requires_grad=True)
     )
     topk_indices = index_scores.detach().topk(topk, dim=-1).indices
     query = torch.randn(seqlen, batch_size, num_heads, head_dim, dtype=torch.float32)
@@ -131,8 +571,8 @@ def test_compute_gqa_dsa_indexer_loss_sparse_topk_only_chunked_matches_unchunked
     head_dim = 16
     topk = 4
 
-    index_scores = torch.randn(
-        batch_size, seqlen, seqlen, dtype=torch.float32, requires_grad=True
+    index_scores = _causal_index_scores(
+        torch.randn(batch_size, seqlen, seqlen, dtype=torch.float32, requires_grad=True)
     )
     topk_indices = index_scores.detach().topk(topk, dim=-1).indices
     query = torch.randn(seqlen, batch_size, num_heads, head_dim, dtype=torch.float32)
@@ -183,8 +623,8 @@ def test_compute_gqa_dsa_indexer_loss_sparse_topk_only_selected_scores_matches_r
     head_dim = 16
     topk = 4
 
-    index_scores = torch.randn(
-        batch_size, seqlen, seqlen, dtype=torch.float32, requires_grad=True
+    index_scores = _causal_index_scores(
+        torch.randn(batch_size, seqlen, seqlen, dtype=torch.float32, requires_grad=True)
     )
     topk_indices = index_scores.detach().topk(topk, dim=-1).indices
     selected_index_scores = (
@@ -236,8 +676,8 @@ def test_compute_gqa_dsa_indexer_loss_sparse_topk_only_selected_scores_chunked_m
     head_dim = 16
     topk = 4
 
-    index_scores = torch.randn(
-        batch_size, seqlen, seqlen, dtype=torch.float32, requires_grad=True
+    index_scores = _causal_index_scores(
+        torch.randn(batch_size, seqlen, seqlen, dtype=torch.float32, requires_grad=True)
     )
     topk_indices = index_scores.detach().topk(topk, dim=-1).indices
     selected_index_scores = (
@@ -294,7 +734,7 @@ def test_unfused_grouped_dsa_fn_output_shape():
     query = torch.randn(seqlen, batch_size, num_heads, head_dim, dtype=torch.float32)
     key = torch.randn(seqlen, batch_size, num_query_groups, head_dim, dtype=torch.float32)
     value = torch.randn(seqlen, batch_size, num_query_groups, head_dim, dtype=torch.float32)
-    topk_indices = torch.randint(0, seqlen, (batch_size, seqlen, topk))
+    topk_indices = _random_topk_indices(batch_size, seqlen, topk)
 
     output = unfused_grouped_dsa_fn(
         query=query,
@@ -327,7 +767,7 @@ def test_unfused_grouped_dsa_fn_matches_dense_reference():
     value = torch.randn(
         seqlen, batch_size, num_query_groups, head_dim, dtype=torch.float32, requires_grad=True
     )
-    topk_indices = torch.randint(0, seqlen, (batch_size, seqlen, topk))
+    topk_indices = _random_topk_indices(batch_size, seqlen, topk)
     mask = torch.zeros(batch_size, seqlen, seqlen, dtype=torch.float32)
     mask[:, :, -1] = float("-inf")
 
@@ -382,7 +822,7 @@ def test_unfused_grouped_dsa_fn_gather_bool_mask_matches_dense_float_mask():
     value = torch.randn(
         seqlen, batch_size, num_query_groups, head_dim, dtype=torch.float32, requires_grad=True
     )
-    topk_indices = torch.randint(0, seqlen, (batch_size, seqlen, topk))
+    topk_indices = _random_topk_indices(batch_size, seqlen, topk)
     bool_mask = torch.zeros(batch_size, seqlen, seqlen, dtype=torch.bool)
     bool_mask[:, :, -1] = True
     float_mask = torch.zeros(batch_size, seqlen, seqlen, dtype=torch.float32).masked_fill(
@@ -440,7 +880,7 @@ def test_unfused_grouped_dsa_fn_chunked_matches_unchunked():
     value = torch.randn(
         seqlen, batch_size, num_query_groups, head_dim, dtype=torch.float32, requires_grad=True
     )
-    topk_indices = torch.randint(0, seqlen, (batch_size, seqlen, topk))
+    topk_indices = _random_topk_indices(batch_size, seqlen, topk)
     mask = torch.zeros(batch_size, seqlen, seqlen, dtype=torch.float32)
     mask[:, :, -1] = float("-inf")
 
@@ -497,7 +937,7 @@ def test_unfused_grouped_dsa_fn_recompute_matches_normal():
     value = torch.randn(
         seqlen, batch_size, num_query_groups, head_dim, dtype=torch.float32, requires_grad=True
     )
-    topk_indices = torch.randint(0, seqlen, (batch_size, seqlen, topk))
+    topk_indices = _random_topk_indices(batch_size, seqlen, topk)
     mask = torch.zeros(batch_size, seqlen, seqlen, dtype=torch.float32)
     mask[:, :, -1] = float("-inf")
 
@@ -562,7 +1002,7 @@ def test_unfused_grouped_dsa_fn_gather_recompute_matches_normal():
     value = torch.randn(
         seqlen, batch_size, num_query_groups, head_dim, dtype=torch.float32, requires_grad=True
     )
-    topk_indices = torch.randint(0, seqlen, (batch_size, seqlen, topk))
+    topk_indices = _random_topk_indices(batch_size, seqlen, topk)
     mask = torch.zeros(batch_size, seqlen, seqlen, dtype=torch.bool)
     mask[:, :, -1] = True
 
@@ -660,8 +1100,8 @@ def test_fused_qk_topk_chunked_matches_dense_reference():
     expected_chunked_scores = dense_scores.gather(-1, chunked_indices)
     torch.testing.assert_close(chunked_scores, expected_chunked_scores)
     torch.testing.assert_close(
-        torch.sort(chunked_indices, dim=-1).values,
-        torch.sort(dense_indices, dim=-1).values,
+        torch.sort(chunked_scores, dim=-1).values,
+        torch.sort(dense_scores.gather(-1, dense_indices), dim=-1).values,
     )
 
 
@@ -736,8 +1176,8 @@ def test_compute_gqa_dsa_indexer_loss_recompute_matches_normal():
     head_dim = 16
     topk = 4
 
-    index_scores = torch.randn(
-        batch_size, seqlen, seqlen, dtype=torch.float32, requires_grad=True
+    index_scores = _causal_index_scores(
+        torch.randn(batch_size, seqlen, seqlen, dtype=torch.float32, requires_grad=True)
     )
     topk_indices = index_scores.detach().topk(topk, dim=-1).indices
     query = torch.randn(seqlen, batch_size, num_heads, head_dim, dtype=torch.float32)
@@ -783,8 +1223,8 @@ def test_compute_gqa_dsa_indexer_loss_sparse_topk_only_recompute_matches_normal(
     head_dim = 16
     topk = 4
 
-    index_scores = torch.randn(
-        batch_size, seqlen, seqlen, dtype=torch.float32, requires_grad=True
+    index_scores = _causal_index_scores(
+        torch.randn(batch_size, seqlen, seqlen, dtype=torch.float32, requires_grad=True)
     )
     topk_indices = index_scores.detach().topk(topk, dim=-1).indices
     query = torch.randn(seqlen, batch_size, num_heads, head_dim, dtype=torch.float32)
@@ -831,8 +1271,8 @@ def test_compute_gqa_dsa_indexer_loss_sparse_topk_only_chunked_recompute_matches
     head_dim = 16
     topk = 4
 
-    index_scores = torch.randn(
-        batch_size, seqlen, seqlen, dtype=torch.float32, requires_grad=True
+    index_scores = _causal_index_scores(
+        torch.randn(batch_size, seqlen, seqlen, dtype=torch.float32, requires_grad=True)
     )
     topk_indices = index_scores.detach().topk(topk, dim=-1).indices
     query = torch.randn(seqlen, batch_size, num_heads, head_dim, dtype=torch.float32)
