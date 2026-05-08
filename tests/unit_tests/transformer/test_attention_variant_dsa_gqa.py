@@ -8,6 +8,7 @@ from megatron.core.models.mamba.mamba_layer_specs import mamba_stack_spec
 from megatron.core.transformer.experimental_attention_variant.dsa import (
     fused_qk_topk_chunked,
     fused_qk_topk_naive,
+    hadamard_transform,
 )
 from megatron.core.transformer.experimental_attention_variant.dsa_gqa import (
     DSGroupedSelfAttention,
@@ -18,6 +19,17 @@ from megatron.core.transformer.experimental_attention_variant.dsa_gqa import (
 from megatron.core.transformer.experimental_attention_variant.dsa_min_memory import (
     DSAMinMemoryGQAFn,
     _forward_min_memory_impl,
+    _native_indexer_loss_wgrad_chunk,
+    _project_q_index_tile,
+    _selected_index_scores_tile,
+)
+from megatron.core.transformer.experimental_attention_variant.dsa_min_memory_triton import (
+    HAVE_TRITON,
+    triton_indexer_loss_grad,
+    triton_linear_wgrad,
+    triton_selected_k_linear,
+    triton_selected_index_scores,
+    triton_topk_index_block,
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
 
@@ -63,6 +75,22 @@ def _random_topk_indices(batch_size: int, seqlen: int, topk: int):
     return torch.randn(batch_size, seqlen, seqlen).topk(topk, dim=-1).indices
 
 
+def _selected_index_scores_reference(q_index, weights, selected_k_index, topk_indices, q_start):
+    q = q_index.permute(1, 0, 2, 3).float()
+    w = weights.permute(1, 0, 2).float()
+    scores = torch.einsum("bqhd,bqkd->bqhk", q, selected_k_index.float())
+    scores = torch.relu(scores)
+    scores = (scores * w.unsqueeze(-1)).sum(dim=2)
+    query_positions = torch.arange(
+        q_start,
+        q_start + topk_indices.size(1),
+        device=topk_indices.device,
+        dtype=topk_indices.dtype,
+    )
+    invalid = topk_indices > query_positions.view(1, topk_indices.size(1), 1)
+    return scores.masked_fill(invalid, float("-inf"))
+
+
 def _rotary_freqs(rotary, seqlen: int, rotary_dim: int):
     positions = torch.arange(seqlen, dtype=rotary.inv_freq.dtype, device=rotary.inv_freq.device)
     freqs = torch.outer(positions, rotary.inv_freq[: rotary_dim // 2])
@@ -88,23 +116,37 @@ def _apply_reference_indexer_rope(
 
 
 def test_transformer_config_accepts_min_memory_backend():
-    config = TransformerConfig(
-        num_layers=1,
-        hidden_size=32,
-        num_attention_heads=4,
-        experimental_attention_variant="dsa",
-        dsa_indexer_n_heads=2,
-        dsa_indexer_head_dim=8,
-        dsa_indexer_topk=4,
-        dsa_kernel_backend="triton-min-memory",
-        dsa_indexer_loss_coeff=0.1,
-        dsa_indexer_use_sparse_loss=True,
-        dsa_indexer_sparse_loss_use_topk_only=True,
-        dsa_sparse_attention_query_chunk_size=2,
-        dsa_indexer_use_hadamard=True,
-    )
+    for backend in ("triton-min-memory", "torch-min-memory"):
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=32,
+            num_attention_heads=4,
+            experimental_attention_variant="dsa",
+            dsa_indexer_n_heads=2,
+            dsa_indexer_head_dim=8,
+            dsa_indexer_topk=4,
+            dsa_kernel_backend=backend,
+            dsa_kernel_cache_routing=True,
+            dsa_kernel_cache_indexer_k=True,
+            dsa_kernel_cache_selected_scores=True,
+            dsa_indexer_loss_coeff=0.1,
+            dsa_indexer_use_sparse_loss=True,
+            dsa_indexer_sparse_loss_use_topk_only=True,
+            dsa_kernel_query_block_size=256,
+            dsa_kernel_key_block_size=1024,
+            dsa_indexer_use_hadamard=True,
+            dsa_min_memory_profile=True,
+            dsa_min_memory_profile_rank=-1,
+        )
 
-    assert config.dsa_kernel_backend == "triton-min-memory"
+        assert config.dsa_kernel_backend == backend
+        assert config.dsa_kernel_query_block_size == 256
+        assert config.dsa_kernel_key_block_size == 1024
+        assert config.dsa_kernel_cache_routing
+        assert config.dsa_kernel_cache_indexer_k
+        assert config.dsa_kernel_cache_selected_scores
+        assert config.dsa_min_memory_profile
+        assert config.dsa_min_memory_profile_rank == -1
 
 
 def test_transformer_config_min_memory_accepts_sparse_loss_without_topk_only_flag():
@@ -126,6 +168,331 @@ def test_transformer_config_min_memory_accepts_sparse_loss_without_topk_only_fla
     assert not config.dsa_indexer_sparse_loss_use_topk_only
 
 
+@pytest.mark.parametrize(
+    "legacy_flag",
+    [
+        "dsa_sparse_attention_query_chunk_size",
+        "dsa_indexer_loss_query_chunk_size",
+        "dsa_indexer_topk_key_chunk_size",
+    ],
+)
+def test_transformer_config_min_memory_rejects_legacy_chunk_flags(legacy_flag):
+    with pytest.raises(AssertionError, match="min-memory"):
+        TransformerConfig(
+            num_layers=1,
+            hidden_size=32,
+            num_attention_heads=4,
+            experimental_attention_variant="dsa",
+            dsa_indexer_n_heads=2,
+            dsa_indexer_head_dim=8,
+            dsa_indexer_topk=4,
+            dsa_kernel_backend="triton-min-memory",
+            dsa_indexer_loss_coeff=0.1,
+            dsa_indexer_use_sparse_loss=True,
+            dsa_indexer_use_hadamard=True,
+            **{legacy_flag: 2},
+        )
+
+
+@pytest.mark.parametrize(
+    "legacy_flag",
+    [
+        "dsa_indexer_topk_recompute",
+        "dsa_indexer_loss_recompute",
+        "dsa_sparse_attention_recompute",
+        "dsa_sparse_attention_use_gather",
+    ],
+)
+def test_transformer_config_min_memory_rejects_legacy_backend_flags(legacy_flag):
+    kwargs = {legacy_flag: True}
+    if legacy_flag == "dsa_indexer_topk_recompute":
+        kwargs["dsa_indexer_topk_key_chunk_size"] = 2
+    with pytest.raises(AssertionError, match="min-memory"):
+        TransformerConfig(
+            num_layers=1,
+            hidden_size=32,
+            num_attention_heads=4,
+            experimental_attention_variant="dsa",
+            dsa_indexer_n_heads=2,
+            dsa_indexer_head_dim=8,
+            dsa_indexer_topk=4,
+            dsa_kernel_backend="triton-min-memory",
+            dsa_indexer_loss_coeff=0.1,
+            dsa_indexer_use_sparse_loss=True,
+            dsa_indexer_use_hadamard=True,
+            **kwargs,
+        )
+
+
+def test_transformer_config_cache_routing_requires_min_memory_backend():
+    with pytest.raises(AssertionError, match="dsa_kernel_cache_routing"):
+        TransformerConfig(
+            num_layers=1,
+            hidden_size=32,
+            num_attention_heads=4,
+            experimental_attention_variant="dsa",
+            dsa_indexer_n_heads=2,
+            dsa_indexer_head_dim=8,
+            dsa_indexer_topk=4,
+            dsa_kernel_backend="reference",
+            dsa_indexer_loss_coeff=0.1,
+            dsa_kernel_cache_routing=True,
+        )
+
+
+@pytest.mark.parametrize(
+    "cache_flag",
+    ["dsa_kernel_cache_indexer_k", "dsa_kernel_cache_selected_scores"],
+)
+def test_transformer_config_optional_kernel_caches_require_min_memory_backend(cache_flag):
+    with pytest.raises(AssertionError, match=cache_flag):
+        TransformerConfig(
+            num_layers=1,
+            hidden_size=32,
+            num_attention_heads=4,
+            experimental_attention_variant="dsa",
+            dsa_indexer_n_heads=2,
+            dsa_indexer_head_dim=8,
+            dsa_indexer_topk=4,
+            dsa_kernel_backend="reference",
+            dsa_indexer_loss_coeff=0.1,
+            **{cache_flag: True},
+        )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or not HAVE_TRITON, reason="CUDA Triton only")
+def test_triton_topk_index_block_matches_reference():
+    torch.manual_seed(123)
+    device = torch.device("cuda")
+    batch_size = 2
+    query_len = 35
+    key_len = 257
+    index_heads = 3
+    index_head_dim = 32
+    topk = 7
+    q_start = 256
+
+    q_index = torch.randn(query_len, batch_size, index_heads, index_head_dim, device=device)
+    k_index = torch.randn(key_len, batch_size, index_head_dim, device=device)
+    weights = torch.randn(query_len, batch_size, index_heads, device=device)
+    scores = torch.einsum("qbhd,tbd->bqht", q_index.float(), k_index.float())
+    scores = torch.relu(scores)
+    scores = (scores * weights.permute(1, 0, 2).unsqueeze(-1).float()).sum(dim=2)
+    query_positions = (q_start + torch.arange(query_len, device=device)).view(query_len, 1)
+    key_positions = torch.arange(key_len, device=device).view(1, key_len)
+    scores = scores.masked_fill((key_positions > query_positions).unsqueeze(0), float("-inf"))
+    ref_scores, ref_indices = scores.topk(topk, dim=-1)
+
+    tri_scores, tri_indices = triton_topk_index_block(
+        q_index, weights, k_index, topk, q_start=q_start, k_start=0
+    )
+
+    torch.testing.assert_close(tri_scores, ref_scores, rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(tri_indices, ref_indices)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or not HAVE_TRITON, reason="CUDA Triton only")
+def test_triton_selected_index_scores_backward_matches_reference():
+    torch.manual_seed(123)
+    device = torch.device("cuda")
+    batch_size = 2
+    query_len = 9
+    topk = 11
+    index_heads = 3
+    index_head_dim = 32
+    q_start = 4
+
+    q_index = torch.randn(
+        query_len, batch_size, index_heads, index_head_dim, device=device, requires_grad=True
+    )
+    weights = torch.randn(query_len, batch_size, index_heads, device=device, requires_grad=True)
+    selected_k = torch.randn(
+        batch_size, query_len, topk, index_head_dim, device=device, requires_grad=True
+    )
+    topk_indices = torch.stack(
+        [
+            torch.randint(0, q_start + query_idx + 1, (batch_size, topk), device=device)
+            for query_idx in range(query_len)
+        ],
+        dim=1,
+    )
+    grad = torch.randn(batch_size, query_len, topk, device=device)
+
+    tri_scores = triton_selected_index_scores(q_index, weights, selected_k, topk_indices, q_start)
+    (tri_scores * grad).sum().backward()
+    tri_grads = (q_index.grad.clone(), weights.grad.clone(), selected_k.grad.clone())
+
+    q_ref = q_index.detach().clone().requires_grad_(True)
+    w_ref = weights.detach().clone().requires_grad_(True)
+    sk_ref = selected_k.detach().clone().requires_grad_(True)
+    ref_scores = _selected_index_scores_reference(q_ref, w_ref, sk_ref, topk_indices, q_start)
+    (ref_scores * grad).sum().backward()
+
+    torch.testing.assert_close(tri_scores, ref_scores, rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(tri_grads[0], q_ref.grad, rtol=1e-4, atol=1e-4)
+    torch.testing.assert_close(tri_grads[1], w_ref.grad, rtol=1e-4, atol=1e-4)
+    torch.testing.assert_close(tri_grads[2], sk_ref.grad, rtol=1e-4, atol=1e-4)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or not HAVE_TRITON, reason="CUDA Triton only")
+def test_triton_indexer_loss_grad_matches_reference():
+    torch.manual_seed(123)
+    device = torch.device("cuda")
+    selected_scores = torch.randn(2, 9, 17, device=device)
+    teacher = torch.softmax(torch.randn(2, 9, 17, device=device), dim=-1)
+    scale = torch.tensor(0.125, device=device)
+
+    tri_grad = triton_indexer_loss_grad(selected_scores, teacher, scale)
+    student = torch.nn.functional.softmax(selected_scores, dim=-1, dtype=torch.float32)
+    teacher_over_student = teacher * student / (student + 1e-10)
+    ref_grad = student * teacher_over_student.sum(dim=-1, keepdim=True) - teacher_over_student
+    ref_grad = ref_grad * scale
+
+    torch.testing.assert_close(tri_grad, ref_grad, rtol=1e-5, atol=1e-6)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or not HAVE_TRITON, reason="CUDA Triton only")
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_triton_linear_wgrad_matches_reference(dtype):
+    torch.manual_seed(123)
+    device = torch.device("cuda")
+    rows = 37
+    out_features = 19
+    in_features = 41
+    grad_output = torch.randn(rows, out_features, device=device, dtype=dtype)
+    input_tensor = torch.randn(rows, in_features, device=device, dtype=dtype)
+    grad_weight = torch.zeros(out_features, in_features, device=device, dtype=torch.float32)
+
+    assert triton_linear_wgrad(grad_output, input_tensor, grad_weight)
+
+    ref = grad_output.float().t().matmul(input_tensor.float())
+    rtol = 2e-2 if dtype == torch.bfloat16 else 3e-3
+    atol = 2e-2 if dtype == torch.bfloat16 else 3e-3
+    torch.testing.assert_close(grad_weight, ref, rtol=rtol, atol=atol)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or not HAVE_TRITON, reason="CUDA Triton only")
+@pytest.mark.parametrize("rotary_interleaved", [False, True])
+@pytest.mark.parametrize("use_hadamard", [False, True])
+def test_native_indexer_loss_wgrad_matches_autograd(rotary_interleaved, use_hadamard):
+    if use_hadamard and hadamard_transform is None:
+        pytest.skip("fast_hadamard_transform is not installed")
+    torch.manual_seed(1234)
+    device = torch.device("cuda")
+    dtype = torch.bfloat16 if use_hadamard else torch.float32
+    seqlen = 9
+    batch_size = 2
+    hidden_size = 16
+    query_len = 4
+    q_start = 3
+    index_heads = 2
+    index_head_dim = 8
+    topk = 5
+    rotary_dim = 4
+
+    hidden_states = torch.randn(seqlen, batch_size, hidden_size, device=device, dtype=dtype)
+    linear_q_weight = torch.randn(
+        index_heads * index_head_dim, hidden_size, device=device, dtype=dtype, requires_grad=True
+    )
+    linear_k_weight = torch.randn(
+        index_head_dim, hidden_size, device=device, dtype=dtype, requires_grad=True
+    )
+    k_norm_weight = torch.randn(index_head_dim, device=device, dtype=dtype, requires_grad=True)
+    k_norm_bias = torch.randn(index_head_dim, device=device, dtype=dtype, requires_grad=True)
+    linear_weights_weight = torch.randn(
+        index_heads, hidden_size, device=device, dtype=dtype, requires_grad=True
+    )
+    topk_indices = torch.stack(
+        [
+            torch.randint(0, q_start + query_idx + 1, (batch_size, topk), device=device)
+            for query_idx in range(query_len)
+        ],
+        dim=1,
+    )
+    grad_scores = torch.randn(batch_size, query_len, topk, device=device)
+    rotary = _DummyRotary(rotary_dim=rotary_dim, rotary_interleaved=rotary_interleaved)
+
+    q_index, weights = _project_q_index_tile(
+        hidden_states.detach(),
+        q_start,
+        q_start + query_len,
+        linear_q_weight,
+        linear_weights_weight,
+        index_heads,
+        index_head_dim,
+        rotary_dim,
+        rotary,
+        rotary_interleaved,
+        use_indexer_rope=True,
+        use_hadamard=use_hadamard,
+    )
+    selected_scores = _selected_index_scores_tile(
+        hidden_states.detach(),
+        q_start,
+        q_start + query_len,
+        topk_indices,
+        q_index,
+        weights,
+        linear_k_weight,
+        k_norm_weight,
+        k_norm_bias,
+        True,
+        1.0e-5,
+        index_head_dim,
+        rotary_dim,
+        rotary,
+        rotary_interleaved,
+        use_indexer_rope=True,
+        use_hadamard=use_hadamard,
+    )
+    ref_grads = torch.autograd.grad(
+        selected_scores,
+        [
+            linear_q_weight,
+            linear_k_weight,
+            k_norm_weight,
+            k_norm_bias,
+            linear_weights_weight,
+        ],
+        grad_outputs=grad_scores,
+    )
+
+    native_grads = [torch.zeros_like(grad, dtype=torch.float32) for grad in ref_grads]
+    with torch.no_grad():
+        native_done = _native_indexer_loss_wgrad_chunk(
+            hidden_states.detach(),
+            q_start,
+            q_start + query_len,
+            topk_indices,
+            q_index.detach(),
+            weights.detach(),
+            grad_scores,
+            linear_q_weight.detach(),
+            linear_k_weight.detach(),
+            k_norm_weight.detach(),
+            k_norm_bias.detach(),
+            True,
+            linear_weights_weight.detach(),
+            1.0e-5,
+            index_head_dim,
+            rotary_dim,
+            rotary,
+            rotary_interleaved,
+            use_indexer_rope=True,
+            use_hadamard=use_hadamard,
+            grad_linear_q_weight=native_grads[0],
+            grad_linear_k_weight=native_grads[1],
+            grad_k_norm_weight=native_grads[2],
+            grad_k_norm_bias=native_grads[3],
+            grad_linear_weights_weight=native_grads[4],
+            profile=None,
+        )
+
+    assert native_done
+    rtol = 3e-2 if use_hadamard else 2e-3
+    atol = 3e-2 if use_hadamard else 2e-3
+    for native_grad, ref_grad in zip(native_grads, ref_grads):
+        torch.testing.assert_close(native_grad, ref_grad.float(), rtol=rtol, atol=atol)
 def test_transformer_config_min_memory_requires_sparse_loss():
     with pytest.raises(AssertionError, match="dsa_indexer_use_sparse_loss"):
         TransformerConfig(
@@ -226,7 +593,6 @@ def test_min_memory_impl_matches_reference_forward_and_loss():
         2,
         3,
         pg_collection,
-        compute_loss=True,
     )
 
     torch.testing.assert_close(output, reference_output)
@@ -327,7 +693,6 @@ def test_min_memory_impl_matches_reference_rope_interleaved_layout():
         2,
         3,
         pg_collection,
-        compute_loss=True,
         rotary_interleaved=config_rotary_interleaved,
     )
 
@@ -412,6 +777,13 @@ def test_min_memory_impl_matches_reference_gradients():
         2,
         3,
         pg_collection,
+        False,
+        False,
+        0,
+        "",
+        False,
+        False,
+        False,
     )
     (output.sum() + loss).backward()
 
@@ -466,6 +838,28 @@ def test_min_memory_impl_matches_reference_gradients():
         torch.testing.assert_close(min_tensor.grad, ref_tensor.grad)
 
 
+@pytest.mark.skipif(
+    not HAVE_TRITON or not torch.cuda.is_available(),
+    reason="CUDA Triton kernels are required for this test.",
+)
+def test_triton_selected_k_linear_matches_pytorch_projection():
+    torch.manual_seed(123)
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    seqlen, batch_size, query_len, topk = 11, 2, 5, 4
+    hidden_size, index_head_dim = 64, 32
+    hidden_states = torch.randn(seqlen, batch_size, hidden_size, device=device, dtype=dtype)
+    linear_k_weight = torch.randn(index_head_dim, hidden_size, device=device, dtype=dtype)
+    topk_indices = torch.randint(0, seqlen, (batch_size, query_len, topk), device=device)
+
+    projected = triton_selected_k_linear(hidden_states, topk_indices, linear_k_weight)
+    hidden_by_batch = hidden_states.permute(1, 0, 2)
+    batch_index = torch.arange(batch_size, device=device).view(batch_size, 1, 1)
+    selected_hidden = hidden_by_batch[batch_index, topk_indices]
+    reference = F.linear(selected_hidden, linear_k_weight)
+
+    assert projected is not None
+    torch.testing.assert_close(projected.float(), reference.float(), atol=2e-2, rtol=2e-2)
 def test_compute_gqa_dsa_indexer_loss_dense_and_sparse():
     torch.manual_seed(123)
 

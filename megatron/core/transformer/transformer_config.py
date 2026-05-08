@@ -286,8 +286,29 @@ class TransformerConfig(ModelParallelConfig):
     dsa_indexer_topk: Optional[int] = None
     """Number of top-k tokens to select in DSA indexer."""
 
-    dsa_kernel_backend: Literal['reference', 'triton-min-memory'] = 'reference'
+    dsa_kernel_backend: Literal['reference', 'triton-min-memory', 'torch-min-memory'] = 'reference'
     """DSA-GQA kernel backend. The min-memory backend recomputes routing and attention."""
+
+    dsa_min_memory_profile: bool = False
+    """Whether to print per-layer DSA min-memory forward/backward timing breakdowns."""
+
+    dsa_min_memory_profile_rank: int = 0
+    """Global rank that prints DSA min-memory timings. Set to -1 to print on every rank."""
+
+    dsa_kernel_query_block_size: Optional[int] = None
+    """Optional query tile size for DSA min-memory kernel backends."""
+
+    dsa_kernel_key_block_size: Optional[int] = None
+    """Optional key tile size for DSA min-memory kernel backends."""
+
+    dsa_kernel_cache_routing: bool = False
+    """Whether DSA kernel backends may save forward routing top-k indices for backward speed."""
+
+    dsa_kernel_cache_indexer_k: bool = False
+    """Whether DSA kernel backends may save full-sequence projected indexer K for speed."""
+
+    dsa_kernel_cache_selected_scores: bool = False
+    """Whether DSA kernel backends may save selected indexer scores for speed."""
 
     dsa_indexer_topk_key_chunk_size: Optional[int] = None
     """Optional key chunk size for exact streamed DSA top-k routing. If unset, use dense routing."""
@@ -2185,8 +2206,41 @@ class TransformerConfig(ModelParallelConfig):
                 self.dsa_indexer_topk_key_chunk_size is None
                 or self.dsa_indexer_topk_key_chunk_size > 0
             ), "dsa_indexer_topk_key_chunk_size must be a positive integer when set."
-            assert self.dsa_kernel_backend in ('reference', 'triton-min-memory'), (
-                "dsa_kernel_backend must be either 'reference' or 'triton-min-memory'."
+            min_memory_dsa_backend = self.dsa_kernel_backend in (
+                'triton-min-memory',
+                'torch-min-memory',
+            )
+            assert self.dsa_kernel_backend in (
+                'reference',
+                'triton-min-memory',
+                'torch-min-memory',
+            ), (
+                "dsa_kernel_backend must be 'reference', 'triton-min-memory', "
+                "or 'torch-min-memory'."
+            )
+            assert self.dsa_min_memory_profile_rank >= -1, (
+                "dsa_min_memory_profile_rank must be -1 or a non-negative global rank."
+            )
+            assert (
+                self.dsa_kernel_query_block_size is None or self.dsa_kernel_query_block_size > 0
+            ), "dsa_kernel_query_block_size must be a positive integer when set."
+            assert (
+                self.dsa_kernel_key_block_size is None or self.dsa_kernel_key_block_size > 0
+            ), "dsa_kernel_key_block_size must be a positive integer when set."
+            assert (
+                not self.dsa_kernel_cache_routing
+                or min_memory_dsa_backend
+            ), "dsa_kernel_cache_routing requires a min-memory dsa_kernel_backend."
+            assert (
+                not self.dsa_kernel_cache_indexer_k
+                or min_memory_dsa_backend
+            ), "dsa_kernel_cache_indexer_k requires a min-memory dsa_kernel_backend."
+            assert (
+                not self.dsa_kernel_cache_selected_scores
+                or min_memory_dsa_backend
+            ), (
+                "dsa_kernel_cache_selected_scores requires "
+                "a min-memory dsa_kernel_backend."
             )
             assert (
                 not self.dsa_indexer_sparse_loss_use_topk_only or self.dsa_indexer_use_sparse_loss
@@ -2204,9 +2258,10 @@ class TransformerConfig(ModelParallelConfig):
             assert (
                 self.dsa_indexer_loss_query_chunk_size is None
                 or self.dsa_indexer_sparse_loss_use_topk_only
+                or min_memory_dsa_backend
             ), (
                 "dsa_indexer_loss_query_chunk_size requires "
-                "dsa_indexer_sparse_loss_use_topk_only."
+                "dsa_indexer_sparse_loss_use_topk_only or a min-memory dsa_kernel_backend."
             )
             assert (
                 not self.dsa_indexer_topk_recompute
@@ -2220,10 +2275,10 @@ class TransformerConfig(ModelParallelConfig):
             assert (
                 self.dsa_sparse_attention_query_chunk_size is None
                 or self.dsa_sparse_attention_use_gather
-                or self.dsa_kernel_backend == 'triton-min-memory'
+                or min_memory_dsa_backend
             ), (
                 "dsa_sparse_attention_query_chunk_size requires "
-                "dsa_sparse_attention_use_gather or dsa_kernel_backend='triton-min-memory'."
+                "dsa_sparse_attention_use_gather or a min-memory dsa_kernel_backend."
             )
             assert (
                 self.context_parallel_size == 1
@@ -2232,13 +2287,41 @@ class TransformerConfig(ModelParallelConfig):
                 "Currently sequence parallelism is not supported by DSAttention."
             )
             assert not self.apply_rope_fusion, "RoPE fusion is not supported for DSAttention"
-            if self.dsa_kernel_backend == 'triton-min-memory':
+            if min_memory_dsa_backend:
+                assert self.dsa_sparse_attention_query_chunk_size is None, (
+                    "min-memory dsa_kernel_backend uses dsa_kernel_query_block_size; "
+                    "leave dsa_sparse_attention_query_chunk_size for legacy/reference paths."
+                )
+                assert self.dsa_indexer_loss_query_chunk_size is None, (
+                    "min-memory dsa_kernel_backend uses dsa_kernel_query_block_size; "
+                    "leave dsa_indexer_loss_query_chunk_size for legacy/reference paths."
+                )
+                assert self.dsa_indexer_topk_key_chunk_size is None, (
+                    "min-memory dsa_kernel_backend uses dsa_kernel_key_block_size; "
+                    "leave dsa_indexer_topk_key_chunk_size for legacy/reference paths."
+                )
+                assert not self.dsa_indexer_topk_recompute, (
+                    "min-memory dsa_kernel_backend recomputes or caches routing internally; "
+                    "leave dsa_indexer_topk_recompute for legacy/reference paths."
+                )
+                assert not self.dsa_indexer_loss_recompute, (
+                    "min-memory dsa_kernel_backend recomputes indexer-loss intermediates "
+                    "internally; leave dsa_indexer_loss_recompute for legacy/reference paths."
+                )
+                assert not self.dsa_sparse_attention_recompute, (
+                    "min-memory dsa_kernel_backend recomputes sparse attention internally; "
+                    "leave dsa_sparse_attention_recompute for legacy/reference paths."
+                )
+                assert not self.dsa_sparse_attention_use_gather, (
+                    "min-memory dsa_kernel_backend bypasses the reference gather backend; "
+                    "leave dsa_sparse_attention_use_gather for legacy/reference paths."
+                )
                 assert self.dsa_indexer_use_sparse_loss, (
-                    "dsa_kernel_backend='triton-min-memory' requires "
+                    "min-memory dsa_kernel_backend requires "
                     "dsa_indexer_use_sparse_loss."
                 )
                 assert self.dsa_indexer_use_hadamard, (
-                    "dsa_kernel_backend='triton-min-memory' requires "
+                    "min-memory dsa_kernel_backend requires "
                     "dsa_indexer_use_hadamard to match the DeepSeek indexer."
                 )
 
