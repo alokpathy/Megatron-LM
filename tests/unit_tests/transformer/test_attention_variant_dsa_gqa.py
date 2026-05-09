@@ -1,3 +1,5 @@
+from types import SimpleNamespace
+
 import torch
 import torch.nn.functional as F
 import torch.utils.checkpoint as torch_checkpoint
@@ -12,6 +14,7 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
 )
 from megatron.core.transformer.experimental_attention_variant.dsa_gqa import (
     DSGroupedSelfAttention,
+    DSGQACoreAttention,
     _build_shifted_causal_mask,
     compute_gqa_dsa_indexer_loss,
     unfused_grouped_dsa_fn,
@@ -166,6 +169,67 @@ def test_transformer_config_min_memory_accepts_sparse_loss_without_topk_only_fla
 
     assert config.dsa_indexer_use_sparse_loss
     assert not config.dsa_indexer_sparse_loss_use_topk_only
+
+
+def test_min_memory_backend_supports_no_grad_validation_forward(monkeypatch):
+    torch.manual_seed(123)
+
+    calls = []
+
+    def _fake_forward_only(**kwargs):
+        calls.append(kwargs)
+        query = kwargs["query"]
+        value = kwargs["value"]
+        return query.new_empty(query.size(0), query.size(1), query.size(2) * value.size(-1))
+
+    monkeypatch.setattr(
+        "megatron.core.transformer.experimental_attention_variant.dsa_gqa."
+        "dsa_min_memory_gqa_forward_only",
+        _fake_forward_only,
+    )
+
+    for backend in ("torch-min-memory", "triton-min-memory"):
+        core = SimpleNamespace(
+            config=SimpleNamespace(
+                dsa_kernel_backend=backend,
+                dsa_sparse_attention_use_gather=False,
+                dsa_indexer_use_sparse_loss=True,
+                dsa_indexer_use_hadamard=True,
+                fp8=None,
+                fp8_param=False,
+                layernorm_zero_centered_gamma=False,
+                dsa_kernel_query_block_size=2,
+                dsa_kernel_key_block_size=3,
+                dsa_kernel_cache_indexer_k=True,
+                dsa_min_memory_profile=False,
+                dsa_min_memory_profile_rank=0,
+            ),
+            indexer=object(),
+            softmax_scale=4**-0.5,
+            training=False,
+            layer_number=1,
+        )
+
+        query = torch.randn(4, 2, 4, 4)
+        key = torch.randn(4, 2, 2, 4)
+        value = torch.randn(4, 2, 2, 4)
+        hidden_states = torch.randn(4, 2, 8)
+
+        with torch.no_grad():
+            output = DSGQACoreAttention._forward_min_memory(
+                core,
+                query,
+                key,
+                value,
+                None,
+                hidden_states,
+                attn_mask_type=AttnMaskType.causal,
+            )
+
+        assert output.shape == (4, 2, 16)
+        assert not output.requires_grad
+
+    assert [call["use_triton"] for call in calls] == [False, True]
 
 
 @pytest.mark.parametrize(

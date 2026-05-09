@@ -2179,6 +2179,91 @@ class DSAMinMemoryGQAFn(torch.autograd.Function):
         )
 
 
+def dsa_min_memory_gqa_forward_only(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    hidden_states: torch.Tensor,
+    indexer,
+    softmax_scale: float,
+    use_indexer_rope: bool,
+    query_chunk_size: Optional[int],
+    key_chunk_size: Optional[int],
+    cache_indexer_k: bool = False,
+    profile_enabled: bool = False,
+    profile_rank: int = 0,
+    profile_label: str = "",
+    use_triton: bool = True,
+) -> torch.Tensor:
+    """Run min-memory DSA-GQA for no-grad validation/eval forward passes."""
+    k_norm_bias, has_k_norm_bias = _module_bias(indexer.k_norm, query)
+    query_chunk_size = _chunk_size(
+        query_chunk_size, _default_query_chunk_size(query.size(0)), query.size(0)
+    )
+    key_chunk_size = _chunk_size(
+        key_chunk_size, _default_key_chunk_size(key.size(0)), key.size(0)
+    )
+    rotary_interleaved = getattr(indexer.config, "rotary_interleaved", False)
+    k_norm_eps = getattr(indexer.k_norm, "eps", indexer.config.layernorm_epsilon)
+    linear_q_weight = _module_weight(indexer.linear_q)
+    linear_k_weight = _module_weight(indexer.linear_k)
+    k_norm_weight = _module_weight(indexer.k_norm)
+    linear_weights_weight = _module_weight(indexer.linear_weights_proj)
+    profile = _DSATimingProfiler(profile_enabled, profile_rank, profile_label, query.device)
+    full_k_index = None
+
+    with torch.no_grad(), _triton_dispatch_enabled(use_triton):
+        with profile.record("forward_total", query.device):
+            if cache_indexer_k:
+                with _profile_record(profile, "indexer_k_cache_fwd_project", query.device):
+                    full_k_index = _project_k_index_block(
+                        hidden_states,
+                        0,
+                        hidden_states.size(0),
+                        linear_k_weight,
+                        k_norm_weight,
+                        k_norm_bias,
+                        has_k_norm_bias,
+                        k_norm_eps,
+                        indexer.index_head_dim,
+                        indexer.index_rotary_dim,
+                        indexer.rotary_pos_emb,
+                        rotary_interleaved,
+                        use_indexer_rope,
+                        indexer.config.dsa_indexer_use_hadamard,
+                    )
+            output, _ = _forward_min_memory_impl(
+                query,
+                key,
+                value,
+                hidden_states,
+                linear_q_weight,
+                linear_k_weight,
+                k_norm_weight,
+                k_norm_bias,
+                has_k_norm_bias,
+                linear_weights_weight,
+                k_norm_eps,
+                indexer.index_n_heads,
+                indexer.index_head_dim,
+                indexer.index_topk,
+                indexer.index_rotary_dim,
+                indexer.rotary_pos_emb,
+                use_indexer_rope,
+                indexer.config.dsa_indexer_use_hadamard,
+                softmax_scale,
+                0.0,
+                query_chunk_size,
+                key_chunk_size,
+                indexer.pg_collection,
+                rotary_interleaved=rotary_interleaved,
+                profile=profile,
+                full_k_index=full_k_index,
+            )
+    profile.log("forward")
+    return output
+
+
 def dsa_min_memory_gqa(
     query: torch.Tensor,
     key: torch.Tensor,

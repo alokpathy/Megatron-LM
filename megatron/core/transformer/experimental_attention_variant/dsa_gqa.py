@@ -30,6 +30,7 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
 )
 from megatron.core.transformer.experimental_attention_variant.dsa_min_memory import (
     dsa_min_memory_gqa,
+    dsa_min_memory_gqa_forward_only,
 )
 from megatron.core.utils import is_using_quantization_scales
 
@@ -935,15 +936,11 @@ class DSGQACoreAttention(MegatronModule):
         attention_bias: torch.Tensor = None,
         packed_seq_params: PackedSeqParams = None,
     ) -> torch.Tensor:
-        """Training-only minimum-activation DSA-GQA path."""
+        """Minimum-activation DSA-GQA path for training and no-grad validation."""
         del attention_mask
         dsa_kernel_backend = getattr(self.config, "dsa_kernel_backend", "reference")
         assert attention_bias is None, "attention_bias is not supported for DSA-GQA."
         assert packed_seq_params is None, "Packed sequence is not supported for DSA-GQA."
-        if not self.training or not torch.is_grad_enabled():
-            raise NotImplementedError(
-                f"dsa_kernel_backend='{dsa_kernel_backend}' currently supports training only."
-            )
         if attn_mask_type != AttnMaskType.causal:
             raise NotImplementedError(
                 f"dsa_kernel_backend='{dsa_kernel_backend}' only supports causal fixed-length batches."
@@ -976,6 +973,27 @@ class DSGQACoreAttention(MegatronModule):
             raise NotImplementedError(
                 f"dsa_kernel_backend='{dsa_kernel_backend}' does not yet support "
                 "layernorm_zero_centered_gamma in the DSA indexer norm."
+            )
+        if not torch.is_grad_enabled():
+            return dsa_min_memory_gqa_forward_only(
+                query=query,
+                key=key,
+                value=value,
+                hidden_states=hidden_states.detach(),
+                indexer=self.indexer,
+                softmax_scale=self.softmax_scale,
+                use_indexer_rope=use_indexer_rope,
+                query_chunk_size=getattr(self.config, "dsa_kernel_query_block_size", None),
+                key_chunk_size=getattr(self.config, "dsa_kernel_key_block_size", None),
+                cache_indexer_k=getattr(self.config, "dsa_kernel_cache_indexer_k", False),
+                profile_enabled=getattr(self.config, "dsa_min_memory_profile", False),
+                profile_rank=getattr(self.config, "dsa_min_memory_profile_rank", 0),
+                profile_label=f"layer={self.layer_number}",
+                use_triton=dsa_kernel_backend == "triton-min-memory",
+            )
+        if not self.training:
+            raise NotImplementedError(
+                f"dsa_kernel_backend='{dsa_kernel_backend}' currently supports training only."
             )
 
         indexer_loss_coeff = getattr(self.config, "dsa_indexer_loss_coeff", 0.0) or 0.0
