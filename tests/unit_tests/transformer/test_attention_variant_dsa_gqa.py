@@ -24,6 +24,7 @@ from megatron.core.transformer.experimental_attention_variant.dsa_min_memory imp
     _forward_min_memory_impl,
     _native_indexer_loss_wgrad_chunk,
     _project_q_index_tile,
+    _selected_index_scores_backward_torch,
     _selected_index_scores_tile,
 )
 from megatron.core.transformer.experimental_attention_variant.dsa_min_memory_triton import (
@@ -92,6 +93,50 @@ def _selected_index_scores_reference(q_index, weights, selected_k_index, topk_in
     )
     invalid = topk_indices > query_positions.view(1, topk_indices.size(1), 1)
     return scores.masked_fill(invalid, float("-inf"))
+
+
+def test_torch_selected_index_score_backward_matches_autograd():
+    torch.manual_seed(123)
+
+    batch_size = 2
+    query_len = 4
+    index_heads = 3
+    index_head_dim = 5
+    topk = 4
+    q_start = 2
+
+    q_index = torch.randn(query_len, batch_size, index_heads, index_head_dim, requires_grad=True)
+    weights = torch.randn(query_len, batch_size, index_heads, requires_grad=True)
+    selected_k_index = torch.randn(batch_size, query_len, topk, index_head_dim, requires_grad=True)
+    topk_indices = torch.tensor(
+        [
+            [[0, 1, 2, 5], [0, 3, 4, 7], [2, 3, 4, 5], [0, 1, 5, 6]],
+            [[0, 2, 3, 6], [1, 2, 4, 8], [0, 1, 4, 6], [2, 4, 5, 9]],
+        ],
+        dtype=torch.long,
+    )
+    grad_scores = torch.randn(batch_size, query_len, topk)
+
+    selected_scores = _selected_index_scores_reference(
+        q_index, weights, selected_k_index, topk_indices, q_start
+    )
+    ref_grads = torch.autograd.grad(
+        selected_scores,
+        (q_index, weights, selected_k_index),
+        grad_outputs=grad_scores,
+    )
+
+    torch_grads = _selected_index_scores_backward_torch(
+        q_index.detach(),
+        weights.detach(),
+        selected_k_index.detach(),
+        topk_indices,
+        grad_scores,
+        q_start,
+    )
+
+    for actual, expected in zip(torch_grads, ref_grads):
+        torch.testing.assert_close(actual, expected)
 
 
 def _rotary_freqs(rotary, seqlen: int, rotary_dim: int):

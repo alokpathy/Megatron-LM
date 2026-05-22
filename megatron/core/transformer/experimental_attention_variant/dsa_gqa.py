@@ -510,6 +510,9 @@ class DSGQAIndexer(MegatronModule):
             skip_weight_param_allocation=False,
             parallel_mode="duplicated",
         )
+        if self.pg_collection.tp.size() > 1:
+            for param in self.parameters():
+                setattr(param, "average_gradients_across_tp_domain", True)
 
     def _apply_rope(self, x: torch.Tensor, use_rope: bool, packed_seq_params=None):
         if not use_rope or self.rotary_pos_emb is None or self.index_rotary_dim == 0:

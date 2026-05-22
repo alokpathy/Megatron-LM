@@ -529,6 +529,38 @@ def _index_scores_for_selected(
     return scores.sum(dim=2)
 
 
+def _selected_index_scores_backward_torch(
+    q_index: torch.Tensor,
+    weights: torch.Tensor,
+    selected_k_index: torch.Tensor,
+    topk_indices: torch.Tensor,
+    grad_selected_scores: torch.Tensor,
+    q_start: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    q = q_index.permute(1, 0, 2, 3).to(dtype=torch.float32)
+    w = weights.permute(1, 0, 2).to(dtype=torch.float32)
+    k = selected_k_index.to(dtype=torch.float32)
+    grad_scores = grad_selected_scores.to(dtype=torch.float32)
+
+    invalid = _selected_causal_invalid_mask(topk_indices, q_start)
+    grad_scores = grad_scores.masked_fill(invalid, 0.0)
+
+    dot = torch.einsum("bqhd,bqkd->bqhk", q, k)
+    relu_mask = dot > 0
+    relu_dot = torch.relu(dot)
+
+    grad_weights = (grad_scores.unsqueeze(2) * relu_dot).sum(dim=-1)
+    grad_dot = grad_scores.unsqueeze(2) * w.unsqueeze(-1) * relu_mask.to(dtype=torch.float32)
+    grad_q_index = torch.einsum("bqhk,bqkd->bqhd", grad_dot, k)
+    grad_selected_k = torch.einsum("bqhk,bqhd->bqkd", grad_dot, q)
+
+    return (
+        grad_q_index.permute(1, 0, 2, 3).contiguous(),
+        grad_weights.permute(1, 0, 2).contiguous(),
+        grad_selected_k.contiguous(),
+    )
+
+
 def _accumulate_linear_weight_grad(
     grad_weight: Optional[torch.Tensor],
     grad_output: torch.Tensor,
@@ -1152,7 +1184,14 @@ def _native_indexer_loss_wgrad_chunk(
                     q_start,
                 )
                 if selected_score_grads is None:
-                    return False
+                    selected_score_grads = _selected_index_scores_backward_torch(
+                        q_index,
+                        weights,
+                        selected_k_index,
+                        topk_indices,
+                        grad_selected_scores,
+                        q_start,
+                    )
                 grad_q_index, grad_weights, grad_selected_k = selected_score_grads
 
         hidden_tile = hidden_states[q_start:q_end]
