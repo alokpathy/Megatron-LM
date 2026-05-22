@@ -541,7 +541,7 @@ class DSGQAIndexer(MegatronModule):
         return torch.cat([x_nope, x_pe], dim=-1)
 
     def _get_dynamic_rotary_pos_emb(self, inference_context) -> Tuple[torch.Tensor, float]:
-        n = inference_context.padded_active_token_count
+        n = inference_context.active_token_count
         if n == 0:
             rotary_seq_len = 1
         else:
@@ -563,19 +563,35 @@ class DSGQAIndexer(MegatronModule):
         k_nope, k_pe = torch.split(
             k, [self.index_head_dim - self.index_rotary_dim, self.index_rotary_dim], dim=-1
         )
-        cu_seqlens_q, _ = inference_context.cu_query_lengths()
-        q_pe = inference_context.apply_rotary_emb_query(
-            q_pe,
-            rotary_pos_emb,
-            self.config,
-            cu_seqlens_q,
-            self.pg_collection.cp,
-            mscale=mscale,
-        )
-        k_pe = inference_context.apply_rotary_emb_key(
-            k_pe, rotary_pos_emb, self.config, self.pg_collection.cp, mscale=mscale
-        )
-        return torch.cat([q_nope, q_pe], dim=-1), torch.cat([k_nope, k_pe], dim=-1)
+
+        active_token_count = inference_context.active_token_count
+        q_pe = q_pe.clone()
+        k_pe = k_pe.clone()
+        if active_token_count > 0:
+            q_positions = inference_context.token_to_pos_ids[:active_token_count]
+            k_positions = inference_context.token_to_position_in_request[:active_token_count]
+            q_pe[:active_token_count] = apply_rotary_pos_emb(
+                q_pe[:active_token_count],
+                rotary_pos_emb[q_positions],
+                config=self.config,
+                cu_seqlens=None,
+                mscale=mscale,
+                cp_group=self.pg_collection.cp,
+            )
+            k_pe[:active_token_count] = apply_rotary_pos_emb(
+                k_pe[:active_token_count],
+                rotary_pos_emb[k_positions],
+                config=self.config,
+                cu_seqlens=None,
+                mscale=mscale,
+                cp_group=self.pg_collection.cp,
+            )
+        q = torch.cat([q_nope, q_pe], dim=-1)
+        k = torch.cat([k_nope, k_pe], dim=-1)
+        if active_token_count < q.size(0):
+            q[active_token_count:] = 0
+            k[active_token_count:] = 0
+        return q, k
 
     def forward_before_topk(
         self,
