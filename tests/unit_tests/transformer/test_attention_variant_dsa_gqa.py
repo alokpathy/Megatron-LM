@@ -24,6 +24,7 @@ from megatron.core.transformer.experimental_attention_variant.dsa_min_memory imp
     _forward_min_memory_impl,
     _native_indexer_loss_wgrad_chunk,
     _project_q_index_tile,
+    _routing_key_chunk_size,
     _selected_index_scores_backward_torch,
     _selected_index_scores_tile,
 )
@@ -367,6 +368,13 @@ def test_transformer_config_optional_kernel_caches_require_min_memory_backend(ca
             dsa_indexer_loss_coeff=0.1,
             **{cache_flag: True},
         )
+
+
+def test_torch_min_memory_forces_full_key_routing_chunk():
+    assert _routing_key_chunk_size(None, key_length=8192, use_triton=False) == 8192
+    assert _routing_key_chunk_size(1024, key_length=8192, use_triton=False) == 8192
+    assert _routing_key_chunk_size(None, key_length=8192, use_triton=True) == 1024
+    assert _routing_key_chunk_size(2048, key_length=8192, use_triton=True) == 2048
 
 
 @pytest.mark.skipif(not torch.cuda.is_available() or not HAVE_TRITON, reason="CUDA Triton only")

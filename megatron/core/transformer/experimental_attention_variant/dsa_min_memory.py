@@ -187,6 +187,17 @@ def _chunk_size(config_value: Optional[int], default_value: int, maximum: int) -
     return min(config_value, maximum)
 
 
+def _routing_key_chunk_size(
+    config_value: Optional[int], key_length: int, use_triton: bool
+) -> int:
+    if not use_triton:
+        # The PyTorch backend is the numerical oracle. Streaming torch.topk over key chunks is
+        # not tie-equivalent to a single full torch.topk, and exact zero ties are common after
+        # the indexer ReLU. Use one key block so torch-min-memory preserves reference routing.
+        return key_length
+    return _chunk_size(config_value, _default_key_chunk_size(key_length), key_length)
+
+
 def _default_rotary_interleaved(rotary_pos_emb) -> bool:
     return getattr(rotary_pos_emb, "rotary_interleaved", False)
 
@@ -1558,6 +1569,7 @@ class DSAMinMemoryGQAFn(torch.autograd.Function):
         use_triton: bool = True,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         profile = _DSATimingProfiler(profile_enabled, profile_rank, profile_label, query.device)
+        key_chunk_size = _routing_key_chunk_size(key_chunk_size, key.size(0), use_triton)
         routing_topk_cache = [] if cache_routing else None
         selected_scores_cache = [] if cache_selected_scores else None
         full_k_index = None
@@ -2239,9 +2251,7 @@ def dsa_min_memory_gqa_forward_only(
     query_chunk_size = _chunk_size(
         query_chunk_size, _default_query_chunk_size(query.size(0)), query.size(0)
     )
-    key_chunk_size = _chunk_size(
-        key_chunk_size, _default_key_chunk_size(key.size(0)), key.size(0)
-    )
+    key_chunk_size = _routing_key_chunk_size(key_chunk_size, key.size(0), use_triton)
     rotary_interleaved = getattr(indexer.config, "rotary_interleaved", False)
     k_norm_eps = getattr(indexer.k_norm, "eps", indexer.config.layernorm_epsilon)
     linear_q_weight = _module_weight(indexer.linear_q)
@@ -2346,7 +2356,7 @@ def dsa_min_memory_gqa(
         softmax_scale,
         loss_coeff,
         _chunk_size(query_chunk_size, _default_query_chunk_size(query.size(0)), query.size(0)),
-        _chunk_size(key_chunk_size, _default_key_chunk_size(key.size(0)), key.size(0)),
+        _routing_key_chunk_size(key_chunk_size, key.size(0), use_triton),
         indexer.pg_collection,
         getattr(indexer.config, "rotary_interleaved", False),
         profile_enabled,
