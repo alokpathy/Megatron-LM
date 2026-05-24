@@ -357,6 +357,15 @@ def _dsa_topk_index_block_kernel(
         is_max = (work == max_score) & key_mask
         selected_rel = tl.min(tl.where(is_max, offs_n, BLOCK_N), axis=0)
         selected_rel = tl.minimum(selected_rel, key_len - 1)
+        first_invalid = tl.min(
+            tl.where(key_mask & (key_position > query_position), offs_n, BLOCK_N),
+            axis=0,
+        )
+        selected_rel = tl.where(
+            (max_score == -float("inf")) & (first_invalid < BLOCK_N),
+            first_invalid,
+            selected_rel,
+        )
         tl.store(
             out_scores_ptr
             + batch_idx * out_score_stride_b
@@ -1082,6 +1091,7 @@ def _dsa_gathered_linear_wgrad_kernel(
 @triton.autotune(
     configs=_scatter_selected_grad_autotune_configs(),
     key=["total_rows", "sequence_length", "query_len", "topk", "out_features"],
+    reset_to_zero=["out_ptr"],
 )
 @triton.jit
 def _dsa_scatter_selected_grad_to_sequence_kernel(
@@ -1253,6 +1263,19 @@ def _dsa_topk_index_block_tiled_kernel(
             is_max = (work == max_score[:, None]) & key_mask[None, :]
             selected_rel = tl.min(tl.where(is_max, offs_n[None, :], BLOCK_N), axis=1)
             selected_rel = tl.minimum(selected_rel, key_len - 1)
+            first_invalid = tl.min(
+                tl.where(
+                    key_mask[None, :] & (key_position[None, :] > query_position[:, None]),
+                    offs_n[None, :],
+                    BLOCK_N,
+                ),
+                axis=1,
+            )
+            selected_rel = tl.where(
+                (max_score == -float("inf")) & (first_invalid < BLOCK_N),
+                first_invalid,
+                selected_rel,
+            )
             tl.store(
                 out_scores_ptr
                 + batch_idx * out_score_stride_b

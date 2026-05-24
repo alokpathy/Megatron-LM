@@ -764,9 +764,15 @@ def _gather_selected_kv(
     topk_indices: torch.Tensor,
 ) -> torch.Tensor:
     tensor = tensor[:, :, group_idx, :].permute(1, 0, 2)
-    batch_size = topk_indices.size(0)
-    batch_index = torch.arange(batch_size, device=topk_indices.device).view(batch_size, 1, 1)
-    return tensor[batch_index, topk_indices]
+    batch_size, query_length, topk = topk_indices.shape
+    gather_index = topk_indices[:, :, :, None].expand(
+        batch_size, query_length, topk, tensor.size(-1)
+    )
+    return torch.gather(
+        tensor[:, None, :, :].expand(batch_size, query_length, tensor.size(1), tensor.size(2)),
+        2,
+        gather_index,
+    )
 
 
 def _sparse_attention_tile(
