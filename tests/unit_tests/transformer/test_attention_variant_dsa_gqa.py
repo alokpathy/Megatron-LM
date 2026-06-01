@@ -21,6 +21,7 @@ from megatron.core.transformer.experimental_attention_variant.dsa_gqa import (
 )
 from megatron.core.transformer.experimental_attention_variant.dsa_min_memory import (
     DSAMinMemoryGQAFn,
+    dsa_dense_indexer_loss,
     _forward_min_memory_impl,
     _native_indexer_loss_wgrad_chunk,
     _project_q_index_tile,
@@ -36,6 +37,7 @@ from megatron.core.transformer.experimental_attention_variant.dsa_min_memory_tri
     triton_selected_index_scores,
     triton_topk_index_block,
 )
+from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 
@@ -140,6 +142,97 @@ def test_torch_selected_index_score_backward_matches_autograd():
         torch.testing.assert_close(actual, expected)
 
 
+def test_dense_indexer_loss_matches_reference_dense_loss_and_grads():
+    torch.manual_seed(123)
+    seqlen = 5
+    batch_size = 2
+    num_query_heads = 4
+    num_query_groups = 2
+    head_dim = 3
+    hidden_size = 7
+    index_heads = 2
+    index_head_dim = 4
+    loss_coeff = 0.3
+    softmax_scale = head_dim**-0.5
+
+    query = torch.randn(seqlen, batch_size, num_query_heads, head_dim)
+    key = torch.randn(seqlen, batch_size, num_query_groups, head_dim)
+    hidden_states = torch.randn(seqlen, batch_size, hidden_size)
+
+    indexer = SimpleNamespace(
+        index_n_heads=index_heads,
+        index_head_dim=index_head_dim,
+        index_topk=2,
+        index_rotary_dim=0,
+        rotary_pos_emb=None,
+        pg_collection=_DummyPGCollection(),
+        config=SimpleNamespace(
+            layernorm_epsilon=1e-5,
+            dsa_indexer_use_hadamard=False,
+            rotary_interleaved=False,
+        ),
+    )
+    indexer.linear_q = torch.nn.Linear(hidden_size, index_heads * index_head_dim, bias=False)
+    indexer.linear_k = torch.nn.Linear(hidden_size, index_head_dim, bias=False)
+    indexer.k_norm = torch.nn.LayerNorm(index_head_dim, eps=1e-5)
+    indexer.linear_weights_proj = torch.nn.Linear(hidden_size, index_heads, bias=False)
+
+    q_index = indexer.linear_q(hidden_states).reshape(
+        seqlen, batch_size, index_heads, index_head_dim
+    )
+    k_index = indexer.k_norm(indexer.linear_k(hidden_states)).reshape(
+        seqlen, batch_size, index_head_dim
+    )
+    weights = (
+        indexer.linear_weights_proj(hidden_states)
+        * (index_heads**-0.5)
+        * (index_head_dim**-0.5)
+    )
+    index_scores, topk_indices = fused_qk_topk_naive(
+        q_index,
+        k_index,
+        weights,
+        indexer.index_topk,
+        _causal_mask(seqlen, query.device),
+    )
+    reference_loss = compute_gqa_dsa_indexer_loss(
+        index_scores,
+        topk_indices,
+        query,
+        key,
+        softmax_scale,
+        loss_coeff,
+        False,
+        indexer.pg_collection,
+    )
+    dense_loss = dsa_dense_indexer_loss(
+        query.detach(),
+        key.detach(),
+        hidden_states.detach(),
+        indexer,
+        softmax_scale,
+        loss_coeff,
+        False,
+        query_chunk_size=2,
+        key_chunk_size=3,
+        use_triton=False,
+    )
+
+    torch.testing.assert_close(dense_loss, reference_loss)
+
+    params = (
+        indexer.linear_q.weight,
+        indexer.linear_k.weight,
+        indexer.k_norm.weight,
+        indexer.k_norm.bias,
+        indexer.linear_weights_proj.weight,
+    )
+    reference_grads = torch.autograd.grad(reference_loss, params)
+    dense_grads = torch.autograd.grad(dense_loss, params)
+    for actual, expected in zip(dense_grads, reference_grads):
+        torch.testing.assert_close(actual, expected)
+
+
 def _rotary_freqs(rotary, seqlen: int, rotary_dim: int):
     positions = torch.arange(seqlen, dtype=rotary.inv_freq.dtype, device=rotary.inv_freq.device)
     freqs = torch.outer(positions, rotary.inv_freq[: rotary_dim // 2])
@@ -217,6 +310,102 @@ def test_transformer_config_min_memory_accepts_sparse_loss_without_topk_only_fla
     assert not config.dsa_indexer_sparse_loss_use_topk_only
 
 
+def test_transformer_config_accepts_dense_warmup_min_memory_backend():
+    for backend in ("triton-min-memory", "torch-min-memory"):
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=32,
+            num_attention_heads=4,
+            experimental_attention_variant="dsa",
+            dsa_indexer_n_heads=2,
+            dsa_indexer_head_dim=8,
+            dsa_indexer_topk=4,
+            dsa_kernel_backend=backend,
+            dsa_fwd_use_dense_attn=True,
+            dsa_indexer_loss_coeff=0.1,
+            dsa_indexer_use_hadamard=True,
+        )
+
+        assert config.dsa_fwd_use_dense_attn
+        assert not config.dsa_indexer_use_sparse_loss
+
+
+def test_transformer_config_dense_warmup_rejects_sparse_loss_and_caches():
+    with pytest.raises(AssertionError, match="dsa_indexer_use_sparse_loss"):
+        TransformerConfig(
+            num_layers=1,
+            hidden_size=32,
+            num_attention_heads=4,
+            experimental_attention_variant="dsa",
+            dsa_indexer_n_heads=2,
+            dsa_indexer_head_dim=8,
+            dsa_indexer_topk=4,
+            dsa_kernel_backend="triton-min-memory",
+            dsa_fwd_use_dense_attn=True,
+            dsa_indexer_loss_coeff=0.1,
+            dsa_indexer_use_sparse_loss=True,
+            dsa_indexer_use_hadamard=True,
+        )
+
+    with pytest.raises(AssertionError, match="dsa_kernel_cache_routing"):
+        TransformerConfig(
+            num_layers=1,
+            hidden_size=32,
+            num_attention_heads=4,
+            experimental_attention_variant="dsa",
+            dsa_indexer_n_heads=2,
+            dsa_indexer_head_dim=8,
+            dsa_indexer_topk=4,
+            dsa_kernel_backend="triton-min-memory",
+            dsa_fwd_use_dense_attn=True,
+            dsa_indexer_loss_coeff=0.1,
+            dsa_indexer_use_hadamard=True,
+            dsa_kernel_cache_routing=True,
+        )
+
+
+def test_transformer_config_dense_warmup_requires_min_memory_backend():
+    with pytest.raises(AssertionError, match="dsa_fwd_use_dense_attn"):
+        TransformerConfig(
+            num_layers=1,
+            hidden_size=32,
+            num_attention_heads=4,
+            experimental_attention_variant="dsa",
+            dsa_indexer_n_heads=2,
+            dsa_indexer_head_dim=8,
+            dsa_indexer_topk=4,
+            dsa_kernel_backend="reference",
+            dsa_fwd_use_dense_attn=True,
+            dsa_indexer_loss_coeff=0.1,
+            dsa_indexer_use_hadamard=True,
+        )
+
+
+def test_transformer_config_dense_warmup_requires_positive_loss_coeff_and_dsa_variant():
+    with pytest.raises(AssertionError, match="dsa_indexer_loss_coeff"):
+        TransformerConfig(
+            num_layers=1,
+            hidden_size=32,
+            num_attention_heads=4,
+            experimental_attention_variant="dsa",
+            dsa_indexer_n_heads=2,
+            dsa_indexer_head_dim=8,
+            dsa_indexer_topk=4,
+            dsa_kernel_backend="triton-min-memory",
+            dsa_fwd_use_dense_attn=True,
+            dsa_indexer_loss_coeff=0.0,
+            dsa_indexer_use_hadamard=True,
+        )
+
+    with pytest.raises(AssertionError, match="experimental_attention_variant='dsa'"):
+        TransformerConfig(
+            num_layers=1,
+            hidden_size=32,
+            num_attention_heads=4,
+            dsa_fwd_use_dense_attn=True,
+        )
+
+
 def test_min_memory_backend_supports_no_grad_validation_forward(monkeypatch):
     torch.manual_seed(123)
 
@@ -276,6 +465,59 @@ def test_min_memory_backend_supports_no_grad_validation_forward(monkeypatch):
         assert not output.requires_grad
 
     assert [call["use_triton"] for call in calls] == [False, True]
+
+
+def test_dense_warmup_no_grad_validation_uses_dense_core_attention():
+    torch.manual_seed(123)
+    calls = []
+
+    class _DenseCore:
+        def __call__(self, query, key, value, attention_mask, **kwargs):
+            calls.append((query, key, value, attention_mask, kwargs))
+            return query.new_empty(query.size(0), query.size(1), query.size(2) * value.size(-1))
+
+    core = SimpleNamespace(
+        config=SimpleNamespace(
+            dsa_kernel_backend="triton-min-memory",
+            dsa_fwd_use_dense_attn=True,
+            dsa_sparse_attention_use_gather=False,
+            dsa_indexer_use_sparse_loss=False,
+            dsa_indexer_use_hadamard=True,
+            fp8=None,
+            fp8_param=False,
+            layernorm_zero_centered_gamma=False,
+            dsa_kernel_cache_routing=False,
+            dsa_kernel_cache_indexer_k=False,
+            dsa_kernel_cache_selected_scores=False,
+        ),
+        dense_core_attention=_DenseCore(),
+        indexer=object(),
+        softmax_scale=4**-0.5,
+        training=False,
+        layer_number=1,
+    )
+
+    query = torch.randn(4, 2, 4, 4)
+    key = torch.randn(4, 2, 2, 4)
+    value = torch.randn(4, 2, 2, 4)
+    attention_mask = torch.empty(1)
+    hidden_states = torch.randn(4, 2, 8)
+
+    with torch.no_grad():
+        output = DSGQACoreAttention._forward_min_memory(
+            core,
+            query,
+            key,
+            value,
+            attention_mask,
+            hidden_states,
+            attn_mask_type=AttnMaskType.causal,
+        )
+
+    assert output.shape == (4, 2, 16)
+    assert len(calls) == 1
+    assert calls[0][3] is attention_mask
+    assert calls[0][4]["attn_mask_type"] == AttnMaskType.causal
 
 
 @pytest.mark.parametrize(

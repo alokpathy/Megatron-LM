@@ -28,6 +28,7 @@ if str(_REPO_ROOT) not in sys.path:
 def _import_dsa_modules() -> None:
     """Import Megatron DSA modules after CUDA preflight has validated the process context."""
     global DSAMinMemoryGQAFn
+    global dsa_dense_indexer_loss
     global _project_k_index_block
     global _project_q_index_tile
     global _selected_index_scores_tile
@@ -48,6 +49,7 @@ def _import_dsa_modules() -> None:
     )
     from megatron.core.transformer.experimental_attention_variant.dsa_min_memory import (
         DSAMinMemoryGQAFn as _DSAMinMemoryGQAFn,
+        dsa_dense_indexer_loss as _dsa_dense_indexer_loss,
         _project_k_index_block as _project_k_index_block_imported,
         _project_q_index_tile as _project_q_index_tile_imported,
         _selected_index_scores_tile as _selected_index_scores_tile_imported,
@@ -58,6 +60,7 @@ def _import_dsa_modules() -> None:
     )
 
     DSAMinMemoryGQAFn = _DSAMinMemoryGQAFn
+    dsa_dense_indexer_loss = _dsa_dense_indexer_loss
     _project_k_index_block = _project_k_index_block_imported
     _project_q_index_tile = _project_q_index_tile_imported
     _selected_index_scores_tile = _selected_index_scores_tile_imported
@@ -244,12 +247,17 @@ class _DummyPGCollection:
     tp = _DummyTPGroup()
 
 
+@dataclass
+class _RuntimePGCollection:
+    tp: object
+
+
 class _SimpleRotary:
-    def __init__(self, rotary_dim: int, device: torch.device):
+    def __init__(self, rotary_dim: int, device: torch.device, rotary_interleaved: bool = False):
         self.inv_freq = 1.0 / (
             10000 ** (torch.arange(0, rotary_dim, 2, dtype=torch.float32, device=device) / rotary_dim)
         )
-        self.rotary_interleaved = False
+        self.rotary_interleaved = rotary_interleaved
         self.seq_len_interpolation_factor = None
 
 
@@ -281,6 +289,42 @@ def _dtype(name: str, device: torch.device) -> torch.dtype:
         "fp16": torch.float16,
         "bf16": torch.bfloat16,
     }[name]
+
+
+def _distributed_env_world_size() -> int:
+    return int(os.environ.get("WORLD_SIZE", "1"))
+
+
+def _configure_distributed_for_dense_mode(device: torch.device, backend: Optional[str]):
+    world_size = _distributed_env_world_size()
+    if world_size <= 1:
+        return device, 0, 1, _DummyPGCollection()
+
+    if device.type == "cuda":
+        local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+        if device.index is None:
+            torch.cuda.set_device(local_rank)
+            device = torch.device("cuda", local_rank)
+        else:
+            torch.cuda.set_device(device.index)
+
+    if not torch.distributed.is_initialized():
+        if backend is None:
+            backend = "nccl" if device.type == "cuda" else "gloo"
+        torch.distributed.init_process_group(backend=backend, init_method="env://")
+
+    rank = torch.distributed.get_rank()
+    world_size = torch.distributed.get_world_size()
+    return device, rank, world_size, _RuntimePGCollection(torch.distributed.group.WORLD)
+
+
+def _all_gather_concat(tensor: torch.Tensor, dim: int) -> torch.Tensor:
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        return tensor
+    world_size = torch.distributed.get_world_size()
+    gathered = [torch.empty_like(tensor) for _ in range(world_size)]
+    torch.distributed.all_gather(gathered, tensor.contiguous())
+    return torch.cat(gathered, dim=dim)
 
 
 def _make_leaf(shape: Tuple[int, ...], device: torch.device, dtype: torch.dtype) -> torch.Tensor:
@@ -323,6 +367,64 @@ def _make_case(args, device: torch.device, dtype: torch.dtype) -> Case:
     )
 
 
+def _make_dense_local_case(args, device: torch.device, dtype: torch.dtype, rank: int) -> Case:
+    torch.manual_seed(args.seed)
+    hidden_states = torch.randn(
+        args.seq_len, args.batch_size, args.hidden_size, device=device, dtype=dtype
+    )
+    linear_q_weight = _make_leaf(
+        (args.indexer_heads * args.indexer_head_dim, args.hidden_size), device, dtype
+    )
+    linear_k_weight = _make_leaf((args.indexer_head_dim, args.hidden_size), device, dtype)
+    k_norm_weight = (1.0 + 0.02 * torch.randn(args.indexer_head_dim, device=device, dtype=dtype))
+    k_norm_weight.requires_grad_(True)
+    k_norm_bias = (0.02 * torch.randn(args.indexer_head_dim, device=device, dtype=dtype))
+    k_norm_bias.requires_grad_(True)
+    linear_weights_weight = _make_leaf((args.indexer_heads, args.hidden_size), device, dtype)
+
+    generator = torch.Generator(device=device)
+    generator.manual_seed(args.seed + 1009 + rank)
+    query = torch.randn(
+        args.seq_len,
+        args.batch_size,
+        args.num_query_heads,
+        args.head_dim,
+        device=device,
+        dtype=dtype,
+        generator=generator,
+    ).requires_grad_(True)
+    key = torch.randn(
+        args.seq_len,
+        args.batch_size,
+        args.num_query_groups,
+        args.head_dim,
+        device=device,
+        dtype=dtype,
+        generator=generator,
+    ).requires_grad_(True)
+    value = torch.randn(
+        args.seq_len,
+        args.batch_size,
+        args.num_query_groups,
+        args.value_head_dim,
+        device=device,
+        dtype=dtype,
+        generator=generator,
+    ).requires_grad_(True)
+
+    return Case(
+        hidden_states,
+        query,
+        key,
+        value,
+        linear_q_weight,
+        linear_k_weight,
+        k_norm_weight,
+        k_norm_bias,
+        linear_weights_weight,
+    )
+
+
 def _clone_case(case: Case) -> Case:
     values = {}
     for name, tensor in case.__dict__.items():
@@ -345,6 +447,48 @@ def _case_tensors(case: Case) -> Iterable[Tuple[str, torch.Tensor]]:
         "linear_weights_weight",
     ):
         yield name, getattr(case, name)
+
+
+class _WeightOnlyModule:
+    def __init__(self, weight: torch.Tensor, bias: Optional[torch.Tensor] = None, eps: float = 1e-5):
+        self.weight = weight
+        self.bias = bias
+        self.eps = eps
+
+
+def _indexer_from_case(case: Case, args, pg_collection):
+    return type(
+        "_DenseWarmupIndexer",
+        (),
+        {
+            "linear_q": _WeightOnlyModule(case.linear_q_weight),
+            "linear_k": _WeightOnlyModule(case.linear_k_weight),
+            "k_norm": _WeightOnlyModule(case.k_norm_weight, case.k_norm_bias, args.layernorm_eps),
+            "linear_weights_proj": _WeightOnlyModule(case.linear_weights_weight),
+            "index_n_heads": args.indexer_heads,
+            "index_head_dim": args.indexer_head_dim,
+            "index_rotary_dim": args.indexer_rotary_dim,
+            "rotary_pos_emb": (
+                _SimpleRotary(
+                    args.indexer_rotary_dim,
+                    case.hidden_states.device,
+                    args.rotary_interleaved,
+                )
+                if args.indexer_rotary_dim > 0
+                else None
+            ),
+            "pg_collection": pg_collection,
+            "config": type(
+                "_DenseWarmupIndexerConfig",
+                (),
+                {
+                    "layernorm_epsilon": args.layernorm_eps,
+                    "dsa_indexer_use_hadamard": args.hadamard,
+                    "rotary_interleaved": args.rotary_interleaved,
+                },
+            )(),
+        },
+    )()
 
 
 def _project_indexer(case: Case, args, rotary_pos_emb):
@@ -636,6 +780,414 @@ def _min_memory_sparse_attention_grads(
     }
 
 
+def _dense_reference_loss_and_grads(
+    case: Case,
+    args,
+    rotary_pos_emb,
+    full_query: torch.Tensor,
+    full_key: torch.Tensor,
+) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    q_index, k_index, weights = _project_indexer(case, args, rotary_pos_emb)
+    index_scores, topk_indices = fused_qk_topk_naive(
+        q_index, k_index, weights, args.topk, _causal_mask(args.seq_len, case.query.device)
+    )
+    loss = compute_gqa_dsa_indexer_loss(
+        index_scores=index_scores,
+        topk_indices=topk_indices,
+        query=full_query.detach(),
+        key=full_key.detach(),
+        softmax_scale=args.head_dim**-0.5,
+        loss_coeff=args.loss_coeff,
+        sparse_loss=False,
+        pg_collection=_DummyPGCollection(),
+    )
+    params = (
+        case.linear_q_weight,
+        case.linear_k_weight,
+        case.k_norm_weight,
+        case.k_norm_bias,
+        case.linear_weights_weight,
+    )
+    grads = torch.autograd.grad(loss, params)
+    return loss.detach(), {
+        "linear_q_weight": grads[0].detach(),
+        "linear_k_weight": grads[1].detach(),
+        "k_norm_weight": grads[2].detach(),
+        "k_norm_bias": grads[3].detach(),
+        "linear_weights_weight": grads[4].detach(),
+    }
+
+
+def _dense_min_memory_loss_and_grads(
+    case: Case,
+    args,
+    pg_collection,
+    use_triton: bool,
+) -> Tuple[torch.Tensor, Dict[str, Optional[torch.Tensor]], Dict[str, Optional[torch.Tensor]]]:
+    indexer = _indexer_from_case(case, args, pg_collection)
+    loss = dsa_dense_indexer_loss(
+        query=case.query,
+        key=case.key,
+        hidden_states=case.hidden_states.requires_grad_(True),
+        indexer=indexer,
+        softmax_scale=args.head_dim**-0.5,
+        loss_coeff=args.loss_coeff,
+        use_indexer_rope=args.indexer_rotary_dim > 0,
+        query_chunk_size=args.query_block_size,
+        key_chunk_size=args.key_block_size,
+        use_triton=use_triton,
+    )
+    grad_inputs = (
+        case.linear_q_weight,
+        case.linear_k_weight,
+        case.k_norm_weight,
+        case.k_norm_bias,
+        case.linear_weights_weight,
+        case.query,
+        case.key,
+        case.hidden_states,
+    )
+    grads = torch.autograd.grad(loss, grad_inputs, allow_unused=True)
+    param_grads = {
+        "linear_q_weight": grads[0],
+        "linear_k_weight": grads[1],
+        "k_norm_weight": grads[2],
+        "k_norm_bias": grads[3],
+        "linear_weights_weight": grads[4],
+    }
+    input_grads = {
+        "query": grads[5],
+        "key": grads[6],
+        "hidden_states": grads[7],
+    }
+    return loss.detach(), param_grads, input_grads
+
+
+def _full_support_indices(batch_size: int, seq_len: int, device: torch.device) -> torch.Tensor:
+    return (
+        torch.arange(seq_len, device=device, dtype=torch.long)
+        .view(1, 1, seq_len)
+        .expand(batch_size, seq_len, seq_len)
+        .contiguous()
+    )
+
+
+def _sparse_full_topk_run(case: Case, args, rotary_pos_emb, pg_collection):
+    q_index, k_index, weights = _project_indexer(case, args, rotary_pos_emb)
+    index_scores, topk_indices = fused_qk_topk_naive(
+        q_index, k_index, weights, args.seq_len, _causal_mask(args.seq_len, case.query.device)
+    )
+    output = unfused_grouped_dsa_fn(
+        case.query,
+        case.key,
+        case.value,
+        topk_indices,
+        args.head_dim**-0.5,
+        query_chunk_size=args.query_block_size,
+        use_gather=True,
+    )
+    selected_scores = index_scores.gather(-1, topk_indices)
+    loss = compute_gqa_dsa_indexer_loss(
+        index_scores=None,
+        topk_indices=topk_indices,
+        query=case.query.detach(),
+        key=case.key.detach(),
+        softmax_scale=args.head_dim**-0.5,
+        loss_coeff=args.loss_coeff,
+        sparse_loss=True,
+        pg_collection=pg_collection,
+        sparse_loss_use_topk_only=True,
+        query_chunk_size=args.query_block_size,
+        selected_index_scores=selected_scores,
+    )
+    grad_inputs = (
+        case.query,
+        case.key,
+        case.value,
+        case.linear_q_weight,
+        case.linear_k_weight,
+        case.k_norm_weight,
+        case.k_norm_bias,
+        case.linear_weights_weight,
+    )
+    grads = torch.autograd.grad(output.float().sum() + loss.float(), grad_inputs)
+    return {
+        "topk_indices": topk_indices.detach(),
+        "output": output.detach(),
+        "loss": loss.detach(),
+        "grads": {
+            "query": grads[0].detach(),
+            "key": grads[1].detach(),
+            "value": grads[2].detach(),
+            "linear_q_weight": grads[3].detach(),
+            "linear_k_weight": grads[4].detach(),
+            "k_norm_weight": grads[5].detach(),
+            "k_norm_bias": grads[6].detach(),
+            "linear_weights_weight": grads[7].detach(),
+        },
+    }
+
+
+def _dense_full_support_run(case: Case, args, pg_collection, use_triton: bool):
+    full_support = _full_support_indices(args.batch_size, args.seq_len, case.query.device)
+    output = unfused_grouped_dsa_fn(
+        case.query,
+        case.key,
+        case.value,
+        full_support,
+        args.head_dim**-0.5,
+        use_gather=False,
+    )
+    indexer = _indexer_from_case(case, args, pg_collection)
+    loss = dsa_dense_indexer_loss(
+        query=case.query,
+        key=case.key,
+        hidden_states=case.hidden_states.requires_grad_(True),
+        indexer=indexer,
+        softmax_scale=args.head_dim**-0.5,
+        loss_coeff=args.loss_coeff,
+        use_indexer_rope=args.indexer_rotary_dim > 0,
+        query_chunk_size=args.query_block_size,
+        key_chunk_size=args.key_block_size,
+        use_triton=use_triton,
+    )
+    grad_inputs = (
+        case.query,
+        case.key,
+        case.value,
+        case.linear_q_weight,
+        case.linear_k_weight,
+        case.k_norm_weight,
+        case.k_norm_bias,
+        case.linear_weights_weight,
+        case.hidden_states,
+    )
+    grads = torch.autograd.grad(output.float().sum() + loss.float(), grad_inputs, allow_unused=True)
+    return {
+        "output": output.detach(),
+        "loss": loss.detach(),
+        "grads": {
+            "query": grads[0].detach() if grads[0] is not None else None,
+            "key": grads[1].detach() if grads[1] is not None else None,
+            "value": grads[2].detach() if grads[2] is not None else None,
+            "linear_q_weight": grads[3].detach() if grads[3] is not None else None,
+            "linear_k_weight": grads[4].detach() if grads[4] is not None else None,
+            "k_norm_weight": grads[5].detach() if grads[5] is not None else None,
+            "k_norm_bias": grads[6].detach() if grads[6] is not None else None,
+            "linear_weights_weight": grads[7].detach() if grads[7] is not None else None,
+            "hidden_states": grads[8].detach() if grads[8] is not None else None,
+        },
+    }
+
+
+def _check_dtype(name: str, actual: torch.dtype, expected: torch.dtype, fail_fast: bool) -> bool:
+    ok = actual == expected
+    status = "OK " if ok else "BAD"
+    print(f"{status} {name:<36} actual={actual} expected={expected}", flush=True)
+    if fail_fast and not ok:
+        raise SystemExit(1)
+    return ok
+
+
+def _check_no_grad(name: str, grad: Optional[torch.Tensor], fail_fast: bool) -> bool:
+    ok = grad is None or bool((grad.float() == 0).all().item())
+    status = "OK " if ok else "BAD"
+    if grad is None:
+        detail = "grad=None"
+    else:
+        detail = f"grad_dtype={grad.dtype} max_abs={float(grad.float().abs().max().item()):.6e}"
+    print(f"{status} no_indexer_input_grad_{name:<12} {detail}", flush=True)
+    if fail_fast and not ok:
+        raise SystemExit(1)
+    return ok
+
+
+def _run_dense_warmup_parity(args, device: torch.device, dtype: torch.dtype) -> int:
+    use_triton = args.backend == "triton-min-memory"
+    device, rank, world_size, pg_collection = _configure_distributed_for_dense_mode(
+        device, args.distributed_backend
+    )
+    rotary_pos_emb = (
+        _SimpleRotary(args.indexer_rotary_dim, device, args.rotary_interleaved)
+        if args.indexer_rotary_dim > 0
+        else None
+    )
+    atol = args.atol if args.atol is not None else (4e-2 if dtype != torch.float32 else 3e-4)
+    rtol = args.rtol if args.rtol is not None else (4e-2 if dtype != torch.float32 else 3e-4)
+
+    print(
+        f"Dense warmup parity backend={args.backend} rank={rank}/{world_size} device={device} "
+        f"dtype={dtype} local_Hq={args.num_query_heads} local_G={args.num_query_groups} "
+        f"global_Hq={args.num_query_heads * world_size} "
+        f"global_G={args.num_query_groups * world_size} S={args.seq_len} "
+        f"QBLOCK={args.query_block_size} KBLOCK={args.key_block_size} "
+        f"hadamard={args.hadamard} rotary_dim={args.indexer_rotary_dim} "
+        f"rotary_interleaved={args.rotary_interleaved}",
+        flush=True,
+    )
+
+    base = _make_dense_local_case(args, device, dtype, rank)
+    min_case = _clone_case(base)
+    ref_case = _clone_case(base)
+
+    full_query = _all_gather_concat(base.query.detach(), dim=2)
+    full_key = _all_gather_concat(base.key.detach(), dim=2)
+    ref_loss, ref_grads = _dense_reference_loss_and_grads(
+        ref_case, args, rotary_pos_emb, full_query, full_key
+    )
+    min_loss, min_grads, input_grads = _dense_min_memory_loss_and_grads(
+        min_case, args, pg_collection, use_triton
+    )
+
+    with _triton_dispatch_enabled(use_triton), torch.no_grad():
+        q_index, k_index, weights = _project_indexer(min_case, args, rotary_pos_emb)
+
+    failures = 0
+    failures += not _check_dtype("dense_q_index_dtype", q_index.dtype, dtype, args.fail_fast)
+    failures += not _check_dtype("dense_k_index_dtype", k_index.dtype, dtype, args.fail_fast)
+    failures += not _check_dtype("dense_weights_dtype", weights.dtype, dtype, args.fail_fast)
+    failures += not _check_dtype(
+        "dense_indexer_loss_dtype", min_loss.dtype, torch.float32, args.fail_fast
+    )
+    failures += not _check_tensor(
+        "dense_indexer_loss",
+        min_loss,
+        ref_loss,
+        atol,
+        rtol,
+        args.fail_fast,
+    )
+    for name, expected in ref_grads.items():
+        actual = min_grads[name]
+        if actual is None:
+            print(f"BAD dense_grad_{name:<24} actual=None", flush=True)
+            failures += 1
+            if args.fail_fast:
+                raise SystemExit(1)
+            continue
+        print(
+            f"INFO dense_grad_{name:<24} actual_dtype={actual.dtype} "
+            f"reference_dtype={expected.dtype}",
+            flush=True,
+        )
+        failures += not _check_tensor(
+            f"dense_grad_{name}",
+            actual,
+            expected,
+            atol,
+            rtol,
+            args.fail_fast,
+        )
+
+    for name, grad in input_grads.items():
+        failures += not _check_no_grad(name, grad, args.fail_fast)
+
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        fail_tensor = torch.tensor([failures], device=device, dtype=torch.int32)
+        torch.distributed.all_reduce(fail_tensor, op=torch.distributed.ReduceOp.SUM)
+        failures = int(fail_tensor.item())
+
+    if failures:
+        print(f"\nFAIL: {failures} dense warmup parity checks failed.", flush=True)
+        return 1
+    print("\nPASS: all dense warmup parity checks passed.", flush=True)
+    return 0
+
+
+def _run_dense_vs_full_topk_parity(args, device: torch.device, dtype: torch.dtype) -> int:
+    use_triton = args.backend == "triton-min-memory"
+    device, rank, world_size, pg_collection = _configure_distributed_for_dense_mode(
+        device, args.distributed_backend
+    )
+    rotary_pos_emb = (
+        _SimpleRotary(args.indexer_rotary_dim, device, args.rotary_interleaved)
+        if args.indexer_rotary_dim > 0
+        else None
+    )
+    atol = args.atol if args.atol is not None else (5e-2 if dtype != torch.float32 else 5e-4)
+    rtol = args.rtol if args.rtol is not None else (5e-2 if dtype != torch.float32 else 5e-4)
+
+    print(
+        f"Dense-vs-full-topk parity backend={args.backend} rank={rank}/{world_size} "
+        f"device={device} dtype={dtype} local_Hq={args.num_query_heads} "
+        f"local_G={args.num_query_groups} global_Hq={args.num_query_heads * world_size} "
+        f"global_G={args.num_query_groups * world_size} S={args.seq_len} "
+        f"full_topk={args.seq_len} QBLOCK={args.query_block_size} "
+        f"KBLOCK={args.key_block_size} hadamard={args.hadamard} "
+        f"rotary_dim={args.indexer_rotary_dim} rotary_interleaved={args.rotary_interleaved}",
+        flush=True,
+    )
+
+    base = _make_dense_local_case(args, device, dtype, rank)
+    sparse_case = _clone_case(base)
+    dense_case = _clone_case(base)
+
+    sparse = _sparse_full_topk_run(sparse_case, args, rotary_pos_emb, pg_collection)
+    dense = _dense_full_support_run(dense_case, args, pg_collection, use_triton)
+
+    failures = 0
+    failures += not _check_indices(
+        "full_topk_support",
+        sparse["topk_indices"],
+        _full_support_indices(args.batch_size, args.seq_len, device),
+        args.fail_fast,
+    )
+    failures += not _check_tensor(
+        "full_topk_sparse_vs_dense_output",
+        sparse["output"],
+        dense["output"],
+        atol,
+        rtol,
+        args.fail_fast,
+    )
+    failures += not _check_tensor(
+        "full_topk_sparse_vs_dense_loss",
+        sparse["loss"],
+        dense["loss"],
+        atol,
+        rtol,
+        args.fail_fast,
+    )
+
+    for name, sparse_grad in sparse["grads"].items():
+        dense_grad = dense["grads"].get(name)
+        if dense_grad is None:
+            print(f"BAD full_topk_grad_{name:<24} dense_grad=None", flush=True)
+            failures += 1
+            if args.fail_fast:
+                raise SystemExit(1)
+            continue
+        print(
+            f"INFO full_topk_grad_{name:<24} sparse_dtype={sparse_grad.dtype} "
+            f"dense_dtype={dense_grad.dtype}",
+            flush=True,
+        )
+        failures += not _check_tensor(
+            f"full_topk_grad_{name}",
+            sparse_grad,
+            dense_grad,
+            atol,
+            rtol,
+            args.fail_fast,
+        )
+    failures += not _check_no_grad(
+        "hidden_states",
+        dense["grads"].get("hidden_states"),
+        args.fail_fast,
+    )
+
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        fail_tensor = torch.tensor([failures], device=device, dtype=torch.int32)
+        torch.distributed.all_reduce(fail_tensor, op=torch.distributed.ReduceOp.SUM)
+        failures = int(fail_tensor.item())
+
+    if failures:
+        print(f"\nFAIL: {failures} dense-vs-full-topk parity checks failed.", flush=True)
+        return 1
+    print("\nPASS: all dense-vs-full-topk parity checks passed.", flush=True)
+    return 0
+
+
 def _max_stats(actual: torch.Tensor, expected: torch.Tensor) -> Tuple[float, float]:
     actual_f = actual.float()
     expected_f = expected.float()
@@ -749,6 +1301,12 @@ def _report_exact_indices(name: str, actual: torch.Tensor, expected: torch.Tenso
 
 def _parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--mode",
+        choices=("sparse", "dense-warmup", "dense-vs-full-topk"),
+        default="sparse",
+        help="Which parity surface to run.",
+    )
     parser.add_argument("--backend", choices=("torch-min-memory", "triton-min-memory"), default="torch-min-memory")
     parser.add_argument("--device", default="auto")
     parser.add_argument("--dtype", choices=("auto", "fp32", "fp16", "bf16"), default="auto")
@@ -781,6 +1339,12 @@ def _parse_args():
     parser.add_argument("--atol", type=float, default=None)
     parser.add_argument("--rtol", type=float, default=None)
     parser.add_argument("--fail-fast", action="store_true")
+    parser.add_argument(
+        "--distributed-backend",
+        choices=("nccl", "gloo"),
+        default=None,
+        help="Distributed backend for dense-warmup TP checks. Defaults to nccl on CUDA.",
+    )
     parser.add_argument(
         "--cuda-preflight-only",
         action="store_true",
@@ -843,11 +1407,18 @@ def main() -> int:
         raise SystemExit("--indexer-rotary-dim must be in [0, --indexer-head-dim].")
     args.indexer_rotary_dim -= args.indexer_rotary_dim % 2
 
+    if args.mode == "dense-warmup":
+        return _run_dense_warmup_parity(args, device, dtype)
+    if args.mode == "dense-vs-full-topk":
+        return _run_dense_vs_full_topk_parity(args, device, dtype)
+
     use_triton = args.backend == "triton-min-memory"
     atol = args.atol if args.atol is not None else (3e-2 if dtype != torch.float32 else 2e-4)
     rtol = args.rtol if args.rtol is not None else (3e-2 if dtype != torch.float32 else 2e-4)
     rotary_pos_emb = (
-        _SimpleRotary(args.indexer_rotary_dim, device) if args.indexer_rotary_dim > 0 else None
+        _SimpleRotary(args.indexer_rotary_dim, device, args.rotary_interleaved)
+        if args.indexer_rotary_dim > 0
+        else None
     )
 
     print(

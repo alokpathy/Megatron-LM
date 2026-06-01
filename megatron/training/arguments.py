@@ -3086,6 +3086,14 @@ def _add_experimental_attention_variant_args(parser):
         ),
     )
     _maybe_add_argument(
+        '--dsa-fwd-use-dense-attn',
+        action='store_true',
+        help=(
+            'Use dense GQA attention forward with dense tiled DSA indexer KL loss for '
+            'min-memory DSA warmup. Requires dsa_indexer_use_sparse_loss to be unset.'
+        ),
+    )
+    _maybe_add_argument(
         '--dsa-indexer-topk-key-chunk-size',
         type=int,
         default=None,
