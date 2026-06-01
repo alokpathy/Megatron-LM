@@ -2218,6 +2218,11 @@ class TransformerConfig(ModelParallelConfig):
                 'torch-min-memory',
             )
             dense_dsa_warmup = self.dsa_fwd_use_dense_attn
+            sparse_fwd_dense_loss = (
+                min_memory_dsa_backend
+                and not dense_dsa_warmup
+                and not self.dsa_indexer_use_sparse_loss
+            )
             assert self.dsa_kernel_backend in (
                 'reference',
                 'triton-min-memory',
@@ -2332,7 +2337,7 @@ class TransformerConfig(ModelParallelConfig):
                         "dsa_fwd_use_dense_attn uses dense indexer loss; do not set "
                         "dsa_indexer_use_sparse_loss."
                     )
-                    assert self.dsa_indexer_loss_coeff > 0.0, (
+                    assert (self.dsa_indexer_loss_coeff or 0.0) > 0.0, (
                         "dsa_fwd_use_dense_attn requires dsa_indexer_loss_coeff > 0."
                     )
                     assert not self.dsa_kernel_cache_routing, (
@@ -2348,10 +2353,14 @@ class TransformerConfig(ModelParallelConfig):
                         "dsa_kernel_cache_selected_scores."
                     )
                 else:
-                    assert self.dsa_indexer_use_sparse_loss, (
-                        "min-memory dsa_kernel_backend requires "
-                        "dsa_indexer_use_sparse_loss unless dsa_fwd_use_dense_attn is set."
+                    assert (self.dsa_indexer_loss_coeff or 0.0) > 0.0, (
+                        "min-memory dsa_kernel_backend requires dsa_indexer_loss_coeff > 0."
                     )
+                    if sparse_fwd_dense_loss:
+                        assert not self.dsa_kernel_cache_selected_scores, (
+                            "Sparse-forward dense-loss mode has no selected scores; do not set "
+                            "dsa_kernel_cache_selected_scores."
+                        )
                 assert self.dsa_indexer_use_hadamard, (
                     "min-memory dsa_kernel_backend requires "
                     "dsa_indexer_use_hadamard to match the DeepSeek indexer."

@@ -974,6 +974,8 @@ class DSGQACoreAttention(MegatronModule):
         """Minimum-activation DSA-GQA path for training and no-grad validation."""
         dsa_kernel_backend = getattr(self.config, "dsa_kernel_backend", "reference")
         dense_warmup = getattr(self.config, "dsa_fwd_use_dense_attn", False)
+        sparse_indexer_loss = getattr(self.config, "dsa_indexer_use_sparse_loss", False)
+        sparse_fwd_dense_loss = not dense_warmup and not sparse_indexer_loss
         assert attention_bias is None, "attention_bias is not supported for DSA-GQA."
         assert packed_seq_params is None, "Packed sequence is not supported for DSA-GQA."
         if attn_mask_type != AttnMaskType.causal:
@@ -1000,9 +1002,12 @@ class DSGQACoreAttention(MegatronModule):
             or getattr(self.config, "dsa_kernel_cache_selected_scores", False)
         ):
             raise NotImplementedError("dsa_fwd_use_dense_attn does not support DSA cache flags.")
-        if not dense_warmup and not getattr(self.config, "dsa_indexer_use_sparse_loss", False):
+        if sparse_fwd_dense_loss and getattr(
+            self.config, "dsa_kernel_cache_selected_scores", False
+        ):
             raise NotImplementedError(
-                f"dsa_kernel_backend='{dsa_kernel_backend}' requires dsa_indexer_use_sparse_loss."
+                "Sparse-forward dense-loss mode has no selected-score sparse loss; do not set "
+                "dsa_kernel_cache_selected_scores."
             )
         if not getattr(self.config, "dsa_indexer_use_hadamard", False):
             raise NotImplementedError(
@@ -1107,6 +1112,7 @@ class DSGQACoreAttention(MegatronModule):
                 "for indexer training."
             )
 
+        sparse_loss_coeff = indexer_loss_coeff if sparse_indexer_loss else 0.0
         output, indexer_loss = dsa_min_memory_gqa(
             query=query,
             key=key,
@@ -1114,7 +1120,7 @@ class DSGQACoreAttention(MegatronModule):
             hidden_states=hidden_states.detach(),
             indexer=self.indexer,
             softmax_scale=self.softmax_scale,
-            loss_coeff=indexer_loss_coeff,
+            loss_coeff=sparse_loss_coeff,
             use_indexer_rope=use_indexer_rope,
             query_chunk_size=getattr(self.config, "dsa_kernel_query_block_size", None),
             key_chunk_size=getattr(self.config, "dsa_kernel_key_block_size", None),
@@ -1128,6 +1134,22 @@ class DSGQACoreAttention(MegatronModule):
             profile_label=f"layer={self.layer_number}",
             use_triton=dsa_kernel_backend == "triton-min-memory",
         )
+        if sparse_fwd_dense_loss:
+            indexer_loss = dsa_dense_indexer_loss(
+                query=query.detach(),
+                key=key.detach(),
+                hidden_states=hidden_states.detach(),
+                indexer=self.indexer,
+                softmax_scale=self.softmax_scale,
+                loss_coeff=indexer_loss_coeff,
+                use_indexer_rope=use_indexer_rope,
+                query_chunk_size=getattr(self.config, "dsa_kernel_query_block_size", None),
+                key_chunk_size=getattr(self.config, "dsa_kernel_key_block_size", None),
+                profile_enabled=getattr(self.config, "dsa_min_memory_profile", False),
+                profile_rank=getattr(self.config, "dsa_min_memory_profile_rank", 0),
+                profile_label=f"layer={self.layer_number}",
+                use_triton=dsa_kernel_backend == "triton-min-memory",
+            )
         DSAIndexerLossLoggingHelper.save_loss_to_tracker(
             loss=indexer_loss,
             raw_loss=indexer_loss / indexer_loss_coeff,

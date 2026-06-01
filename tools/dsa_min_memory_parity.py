@@ -29,6 +29,7 @@ def _import_dsa_modules() -> None:
     """Import Megatron DSA modules after CUDA preflight has validated the process context."""
     global DSAMinMemoryGQAFn
     global dsa_dense_indexer_loss
+    global dsa_min_memory_gqa
     global _project_k_index_block
     global _project_q_index_tile
     global _selected_index_scores_tile
@@ -50,6 +51,7 @@ def _import_dsa_modules() -> None:
     from megatron.core.transformer.experimental_attention_variant.dsa_min_memory import (
         DSAMinMemoryGQAFn as _DSAMinMemoryGQAFn,
         dsa_dense_indexer_loss as _dsa_dense_indexer_loss,
+        dsa_min_memory_gqa as _dsa_min_memory_gqa,
         _project_k_index_block as _project_k_index_block_imported,
         _project_q_index_tile as _project_q_index_tile_imported,
         _selected_index_scores_tile as _selected_index_scores_tile_imported,
@@ -61,6 +63,7 @@ def _import_dsa_modules() -> None:
 
     DSAMinMemoryGQAFn = _DSAMinMemoryGQAFn
     dsa_dense_indexer_loss = _dsa_dense_indexer_loss
+    dsa_min_memory_gqa = _dsa_min_memory_gqa
     _project_k_index_block = _project_k_index_block_imported
     _project_q_index_tile = _project_q_index_tile_imported
     _selected_index_scores_tile = _selected_index_scores_tile_imported
@@ -467,6 +470,7 @@ def _indexer_from_case(case: Case, args, pg_collection):
             "linear_weights_proj": _WeightOnlyModule(case.linear_weights_weight),
             "index_n_heads": args.indexer_heads,
             "index_head_dim": args.indexer_head_dim,
+            "index_topk": args.topk,
             "index_rotary_dim": args.indexer_rotary_dim,
             "rotary_pos_emb": (
                 _SimpleRotary(
@@ -980,6 +984,131 @@ def _dense_full_support_run(case: Case, args, pg_collection, use_triton: bool):
     }
 
 
+def _reference_sparse_fwd_dense_loss_run(
+    case: Case,
+    args,
+    rotary_pos_emb,
+    topk_indices: torch.Tensor,
+    full_query: torch.Tensor,
+    full_key: torch.Tensor,
+):
+    q_index, k_index, weights = _project_indexer(case, args, rotary_pos_emb)
+    index_scores, natural_topk_indices = fused_qk_topk_naive(
+        q_index, k_index, weights, args.topk, _causal_mask(args.seq_len, case.query.device)
+    )
+    output = unfused_grouped_dsa_fn(
+        case.query,
+        case.key,
+        case.value,
+        topk_indices,
+        args.head_dim**-0.5,
+        query_chunk_size=args.query_block_size,
+        use_gather=True,
+    )
+    loss = compute_gqa_dsa_indexer_loss(
+        index_scores=index_scores,
+        topk_indices=natural_topk_indices,
+        query=full_query.detach(),
+        key=full_key.detach(),
+        softmax_scale=args.head_dim**-0.5,
+        loss_coeff=args.loss_coeff,
+        sparse_loss=False,
+        pg_collection=_DummyPGCollection(),
+    )
+    grad_inputs = (
+        case.query,
+        case.key,
+        case.value,
+        case.linear_q_weight,
+        case.linear_k_weight,
+        case.k_norm_weight,
+        case.k_norm_bias,
+        case.linear_weights_weight,
+    )
+    grads = torch.autograd.grad(output.float().sum() + loss.float(), grad_inputs)
+    return {
+        "natural_topk_indices": natural_topk_indices.detach(),
+        "output": output.detach(),
+        "loss": loss.detach(),
+        "grads": {
+            "query": grads[0].detach(),
+            "key": grads[1].detach(),
+            "value": grads[2].detach(),
+            "linear_q_weight": grads[3].detach(),
+            "linear_k_weight": grads[4].detach(),
+            "k_norm_weight": grads[5].detach(),
+            "k_norm_bias": grads[6].detach(),
+            "linear_weights_weight": grads[7].detach(),
+        },
+    }
+
+
+def _min_memory_sparse_fwd_dense_loss_run(
+    case: Case,
+    args,
+    pg_collection,
+    use_triton: bool,
+):
+    indexer = _indexer_from_case(case, args, pg_collection)
+    output, sparse_loss = dsa_min_memory_gqa(
+        query=case.query,
+        key=case.key,
+        value=case.value,
+        hidden_states=case.hidden_states.detach(),
+        indexer=indexer,
+        softmax_scale=args.head_dim**-0.5,
+        loss_coeff=0.0,
+        use_indexer_rope=args.indexer_rotary_dim > 0,
+        query_chunk_size=args.query_block_size,
+        key_chunk_size=args.key_block_size,
+        cache_routing=args.cache_routing,
+        cache_indexer_k=args.cache_indexer_k,
+        cache_selected_scores=False,
+        use_triton=use_triton,
+    )
+    hidden_for_loss = case.hidden_states.detach().requires_grad_(True)
+    loss = dsa_dense_indexer_loss(
+        query=case.query.detach(),
+        key=case.key.detach(),
+        hidden_states=hidden_for_loss,
+        indexer=indexer,
+        softmax_scale=args.head_dim**-0.5,
+        loss_coeff=args.loss_coeff,
+        use_indexer_rope=args.indexer_rotary_dim > 0,
+        query_chunk_size=args.query_block_size,
+        key_chunk_size=args.key_block_size,
+        use_triton=use_triton,
+    )
+    grad_inputs = (
+        case.query,
+        case.key,
+        case.value,
+        case.linear_q_weight,
+        case.linear_k_weight,
+        case.k_norm_weight,
+        case.k_norm_bias,
+        case.linear_weights_weight,
+        hidden_for_loss,
+    )
+    grads = torch.autograd.grad(output.float().sum() + loss.float(), grad_inputs, allow_unused=True)
+    return {
+        "output": output.detach(),
+        "sparse_loss": sparse_loss.detach(),
+        "loss": loss.detach(),
+        "grads": {
+            "query": grads[0].detach() if grads[0] is not None else None,
+            "key": grads[1].detach() if grads[1] is not None else None,
+            "value": grads[2].detach() if grads[2] is not None else None,
+            "linear_q_weight": grads[3].detach() if grads[3] is not None else None,
+            "linear_k_weight": grads[4].detach() if grads[4] is not None else None,
+            "k_norm_weight": grads[5].detach() if grads[5] is not None else None,
+            "k_norm_bias": grads[6].detach() if grads[6] is not None else None,
+            "linear_weights_weight": grads[7].detach() if grads[7] is not None else None,
+            "hidden_states": grads[8].detach() if grads[8] is not None else None,
+        },
+    }
+
+
 def _check_dtype(name: str, actual: torch.dtype, expected: torch.dtype, fail_fast: bool) -> bool:
     ok = actual == expected
     status = "OK " if ok else "BAD"
@@ -1188,6 +1317,130 @@ def _run_dense_vs_full_topk_parity(args, device: torch.device, dtype: torch.dtyp
     return 0
 
 
+def _run_sparse_fwd_dense_loss_parity(args, device: torch.device, dtype: torch.dtype) -> int:
+    if args.cache_selected_scores:
+        raise SystemExit(
+            "--cache-selected-scores is invalid for sparse-forward dense-loss mode; "
+            "there is no selected-score sparse loss to cache."
+        )
+    use_triton = args.backend == "triton-min-memory"
+    device, rank, world_size, pg_collection = _configure_distributed_for_dense_mode(
+        device, args.distributed_backend
+    )
+    rotary_pos_emb = (
+        _SimpleRotary(args.indexer_rotary_dim, device, args.rotary_interleaved)
+        if args.indexer_rotary_dim > 0
+        else None
+    )
+    atol = args.atol if args.atol is not None else (5e-2 if dtype != torch.float32 else 5e-4)
+    rtol = args.rtol if args.rtol is not None else (5e-2 if dtype != torch.float32 else 5e-4)
+
+    print(
+        f"Sparse-forward dense-loss parity backend={args.backend} rank={rank}/{world_size} "
+        f"device={device} dtype={dtype} local_Hq={args.num_query_heads} "
+        f"local_G={args.num_query_groups} global_Hq={args.num_query_heads * world_size} "
+        f"global_G={args.num_query_groups * world_size} S={args.seq_len} topk={args.topk} "
+        f"QBLOCK={args.query_block_size} KBLOCK={args.key_block_size} "
+        f"cache_routing={args.cache_routing} cache_indexer_k={args.cache_indexer_k} "
+        f"hadamard={args.hadamard} rotary_dim={args.indexer_rotary_dim} "
+        f"rotary_interleaved={args.rotary_interleaved}",
+        flush=True,
+    )
+
+    base = _make_dense_local_case(args, device, dtype, rank)
+    comp_case = _clone_case(base)
+    ref_case = _clone_case(base)
+    min_case = _clone_case(base)
+
+    components = _min_memory_components(comp_case, args, rotary_pos_emb, use_triton)
+    full_query = _all_gather_concat(base.query.detach(), dim=2)
+    full_key = _all_gather_concat(base.key.detach(), dim=2)
+    reference = _reference_sparse_fwd_dense_loss_run(
+        ref_case,
+        args,
+        rotary_pos_emb,
+        components["topk_indices"],
+        full_query,
+        full_key,
+    )
+    min_memory = _min_memory_sparse_fwd_dense_loss_run(
+        min_case,
+        args,
+        pg_collection,
+        use_triton,
+    )
+
+    failures = 0
+    failures += not _check_causal_support_indices(
+        "sparse_dense_loss_topk_support",
+        components["topk_indices"],
+        reference["natural_topk_indices"],
+        args.fail_fast,
+    )
+    failures += not _check_tensor(
+        "sparse_dense_loss_forward_output",
+        min_memory["output"],
+        reference["output"],
+        atol,
+        rtol,
+        args.fail_fast,
+    )
+    failures += not _check_tensor(
+        "sparse_dense_loss_internal_sparse_loss_zero",
+        min_memory["sparse_loss"],
+        torch.zeros_like(min_memory["sparse_loss"]),
+        0.0,
+        0.0,
+        args.fail_fast,
+    )
+    failures += not _check_tensor(
+        "sparse_dense_loss_indexer_loss",
+        min_memory["loss"],
+        reference["loss"],
+        atol,
+        rtol,
+        args.fail_fast,
+    )
+
+    for name, expected in reference["grads"].items():
+        actual = min_memory["grads"].get(name)
+        if actual is None:
+            print(f"BAD sparse_dense_loss_grad_{name:<18} actual=None", flush=True)
+            failures += 1
+            if args.fail_fast:
+                raise SystemExit(1)
+            continue
+        print(
+            f"INFO sparse_dense_loss_grad_{name:<18} actual_dtype={actual.dtype} "
+            f"reference_dtype={expected.dtype}",
+            flush=True,
+        )
+        failures += not _check_tensor(
+            f"sparse_dense_loss_grad_{name}",
+            actual,
+            expected,
+            atol,
+            rtol,
+            args.fail_fast,
+        )
+    failures += not _check_no_grad(
+        "hidden_states",
+        min_memory["grads"].get("hidden_states"),
+        args.fail_fast,
+    )
+
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        fail_tensor = torch.tensor([failures], device=device, dtype=torch.int32)
+        torch.distributed.all_reduce(fail_tensor, op=torch.distributed.ReduceOp.SUM)
+        failures = int(fail_tensor.item())
+
+    if failures:
+        print(f"\nFAIL: {failures} sparse-forward dense-loss parity checks failed.", flush=True)
+        return 1
+    print("\nPASS: all sparse-forward dense-loss parity checks passed.", flush=True)
+    return 0
+
+
 def _max_stats(actual: torch.Tensor, expected: torch.Tensor) -> Tuple[float, float]:
     actual_f = actual.float()
     expected_f = expected.float()
@@ -1303,7 +1556,7 @@ def _parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--mode",
-        choices=("sparse", "dense-warmup", "dense-vs-full-topk"),
+        choices=("sparse", "dense-warmup", "dense-vs-full-topk", "sparse-fwd-dense-loss"),
         default="sparse",
         help="Which parity surface to run.",
     )
@@ -1411,6 +1664,8 @@ def main() -> int:
         return _run_dense_warmup_parity(args, device, dtype)
     if args.mode == "dense-vs-full-topk":
         return _run_dense_vs_full_topk_parity(args, device, dtype)
+    if args.mode == "sparse-fwd-dense-loss":
+        return _run_sparse_fwd_dense_loss_parity(args, device, dtype)
 
     use_triton = args.backend == "triton-min-memory"
     atol = args.atol if args.atol is not None else (3e-2 if dtype != torch.float32 else 2e-4)

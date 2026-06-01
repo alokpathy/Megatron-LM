@@ -852,8 +852,29 @@ def test_native_indexer_loss_wgrad_matches_autograd(rotary_interleaved, use_hada
     atol = 3e-2 if use_hadamard else 2e-3
     for native_grad, ref_grad in zip(native_grads, ref_grads):
         torch.testing.assert_close(native_grad, ref_grad.float(), rtol=rtol, atol=atol)
-def test_transformer_config_min_memory_requires_sparse_loss():
-    with pytest.raises(AssertionError, match="dsa_indexer_use_sparse_loss"):
+
+
+def test_transformer_config_accepts_min_memory_sparse_forward_dense_loss():
+    for backend in ("triton-min-memory", "torch-min-memory"):
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=32,
+            num_attention_heads=4,
+            experimental_attention_variant="dsa",
+            dsa_indexer_n_heads=2,
+            dsa_indexer_head_dim=8,
+            dsa_indexer_topk=4,
+            dsa_kernel_backend=backend,
+            dsa_indexer_loss_coeff=0.1,
+            dsa_indexer_use_hadamard=True,
+        )
+
+        assert not config.dsa_fwd_use_dense_attn
+        assert not config.dsa_indexer_use_sparse_loss
+
+
+def test_transformer_config_sparse_forward_dense_loss_rejects_selected_score_cache():
+    with pytest.raises(AssertionError, match="dsa_kernel_cache_selected_scores"):
         TransformerConfig(
             num_layers=1,
             hidden_size=32,
@@ -865,6 +886,7 @@ def test_transformer_config_min_memory_requires_sparse_loss():
             dsa_kernel_backend="triton-min-memory",
             dsa_indexer_loss_coeff=0.1,
             dsa_indexer_use_hadamard=True,
+            dsa_kernel_cache_selected_scores=True,
         )
 
 
