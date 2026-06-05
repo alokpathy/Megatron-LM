@@ -313,6 +313,9 @@ class TransformerConfig(ModelParallelConfig):
     dsa_fwd_use_dense_attn: bool = False
     """Whether DSA min-memory backends use dense GQA attention forward for indexer warmup."""
 
+    dsa_train_indexer_only: bool = False
+    """Whether to freeze non-indexer parameters and train only DSA indexer parameters."""
+
     dsa_indexer_topk_key_chunk_size: Optional[int] = None
     """Optional key chunk size for exact streamed DSA top-k routing. If unset, use dense routing."""
 
@@ -2198,6 +2201,9 @@ class TransformerConfig(ModelParallelConfig):
         assert (
             not self.dsa_fwd_use_dense_attn or self.experimental_attention_variant == "dsa"
         ), "dsa_fwd_use_dense_attn requires experimental_attention_variant='dsa'."
+        assert (
+            not self.dsa_train_indexer_only or self.experimental_attention_variant == "dsa"
+        ), "dsa_train_indexer_only requires experimental_attention_variant='dsa'."
 
         if self.experimental_attention_variant == "dsa":
             assert self.dsa_indexer_n_heads is not None and self.dsa_indexer_n_heads > 0, (
@@ -2209,6 +2215,9 @@ class TransformerConfig(ModelParallelConfig):
             assert self.dsa_indexer_topk is not None and self.dsa_indexer_topk > 0, (
                 "dsa_indexer_topk must be set to a positive integer when using DSA."
             )
+            assert (
+                not self.dsa_train_indexer_only or (self.dsa_indexer_loss_coeff or 0.0) > 0.0
+            ), "dsa_train_indexer_only requires dsa_indexer_loss_coeff > 0."
             assert (
                 self.dsa_indexer_topk_key_chunk_size is None
                 or self.dsa_indexer_topk_key_chunk_size > 0

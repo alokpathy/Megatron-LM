@@ -3094,6 +3094,14 @@ def _add_experimental_attention_variant_args(parser):
         ),
     )
     _maybe_add_argument(
+        '--dsa-train-indexer-only',
+        action='store_true',
+        help=(
+            'Freeze non-indexer parameters and train only DSA indexer parameters. '
+            'Intended for DSA indexer warmup from a dense GQA checkpoint.'
+        ),
+    )
+    _maybe_add_argument(
         '--dsa-indexer-topk-key-chunk-size',
         type=int,
         default=None,

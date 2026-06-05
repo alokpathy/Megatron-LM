@@ -672,6 +672,39 @@ def get_start_time_from_progress_log():
     return datetime.strptime(start_time, '%Y-%m-%d %H:%M:%S'), start_num_floating_point_operations
 
 
+def _freeze_non_dsa_indexer_parameters(model):
+    """Freeze all parameters except those under DSA indexer submodules."""
+
+    indexer_param_count = 0
+    frozen_param_count = 0
+    indexer_element_count = 0
+    frozen_element_count = 0
+
+    for model_module in model:
+        for name, param in model_module.named_parameters():
+            is_indexer_param = ".indexer." in f".{name}."
+            if is_indexer_param:
+                param.requires_grad_(True)
+                indexer_param_count += 1
+                indexer_element_count += param.nelement()
+            else:
+                param.requires_grad_(False)
+                frozen_param_count += 1
+                frozen_element_count += param.nelement()
+
+    if indexer_param_count == 0:
+        raise RuntimeError(
+            "--dsa-train-indexer-only was set, but no DSA indexer parameters were found. "
+            "Check that --experimental-attention-variant dsa is active and DSA layers are built."
+        )
+
+    print_rank_0(
+        " > DSA train-indexer-only: trainable indexer params "
+        f"{indexer_param_count} tensors / {indexer_element_count} elements; "
+        f"frozen non-indexer params {frozen_param_count} tensors / {frozen_element_count} elements."
+    )
+
+
 def preprocess_common_state_dict(common_state_dict):
     import copy
 
@@ -1279,6 +1312,13 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
     for model_module in model:
         for param in model_module.parameters():
             tensor_parallel.set_defaults_if_not_set_tensor_model_parallel_attributes(param)
+
+    if getattr(args, "dsa_train_indexer_only", False):
+        if getattr(args, "experimental_attention_variant", None) != "dsa":
+            raise RuntimeError(
+                "--dsa-train-indexer-only requires --experimental-attention-variant dsa."
+            )
+        _freeze_non_dsa_indexer_parameters(model)
 
     # Print number of parameters.
     num_parameters = sum(
