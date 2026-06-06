@@ -832,6 +832,8 @@ def validate_args(args, defaults={}):
             'Must use --overlap-param-gather with --overlap-grad-reduce'
         assert not args.use_legacy_models, \
             '--overlap-param-gather only supported with MCore models'
+        assert not getattr(args, 'dsa_train_indexer_only', False), \
+            '--dsa-train-indexer-only is not compatible with --overlap-param-gather'
 
     if args.use_torch_fsdp2:
         assert is_torch_min_version("2.4.0"), \

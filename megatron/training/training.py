@@ -1318,6 +1318,12 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             raise RuntimeError(
                 "--dsa-train-indexer-only requires --experimental-attention-variant dsa."
             )
+        if getattr(args, "overlap_param_gather", False):
+            raise RuntimeError(
+                "--dsa-train-indexer-only is not compatible with --overlap-param-gather. "
+                "DSA min-memory indexer paths use indexer parameter tensors directly, bypassing "
+                "the module forward pre-hooks that overlapped param gather depends on."
+            )
         _freeze_non_dsa_indexer_parameters(model)
 
     # Print number of parameters.
