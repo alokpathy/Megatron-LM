@@ -719,65 +719,90 @@ def _is_dsa_indexer_module_name(name: str) -> bool:
     return name == "indexer" or name.endswith(".indexer")
 
 
-def _reset_dsa_indexer_modules(model, seed: int) -> int:
-    """Reset DSA indexer modules using the same initializers as construction."""
+def _reset_dsa_indexer_modules_with_current_rng(model) -> int:
+    """Reset DSA indexer modules using the current RNG state."""
     if not isinstance(model, list):
         model = [model]
 
-    cuda_devices = []
-    if torch.cuda.is_available():
-        cuda_devices = [torch.cuda.current_device()]
-
     reset_module_count = 0
-    with torch.random.fork_rng(devices=cuda_devices):
-        torch.manual_seed(seed)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed(seed)
-        for model_module in model:
-            config = get_model_config(model_module)
-            init_method = getattr(config, "init_method", None)
-            for module_name, module in model_module.named_modules():
-                if not _is_dsa_indexer_module_name(module_name):
+    for model_module in model:
+        config = get_model_config(model_module)
+        init_method = getattr(config, "init_method", None)
+        for module_name, module in model_module.named_modules():
+            if not _is_dsa_indexer_module_name(module_name):
+                continue
+            reset_module_count += 1
+            for child_name, child in module.named_modules():
+                if child_name == "":
                     continue
-                reset_module_count += 1
-                for child_name, child in module.named_modules():
-                    if child_name == "":
-                        continue
-                    child_params = list(child.named_parameters(recurse=False))
-                    if not child_params:
-                        continue
-                    has_matrix_param = any(param.ndim >= 2 for _, param in child_params)
-                    if has_matrix_param:
-                        for param_name, param in child_params:
-                            with torch.no_grad():
-                                if param.ndim >= 2:
-                                    if init_method is None:
-                                        raise RuntimeError(
-                                            "Cannot reset DSA indexer matrix parameter without "
-                                            "a model init_method."
-                                        )
-                                    init_method(param)
-                                elif param_name == "bias":
-                                    param.zero_()
-                                elif param_name == "weight":
-                                    param.fill_(1.0)
-                    elif hasattr(child, "reset_parameters"):
-                        child.reset_parameters()
-                    else:
-                        for param_name, param in child_params:
-                            with torch.no_grad():
-                                if param_name == "bias":
-                                    param.zero_()
-                                elif param_name == "weight":
-                                    param.fill_(1.0)
-                                else:
-                                    param.zero_()
+                child_params = list(child.named_parameters(recurse=False))
+                if not child_params:
+                    continue
+                has_matrix_param = any(param.ndim >= 2 for _, param in child_params)
+                if has_matrix_param:
+                    for param_name, param in child_params:
+                        with torch.no_grad():
+                            if param.ndim >= 2:
+                                if init_method is None:
+                                    raise RuntimeError(
+                                        "Cannot reset DSA indexer matrix parameter without "
+                                        "a model init_method."
+                                    )
+                                init_method(param)
+                            elif param_name == "bias":
+                                param.zero_()
+                            elif param_name == "weight":
+                                param.fill_(1.0)
+                elif hasattr(child, "reset_parameters"):
+                    child.reset_parameters()
+                else:
+                    for param_name, param in child_params:
+                        with torch.no_grad():
+                            if param_name == "bias":
+                                param.zero_()
+                            elif param_name == "weight":
+                                param.fill_(1.0)
+                            else:
+                                param.zero_()
 
     if reset_module_count == 0:
         raise RuntimeError(
             "--dsa-reset-indexer-on-load was set, but no DSA indexer modules were found."
         )
     return reset_module_count
+
+
+def _reset_dsa_indexer_modules(model, seed: int) -> int:
+    """Reset DSA indexer modules using the same RNG path as duplicated TE construction."""
+    cuda_available = torch.cuda.is_available()
+    cuda_rng_tracker = tensor_parallel.get_cuda_rng_tracker()
+    if cuda_available and cuda_rng_tracker.is_initialized():
+        rng_tracker_states = cuda_rng_tracker.get_states()
+        rng_tracker_name = tensor_parallel.get_data_parallel_rng_tracker_name()
+        try:
+            with cuda_rng_tracker.fork(rng_tracker_name):
+                torch.cuda.manual_seed(seed)
+                return _reset_dsa_indexer_modules_with_current_rng(model)
+        finally:
+            cuda_rng_tracker.set_states(rng_tracker_states)
+
+    cuda_devices = [torch.cuda.current_device()] if cuda_available else []
+    with torch.random.fork_rng(devices=cuda_devices):
+        torch.manual_seed(seed)
+        if cuda_available:
+            torch.cuda.manual_seed(seed)
+        return _reset_dsa_indexer_modules_with_current_rng(model)
+
+
+def _get_dsa_indexer_reset_seed(args) -> int:
+    """Return the reset seed, following normal Megatron model-init seed derivation."""
+    seed = args.dsa_indexer_reset_seed
+    if seed is None:
+        seed = getattr(args, "seed", 1234)
+        seed += 100 * mpu.get_pipeline_model_parallel_rank()
+        if getattr(args, "data_parallel_random_init", False):
+            seed += 10 * mpu.get_data_parallel_rank()
+    return seed
 
 
 def _clear_dsa_indexer_optimizer_state(model, optimizer) -> int:
@@ -839,9 +864,7 @@ def _apply_dsa_indexer_lr_warmup(args, optimizer, opt_param_scheduler) -> float 
 
 def _reset_dsa_indexer_after_load(model, optimizer, opt_param_scheduler, args, explicit_start: bool):
     """Reset DSA indexer params/state after checkpoint load and initialize activation warmup."""
-    seed = args.dsa_indexer_reset_seed
-    if seed is None:
-        seed = getattr(args, "seed", 1234)
+    seed = _get_dsa_indexer_reset_seed(args)
 
     reset_count = _reset_dsa_indexer_modules(model, seed)
     if optimizer is not None and not getattr(optimizer, "is_stub_optimizer", False):
