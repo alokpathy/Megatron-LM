@@ -698,7 +698,10 @@ class DSGQACoreAttention(MegatronModule):
             submodules.indexer, config=config, pg_collection=pg_collection
         )
         self.dense_core_attention = None
-        if getattr(config, "dsa_fwd_use_dense_attn", False) and (
+        if (
+            getattr(config, "dsa_fwd_use_dense_attn", False)
+            or getattr(config, "dsa_fwd_skip_dsa", False)
+        ) and (
             submodules.dense_core_attention is not None
         ):
             self.dense_core_attention = build_module(
@@ -744,7 +747,10 @@ class DSGQACoreAttention(MegatronModule):
         sq, b, _, _ = query.size()
         skv = key.size(0)
         dsa_kernel_backend = getattr(self.config, "dsa_kernel_backend", "reference")
-        if dsa_kernel_backend in ("triton-min-memory", "torch-min-memory"):
+        if getattr(self.config, "dsa_fwd_skip_dsa", False) or dsa_kernel_backend in (
+            "triton-min-memory",
+            "torch-min-memory",
+        ):
             return self._forward_min_memory(
                 query=query,
                 key=key,
@@ -973,9 +979,10 @@ class DSGQACoreAttention(MegatronModule):
     ) -> torch.Tensor:
         """Minimum-activation DSA-GQA path for training and no-grad validation."""
         dsa_kernel_backend = getattr(self.config, "dsa_kernel_backend", "reference")
+        skip_dsa = getattr(self.config, "dsa_fwd_skip_dsa", False)
         dense_warmup = getattr(self.config, "dsa_fwd_use_dense_attn", False)
         sparse_indexer_loss = getattr(self.config, "dsa_indexer_use_sparse_loss", False)
-        sparse_fwd_dense_loss = not dense_warmup and not sparse_indexer_loss
+        sparse_fwd_dense_loss = not skip_dsa and not dense_warmup and not sparse_indexer_loss
         assert attention_bias is None, "attention_bias is not supported for DSA-GQA."
         assert packed_seq_params is None, "Packed sequence is not supported for DSA-GQA."
         if attn_mask_type != AttnMaskType.causal:
@@ -986,6 +993,39 @@ class DSGQACoreAttention(MegatronModule):
             raise NotImplementedError(
                 f"dsa_kernel_backend='{dsa_kernel_backend}' requires full-sequence self attention."
             )
+        if skip_dsa:
+            if self.dense_core_attention is None:
+                raise RuntimeError("DSA skip mode requires an original dense core attention spec.")
+            output = self.dense_core_attention(
+                query,
+                key,
+                value,
+                attention_mask,
+                attn_mask_type=attn_mask_type,
+                attention_bias=attention_bias,
+                packed_seq_params=packed_seq_params,
+            )
+            zero_indexer_loss = output.new_zeros((), dtype=torch.float32)
+            DSAIndexerLossLoggingHelper.save_loss_to_tracker(
+                loss=zero_indexer_loss,
+                raw_loss=zero_indexer_loss,
+                layer_number=self.layer_number,
+                num_layers=self.config.num_layers,
+            )
+            if not torch.is_grad_enabled():
+                return output
+            if not self.training:
+                raise NotImplementedError(
+                    "dsa_fwd_skip_dsa supports training and no-grad validation only."
+                )
+            zero_predicate = output.new_zeros((), dtype=torch.bool)
+            for param in self.indexer.parameters():
+                if param.requires_grad and param.numel() > 0:
+                    param_value = param.reshape(-1)[0].float()
+                    zero_indexer_loss = zero_indexer_loss + torch.where(
+                        zero_predicate, param_value, param_value.new_zeros(())
+                    )
+            return DSAIndexerLossAutoScaler.apply(output, zero_indexer_loss)
         if getattr(self.config, "dsa_sparse_attention_use_gather", False):
             raise NotImplementedError(
                 f"dsa_kernel_backend='{dsa_kernel_backend}' bypasses the reference gather backend; "
@@ -1170,6 +1210,8 @@ class DSGQACoreAttention(MegatronModule):
     ) -> torch.Tensor:
         assert not self.training, "Dynamic DSA-GQA inference only supports eval mode."
         assert value_cache is not None, "Dynamic DSA-GQA requires value cache."
+        if getattr(self.config, "dsa_fwd_skip_dsa", False):
+            raise NotImplementedError("dsa_fwd_skip_dsa is not supported by dynamic inference.")
 
         q_index, k_index_current, weights = self.indexer.forward_before_topk_dynamic(
             hidden_states,

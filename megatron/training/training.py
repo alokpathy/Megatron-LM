@@ -49,7 +49,10 @@ from typing import Any, Optional, Dict
 import torch.distributed
 
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
-from megatron.core.optimizer_param_scheduler import get_canonical_lr_for_logging
+from megatron.core.optimizer_param_scheduler import (
+    get_canonical_lr_for_logging,
+    get_indexer_lr_for_logging,
+)
 from .log_handler import CustomHandler
 
 # Make default logging level INFO, but filter out all log messages not from MCore.
@@ -113,7 +116,7 @@ from megatron.core.transformer.module import Float16Module
 from megatron.core.distributed import DistributedDataParallelConfig, TorchFullyShardedDataParallelConfig
 from megatron.core.distributed import DistributedDataParallel as DDP
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel as megatron_FSDP
-from megatron.core.optimizer.optimizer import param_group_identifier_keys
+from megatron.core.optimizer.optimizer import get_param_group_identifier_tuple
 
 from megatron.core.optimizer.qk_clip import clip_qk
 
@@ -177,6 +180,7 @@ from .utils import (
     calc_dsa_split_grad_num_zeros,
     calc_params_l2_norm,
     check_adlr_autoresume_termination,
+    get_model_to_optimizer_param_map,
     logical_and_across_model_parallel_group,
     reduce_max_stat_across_model_parallel_group,
     is_last_rank,
@@ -682,7 +686,7 @@ def _freeze_non_dsa_indexer_parameters(model):
 
     for model_module in model:
         for name, param in model_module.named_parameters():
-            is_indexer_param = ".indexer." in f".{name}."
+            is_indexer_param = _is_dsa_indexer_param_name(name)
             if is_indexer_param:
                 param.requires_grad_(True)
                 indexer_param_count += 1
@@ -702,6 +706,159 @@ def _freeze_non_dsa_indexer_parameters(model):
         " > DSA train-indexer-only: trainable indexer params "
         f"{indexer_param_count} tensors / {indexer_element_count} elements; "
         f"frozen non-indexer params {frozen_param_count} tensors / {frozen_element_count} elements."
+    )
+
+
+def _is_dsa_indexer_param_name(name: str) -> bool:
+    """Return true when a parameter name belongs to a DSA indexer module."""
+    return name.startswith("indexer.") or ".indexer." in name
+
+
+def _is_dsa_indexer_module_name(name: str) -> bool:
+    """Return true when a module name is a DSA indexer module."""
+    return name == "indexer" or name.endswith(".indexer")
+
+
+def _reset_dsa_indexer_modules(model, seed: int) -> int:
+    """Reset DSA indexer modules using the same initializers as construction."""
+    if not isinstance(model, list):
+        model = [model]
+
+    cuda_devices = []
+    if torch.cuda.is_available():
+        cuda_devices = [torch.cuda.current_device()]
+
+    reset_module_count = 0
+    with torch.random.fork_rng(devices=cuda_devices):
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed(seed)
+        for model_module in model:
+            config = get_model_config(model_module)
+            init_method = getattr(config, "init_method", None)
+            for module_name, module in model_module.named_modules():
+                if not _is_dsa_indexer_module_name(module_name):
+                    continue
+                reset_module_count += 1
+                for child_name, child in module.named_modules():
+                    if child_name == "":
+                        continue
+                    child_params = list(child.named_parameters(recurse=False))
+                    if not child_params:
+                        continue
+                    has_matrix_param = any(param.ndim >= 2 for _, param in child_params)
+                    if has_matrix_param:
+                        for param_name, param in child_params:
+                            with torch.no_grad():
+                                if param.ndim >= 2:
+                                    if init_method is None:
+                                        raise RuntimeError(
+                                            "Cannot reset DSA indexer matrix parameter without "
+                                            "a model init_method."
+                                        )
+                                    init_method(param)
+                                elif param_name == "bias":
+                                    param.zero_()
+                                elif param_name == "weight":
+                                    param.fill_(1.0)
+                    elif hasattr(child, "reset_parameters"):
+                        child.reset_parameters()
+                    else:
+                        for param_name, param in child_params:
+                            with torch.no_grad():
+                                if param_name == "bias":
+                                    param.zero_()
+                                elif param_name == "weight":
+                                    param.fill_(1.0)
+                                else:
+                                    param.zero_()
+
+    if reset_module_count == 0:
+        raise RuntimeError(
+            "--dsa-reset-indexer-on-load was set, but no DSA indexer modules were found."
+        )
+    return reset_module_count
+
+
+def _clear_dsa_indexer_optimizer_state(model, optimizer) -> int:
+    """Clear optimizer state only for DSA indexer optimizer parameters."""
+    if optimizer is None or getattr(optimizer, "is_stub_optimizer", False):
+        return 0
+    if not isinstance(model, list):
+        model = [model]
+    if hasattr(optimizer, "chained_optimizers"):
+        return sum(
+            _clear_dsa_indexer_optimizer_state(model, child_optimizer)
+            for child_optimizer in optimizer.chained_optimizers
+        )
+
+    param_to_optim_param = get_model_to_optimizer_param_map(optimizer)
+    torch_optimizer = getattr(optimizer, "optimizer", None)
+    optimizer_state = getattr(torch_optimizer, "state", None)
+    if optimizer_state is None:
+        return 0
+
+    cleared = 0
+    seen_param_ids = set()
+    for model_chunk in model:
+        for name, param in model_chunk.named_parameters():
+            if not _is_dsa_indexer_param_name(name):
+                continue
+            param_id = id(param)
+            if param_id in seen_param_ids:
+                continue
+            seen_param_ids.add(param_id)
+            optim_param = param_to_optim_param.get(param)
+            if optim_param is not None and optim_param in optimizer_state:
+                optimizer_state.pop(optim_param, None)
+                cleared += 1
+    return cleared
+
+
+def _apply_dsa_indexer_lr_warmup(args, optimizer, opt_param_scheduler) -> float | None:
+    """Post-scale DSA indexer optimizer groups after the global scheduler step."""
+    if optimizer is None or opt_param_scheduler is None:
+        return None
+    activation_start = getattr(args, "dsa_indexer_activation_start_samples", None)
+    if activation_start is None:
+        return get_indexer_lr_for_logging(optimizer.param_groups)
+
+    warmup_samples = getattr(args, "dsa_indexer_activation_warmup_samples", 0) or 0
+    if warmup_samples == 0:
+        scale = 1.0
+    else:
+        scheduler_samples = getattr(opt_param_scheduler, "num_steps", args.consumed_train_samples)
+        scale = (scheduler_samples - activation_start) / float(warmup_samples)
+        scale = max(0.0, min(1.0, scale))
+
+    for param_group in optimizer.param_groups:
+        if param_group.get("is_dsa_indexer", False):
+            param_group["lr"] = opt_param_scheduler.get_lr(param_group) * scale
+    return get_indexer_lr_for_logging(optimizer.param_groups)
+
+
+def _reset_dsa_indexer_after_load(model, optimizer, opt_param_scheduler, args, explicit_start: bool):
+    """Reset DSA indexer params/state after checkpoint load and initialize activation warmup."""
+    seed = args.dsa_indexer_reset_seed
+    if seed is None:
+        seed = getattr(args, "seed", 1234)
+
+    reset_count = _reset_dsa_indexer_modules(model, seed)
+    if optimizer is not None and not getattr(optimizer, "is_stub_optimizer", False):
+        optimizer.reload_model_params()
+    cleared_state_count = _clear_dsa_indexer_optimizer_state(model, optimizer)
+
+    if not explicit_start:
+        args.dsa_indexer_activation_start_samples = getattr(
+            opt_param_scheduler, "num_steps", args.consumed_train_samples
+        )
+    indexer_lr = _apply_dsa_indexer_lr_warmup(args, optimizer, opt_param_scheduler)
+
+    print_rank_0(
+        " > DSA reset-indexer-on-load: reset "
+        f"{reset_count} indexer modules with seed {seed}; cleared optimizer state for "
+        f"{cleared_state_count} indexer tensors; activation_start_samples="
+        f"{args.dsa_indexer_activation_start_samples}; indexer_lr={indexer_lr}."
     )
 
 
@@ -733,8 +890,7 @@ def preprocess_common_state_dict(common_state_dict):
             if "param_groups" not in inner_optimizer:
                 return
             param_groups = inner_optimizer["param_groups"]
-            key_fn = lambda pg: [pg[key] for key in param_group_identifier_keys]
-            param_groups.sort(key=key_fn)
+            param_groups.sort(key=get_param_group_identifier_tuple)
             inner_optimizer["param_groups"] = param_groups
 
         optimizer_state_dict = preprocessed_common_state_dict['optimizer']
@@ -1632,6 +1788,9 @@ def setup_model_and_optimizer(
             optimizer.reload_model_params()
         print_rank_0(f'Upcycled checkpoint saved to {args.save}')
 
+    dsa_activation_start_explicit = (
+        getattr(args, "dsa_indexer_activation_start_samples", None) is not None
+    )
     if (
         args.load is not None or args.pretrained_checkpoint is not None
     ) and not args.moe_use_upcycling:
@@ -1657,9 +1816,20 @@ def setup_model_and_optimizer(
                 'load_checkpoint_time': timers('load-checkpoint').active_time(),
             }
         )
+        if getattr(args, "dsa_reset_indexer_on_load", False):
+            _reset_dsa_indexer_after_load(
+                unwrapped_model,
+                optimizer,
+                opt_param_scheduler,
+                args,
+                explicit_start=dsa_activation_start_explicit,
+            )
+        else:
+            _apply_dsa_indexer_lr_warmup(args, optimizer, opt_param_scheduler)
     else:
         args.iteration = 0
         args.num_floating_point_operations_so_far = 0
+        _apply_dsa_indexer_lr_warmup(args, optimizer, opt_param_scheduler)
 
     # get model without FP16 and/or DDP wrappers
     if (
@@ -1834,6 +2004,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     if update_successful:
         increment = get_num_microbatches() * args.micro_batch_size * args.data_parallel_size
         opt_param_scheduler.step(increment=increment)
+        _apply_dsa_indexer_lr_warmup(args, optimizer, opt_param_scheduler)
         skipped_iter = 0
     else:
         skipped_iter = 1
@@ -1880,6 +2051,7 @@ def training_log(
     loss_dict,
     total_loss_dict,
     learning_rate: float | None,
+    indexer_learning_rate: float | None,
     iteration,
     loss_scale,
     report_memory_flag,
@@ -1985,6 +2157,9 @@ def training_log(
 
     # learning rate will be None on ranks without trainable params, so we must gather across mp ranks
     learning_rate: float | None = reduce_max_stat_across_model_parallel_group(learning_rate)
+    indexer_learning_rate: float | None = reduce_max_stat_across_model_parallel_group(
+        indexer_learning_rate
+    )
     # Tensorboard values.
     if writer and (iteration % args.tensorboard_log_interval == 0):
         if wandb_writer:
@@ -1994,6 +2169,15 @@ def training_log(
             writer.add_scalar('learning-rate vs samples', learning_rate, args.consumed_train_samples)
             if wandb_writer:
                 wandb_writer.log({'learning-rate': learning_rate}, iteration)
+        if indexer_learning_rate is not None:
+            writer.add_scalar('indexer-learning-rate', indexer_learning_rate, iteration)
+            writer.add_scalar(
+                'indexer-learning-rate vs samples',
+                indexer_learning_rate,
+                args.consumed_train_samples,
+            )
+            if wandb_writer:
+                wandb_writer.log({'indexer-learning-rate': indexer_learning_rate}, iteration)
         if args.skipped_train_samples > 0:
             writer.add_scalar('skipped-train-samples', args.skipped_train_samples, iteration)
             if wandb_writer:
@@ -2147,7 +2331,10 @@ def training_log(
         )
 
     # Track sparse attention indexer loss.
-    if args.dsa_indexer_loss_coeff is not None and args.dsa_indexer_loss_coeff > 0:
+    if (
+        args.dsa_indexer_loss_coeff is not None
+        and args.dsa_indexer_loss_coeff > 0
+    ) or getattr(args, "dsa_fwd_skip_dsa", False):
         indexer_loss_scale = 1 / get_num_microbatches()
         DSAIndexerLossLoggingHelper.track_indexer_metrics(
             loss_scale=indexer_loss_scale,
@@ -2213,6 +2400,8 @@ def training_log(
                 wandb_writer.log({'power/gpu': power}, iteration)
         # Decoupled_learning_rate should be not None only on first and last pipeline stage.
         log_string += f' learning rate: {learning_rate:.6E} |'
+        if indexer_learning_rate is not None:
+            log_string += f' indexer learning rate: {indexer_learning_rate:.6E} |'
         log_string += f' global batch size: {batch_size:5d} |'
         for key in total_loss_dict:
             if key not in [advanced_iters_key, skipped_iters_key, nan_iters_key]:
@@ -3094,10 +3283,12 @@ def train(
                 non_indexer_num_zeros_in_grad
             )
         learning_rate = get_canonical_lr_for_logging(optimizer.param_groups)
+        indexer_learning_rate = get_indexer_lr_for_logging(optimizer.param_groups)
         report_memory_flag = training_log(
             loss_dict,
             total_loss_dict,
             learning_rate,
+            indexer_learning_rate,
             iteration,
             loss_scale,
             report_memory_flag,

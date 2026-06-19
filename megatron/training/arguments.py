@@ -835,6 +835,28 @@ def validate_args(args, defaults={}):
         assert not getattr(args, 'dsa_train_indexer_only', False), \
             '--dsa-train-indexer-only is not compatible with --overlap-param-gather'
 
+    if getattr(args, 'dsa_fwd_skip_dsa', False):
+        assert args.experimental_attention_variant == 'dsa', \
+            '--dsa-fwd-skip-dsa requires --experimental-attention-variant dsa'
+        assert not getattr(args, 'dsa_train_indexer_only', False), \
+            '--dsa-fwd-skip-dsa is incompatible with --dsa-train-indexer-only'
+
+    if getattr(args, 'dsa_reset_indexer_on_load', False):
+        assert args.experimental_attention_variant == 'dsa', \
+            '--dsa-reset-indexer-on-load requires --experimental-attention-variant dsa'
+        assert args.load is not None or args.pretrained_checkpoint is not None, \
+            '--dsa-reset-indexer-on-load requires --load or --pretrained-checkpoint'
+
+    if getattr(args, 'dsa_indexer_reset_seed', None) is not None:
+        assert args.dsa_indexer_reset_seed >= 0, '--dsa-indexer-reset-seed must be non-negative'
+    if getattr(args, 'dsa_indexer_activation_start_samples', None) is not None:
+        assert args.dsa_indexer_activation_start_samples >= 0, (
+            '--dsa-indexer-activation-start-samples must be non-negative'
+        )
+    assert getattr(args, 'dsa_indexer_activation_warmup_samples', 0) >= 0, (
+        '--dsa-indexer-activation-warmup-samples must be non-negative'
+    )
+
     if args.use_torch_fsdp2:
         assert is_torch_min_version("2.4.0"), \
             'FSDP2 requires PyTorch >= 2.4.0 with FSDP 2 support.'
@@ -3096,12 +3118,43 @@ def _add_experimental_attention_variant_args(parser):
         ),
     )
     _maybe_add_argument(
+        '--dsa-fwd-skip-dsa',
+        action='store_true',
+        help=(
+            'Use dense GQA attention forward and skip DSA routing, top-k, sparse attention, '
+            'and indexer KL loss. Intended for DSA-from-scratch checkpoints before activation.'
+        ),
+    )
+    _maybe_add_argument(
         '--dsa-train-indexer-only',
         action='store_true',
         help=(
             'Freeze non-indexer parameters and train only DSA indexer parameters. '
             'Intended for DSA indexer warmup from a dense GQA checkpoint.'
         ),
+    )
+    _maybe_add_argument(
+        '--dsa-reset-indexer-on-load',
+        action='store_true',
+        help='Reset DSA indexer parameters and clear their optimizer state after checkpoint load.',
+    )
+    _maybe_add_argument(
+        '--dsa-indexer-reset-seed',
+        type=int,
+        default=None,
+        help='Optional deterministic seed for --dsa-reset-indexer-on-load.',
+    )
+    _maybe_add_argument(
+        '--dsa-indexer-activation-start-samples',
+        type=int,
+        default=None,
+        help='Sample position where DSA indexer activation/warmup starts.',
+    )
+    _maybe_add_argument(
+        '--dsa-indexer-activation-warmup-samples',
+        type=int,
+        default=0,
+        help='Sample count over which only DSA indexer optimizer groups warm up after activation.',
     )
     _maybe_add_argument(
         '--dsa-indexer-topk-key-chunk-size',

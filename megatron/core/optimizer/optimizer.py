@@ -94,7 +94,33 @@ def _multi_tensor_copy_this_to_that(
             that_.copy_(this_)
 
 
-param_group_identifier_keys = ('wd_mult', 'lr_mult', 'is_expert_parallel', 'is_decoupled_lr')
+param_group_identifier_keys = (
+    'wd_mult',
+    'lr_mult',
+    'is_expert_parallel',
+    'is_decoupled_lr',
+    'is_dsa_indexer',
+)
+
+
+def get_param_group_identifier_value(param_group: Dict, key: str):
+    """Return a parameter-group identifier value with backward-compatible defaults."""
+    if key in param_group:
+        return param_group[key]
+    pre_key = f"pre_{key}"
+    if pre_key in param_group:
+        return param_group[pre_key]
+    if key == 'is_dsa_indexer':
+        return False
+    raise KeyError(f"Key {key} (or {pre_key}) not found in param_group {param_group}.")
+
+
+def get_param_group_identifier_tuple(param_group: Dict) -> tuple:
+    """Return the tuple used to match optimizer parameter groups across checkpoints."""
+    return tuple(
+        get_param_group_identifier_value(param_group, key)
+        for key in param_group_identifier_keys
+    )
 
 
 class MegatronOptimizer(ABC):
@@ -386,7 +412,7 @@ class MegatronOptimizer(ABC):
     ) -> List[Dict]:
         """Filter and reorder state_dict parameter groups to match current optimizer groups.
         Keys used for matching align with those from _get_param_groups:
-        (wd_mult, lr_mult, is_expert_parallel, is_decoupled_lr)
+        (wd_mult, lr_mult, is_expert_parallel, is_decoupled_lr, is_dsa_indexer)
 
         Args:
             current_groups (List[Dict]): Parameter groups from the current optimizer instance.
@@ -400,8 +426,7 @@ class MegatronOptimizer(ABC):
         """
         # Define groups order that is needed in the current optimizer (coming from runtime)
         needed_groups = [
-            # NeMo may have different key for required fields, e.g., "wd_mult" to "pre_wd_mult"
-            tuple(g[key] if key in g else g[f"pre_{key}"] for key in param_group_identifier_keys)
+            get_param_group_identifier_tuple(g)
             for g in current_groups
         ]
 
@@ -409,13 +434,16 @@ class MegatronOptimizer(ABC):
         # and their order is determined at runtime, not from the checkpoint.
         params_in_state_dict_order = [g['params'] for g in state_dict_groups]
         loaded_groups_map = {
-            tuple(
-                # NeMo may have different key for required fields, e.g., "wd_mult" to "pre_wd_mult"
-                group[key] if key in group else group[f"pre_{key}"]
-                for key in param_group_identifier_keys
-            ): group
+            get_param_group_identifier_tuple(group): group
             for group in state_dict_groups
         }
+        if len(needed_groups) != len(params_in_state_dict_order):
+            raise ValueError(
+                "Loaded optimizer parameter groups do not match current optimizer parameter "
+                f"groups ({len(params_in_state_dict_order)} vs {len(needed_groups)}). "
+                "If DSA indexer groups were introduced after the checkpoint was saved, resume "
+                "with --no-load-optim unless you add a dedicated optimizer-state migration."
+            )
 
         final_groups = []
         for key, params in zip(needed_groups, params_in_state_dict_order):

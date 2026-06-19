@@ -417,6 +417,11 @@ def _get_model_to_optimizer_param_map(optimizer) -> dict:
     return param_map
 
 
+def get_model_to_optimizer_param_map(optimizer) -> dict:
+    """Public wrapper for mapping model params to optimizer-owned params."""
+    return _get_model_to_optimizer_param_map(optimizer)
+
+
 def _add_param_group_mapping(param_map: dict, model_groups: list, optim_groups: list):
     """Add aligned model-param to optimizer-param group mappings."""
     for model_group, optim_group in zip(model_groups, optim_groups):
