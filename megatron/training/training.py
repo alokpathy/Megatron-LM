@@ -3289,7 +3289,17 @@ def train(
         writer = get_tensorboard_writer()
         wandb_writer = get_wandb_writer()
         if grad_norm is not None and iteration % args.tensorboard_log_interval == 0:
-            indexer_grad_norm, non_indexer_grad_norm = calc_dsa_split_grad_norms(model, optimizer)
+            split_grad_norms = (
+                optimizer.get_last_dsa_split_grad_norms()
+                if hasattr(optimizer, "get_last_dsa_split_grad_norms")
+                else None
+            )
+            if split_grad_norms is not None:
+                indexer_grad_norm, non_indexer_grad_norm = split_grad_norms
+            else:
+                indexer_grad_norm, non_indexer_grad_norm = calc_dsa_split_grad_norms(
+                    model, optimizer
+                )
             indexer_grad_norm = reduce_max_stat_across_model_parallel_group(indexer_grad_norm)
             non_indexer_grad_norm = reduce_max_stat_across_model_parallel_group(
                 non_indexer_grad_norm

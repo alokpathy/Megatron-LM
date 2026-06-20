@@ -841,6 +841,15 @@ def validate_args(args, defaults={}):
         assert not getattr(args, 'dsa_train_indexer_only', False), \
             '--dsa-fwd-skip-dsa is incompatible with --dsa-train-indexer-only'
 
+    if getattr(args, 'dsa_separate_indexer_grad_clip', False):
+        assert args.experimental_attention_variant == 'dsa', \
+            '--dsa-separate-indexer-grad-clip requires --experimental-attention-variant dsa'
+    if getattr(args, 'dsa_indexer_clip_grad', None) is not None:
+        assert args.dsa_indexer_clip_grad >= 0.0, \
+            '--dsa-indexer-clip-grad must be non-negative'
+        assert getattr(args, 'dsa_separate_indexer_grad_clip', False), \
+            '--dsa-indexer-clip-grad requires --dsa-separate-indexer-grad-clip'
+
     if getattr(args, 'dsa_reset_indexer_on_load', False):
         assert args.experimental_attention_variant == 'dsa', \
             '--dsa-reset-indexer-on-load requires --experimental-attention-variant dsa'
@@ -2142,6 +2151,12 @@ def _add_regularization_args(parser):
                        help='Apply weight decay to qk layernorm as a special case.')
     group.add_argument('--clip-grad', type=float, default=1.0,
                        help='Gradient clipping based on global L2 norm.')
+    group.add_argument('--dsa-separate-indexer-grad-clip', action='store_true',
+                       help='Clip DSA indexer gradients and non-indexer gradients using '
+                       'separate L2 norms. The non-indexer threshold is --clip-grad.')
+    group.add_argument('--dsa-indexer-clip-grad', type=float, default=None,
+                       help='DSA indexer gradient clipping threshold when '
+                       '--dsa-separate-indexer-grad-clip is set. Defaults to --clip-grad.')
     group.add_argument('--adam-beta1', type=float, default=0.9,
                        help='First coefficient for computing running averages '
                        'of gradient and its square')
