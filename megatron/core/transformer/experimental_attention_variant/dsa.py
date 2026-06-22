@@ -936,8 +936,9 @@ class DSAIndexer(MegatronModule):
         # =========================================
         # Rotate activation
         # =========================================
-        q = rotate_activation(q)
-        k = rotate_activation(k)
+        if self.config.dsa_indexer_use_hadamard:
+            q = rotate_activation(q)
+            k = rotate_activation(k)
 
         # =========================================
         # Prepare weights for index scores
