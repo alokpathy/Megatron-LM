@@ -11,10 +11,11 @@ USE_DSA="${2:-0}"   # pass 1 as second argument to enable DSA, e.g. bash run_8b_
 TOKENIZER_MODEL="${ROOT_DIR}/tokenizers/multiMixV8.gpt4o_nc_sd.500000.128k.vocab.json"
 BLEND_PATH="${ROOT_DIR}/blend_files/1t_singlephase.json"
 
-CHECKPOINT_DIR="${ROOT_DIR}/${NAME}/checkpoints"
+CHECKPOINT_DIR="${ROOT_DIR}/${NAME}/checkpoints$( [ "${USE_DSA}" = "1" ] && echo "_mla_dsa" )"
 DATACACHE_DIR="${ROOT_DIR}/data_cache"
 TENSORBOARD_DIR="${ROOT_DIR}/tensorboard/${NAME}"
-mkdir -p ${CHECKPOINT_DIR} ${DATACACHE_DIR} ${TENSORBOARD_DIR}
+PROFILE_DIR="${ROOT_DIR}/profiles"
+mkdir -p ${CHECKPOINT_DIR} ${DATACACHE_DIR} ${TENSORBOARD_DIR} ${PROFILE_DIR}
 
 cd ${ROOT_DIR}
 
@@ -23,7 +24,7 @@ export PYTHONPATH=${ROOT_DIR}:$PYTHONPATH
 nsys profile \
     -s none \
     -t nvtx,cuda \
-    -o ${ROOT_DIR}/8b_1t/profile \
+    -o ${ROOT_DIR}/profiles/${NAME} \
     --force-overwrite true \
     --capture-range=cudaProfilerApi \
     --capture-range-end=stop \
@@ -34,10 +35,18 @@ torchrun \
     --num-layers 32 \
     --hidden-size 4096 \
     --num-attention-heads 32 \
+    $( [ "${USE_DSA}" = "1" ] && echo "\
+    --multi-latent-attention \
+    --q-lora-rank 1536 \
+    --kv-lora-rank 512 \
+    --qk-head-dim 128 \
+    --qk-pos-emb-head-dim 64 \
+    --v-head-dim 128" \
+    || echo "\
     --group-query-attention \
     --num-query-groups 8 \
+    --kv-channels 128" ) \
     --ffn-hidden-size 21504 \
-    --kv-channels 128 \
     --squared-relu \
     --untie-embeddings-and-output-weights \
     --init-method-std 0.014 \
@@ -57,8 +66,8 @@ torchrun \
     --lr-warmup-samples 3051758 \
     --lr-wsd-decay-style minus_sqrt \
     --lr-wsd-decay-samples 24414063 \
-    --micro-batch-size 12 \
-    --global-batch-size 1536 \
+    --micro-batch-size 1 \
+    --global-batch-size 4 \
     --lr 8e-4 \
     --min-lr 8e-6 \
     --weight-decay 0.1 \
@@ -120,4 +129,5 @@ torchrun \
     --dsa-indexer-n-heads 8 \
     --dsa-indexer-head-dim 64 \
     --dsa-indexer-topk 256 \
+    --dsa-indexer-loss-coeff 0.0 \
     --no-rope-fusion" )
