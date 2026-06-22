@@ -130,4 +130,5 @@ torchrun \
     --dsa-indexer-head-dim 64 \
     --dsa-indexer-topk 256 \
     --dsa-indexer-loss-coeff 0.0 \
+    --dsa-use-cudnn \
     --no-rope-fusion" )

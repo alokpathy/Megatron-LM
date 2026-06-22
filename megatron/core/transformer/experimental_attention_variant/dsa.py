@@ -339,6 +339,7 @@ def fused_qk_topk_naive(
     weights: torch.Tensor,
     index_topk: int,
     mask: Optional[torch.Tensor] = None,
+    use_cudnn: bool = False,
 ):
     """Naive implementation of QK Topk."""
     # =========================================
@@ -355,7 +356,7 @@ def fused_qk_topk_naive(
     # =========================================
     topk_k = min(index_topk, index_scores.size(-1))
     # [batch, seqlen, index_topk]
-    if _DSA is not None:
+    if use_cudnn and _DSA is not None:
         b, sq, sk = index_scores.shape
         flat = index_scores.reshape(b * sq, sk).contiguous().float()
         seq_lens = torch.full((b * sq,), sk, dtype=torch.int32, device=flat.device)
@@ -398,6 +399,7 @@ def fused_qk_topk_chunked(
     index_topk: int,
     mask: Optional[torch.Tensor] = None,
     key_chunk_size: Optional[int] = None,
+    use_cudnn: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Exact top-k routing over key chunks.
 
@@ -407,7 +409,7 @@ def fused_qk_topk_chunked(
     sk = k.size(0)
     topk_k = min(index_topk, sk)
     if key_chunk_size is None or key_chunk_size <= 0 or key_chunk_size >= sk:
-        index_scores, topk_indices = fused_qk_topk_naive(q, k, weights, index_topk, mask)
+        index_scores, topk_indices = fused_qk_topk_naive(q, k, weights, index_topk, mask, use_cudnn=use_cudnn)
         topk_scores = torch.gather(index_scores, -1, topk_indices)
         return topk_scores, topk_indices
 
@@ -432,10 +434,11 @@ def fused_qk_topk_chunked(
 
 
 def fwd_fused_indexer_loss_naive(
-    q, weights, k, query, key, topk, softmax_scale, loss_coeff, mask, sparse_loss, pg_collection
+    q, weights, k, query, key, topk, softmax_scale, loss_coeff, mask, sparse_loss, pg_collection,
+    use_cudnn: bool = False,
 ):
     """Naive implementation of forward pass for indexer loss."""
-    index_scores, topk_indices = fused_qk_topk_naive(q, k, weights, topk, mask)
+    index_scores, topk_indices = fused_qk_topk_naive(q, k, weights, topk, mask, use_cudnn=use_cudnn)
 
     indexer_loss = compute_dsa_indexer_loss(
         index_scores,
@@ -999,7 +1002,8 @@ class DSAIndexer(MegatronModule):
         q, k, weights = self.forward_before_topk(x, qr, packed_seq_params)
 
         # [batch, seqlen, seqlen], [batch, seqlen, index_topk]
-        index_scores, topk_indices = fused_qk_topk_naive(q, k, weights, self.index_topk, mask)
+        use_cudnn = getattr(self.config, 'dsa_use_cudnn', False)
+        index_scores, topk_indices = fused_qk_topk_naive(q, k, weights, self.index_topk, mask, use_cudnn=use_cudnn)
 
         return index_scores, topk_indices
 
