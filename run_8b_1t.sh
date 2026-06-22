@@ -6,8 +6,9 @@ export NVTE_BWD_LAYERNORM_SM_MARGIN=16
 export NVTE_FUSED_ATTN=0
 
 ROOT_DIR="/lustre/fsw/portfolios/nemotron/projects/nemotron_sw_pre/users/atripathy/Megatron-LM"
-NAME="${1:-8b_1t}"  # pass a run name as first argument, e.g. bash run_8b_1t.sh my_experiment
-USE_DSA="${2:-0}"   # pass 1 as second argument to enable DSA, e.g. bash run_8b_1t.sh my_experiment 1
+NAME="${1:-8b_1t}"      # pass a run name as first argument, e.g. bash run_8b_1t.sh my_experiment
+USE_DSA="${2:-0}"       # pass 1 as second argument to enable DSA, e.g. bash run_8b_1t.sh my_experiment 1
+USE_DSA_CUDNN="${3:-0}" # pass 1 as third argument to enable cuDNN DSA kernels, e.g. bash run_8b_1t.sh my_experiment 1 1
 TOKENIZER_MODEL="${ROOT_DIR}/tokenizers/multiMixV8.gpt4o_nc_sd.500000.128k.vocab.json"
 BLEND_PATH="${ROOT_DIR}/blend_files/1t_singlephase.json"
 
@@ -130,5 +131,5 @@ torchrun \
     --dsa-indexer-head-dim 64 \
     --dsa-indexer-topk 256 \
     --dsa-indexer-loss-coeff 0.0 \
-    --dsa-use-cudnn \
+    $( [ "${USE_DSA_CUDNN}" = "1" ] && echo "--dsa-use-cudnn" ) \
     --no-rope-fusion" )
