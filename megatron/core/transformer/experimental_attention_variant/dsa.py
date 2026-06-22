@@ -26,6 +26,15 @@ try:
 except ImportError:
     hadamard_transform = None
 
+try:
+    from cudnn import DSA as _DSA
+except ImportError:
+    try:
+        from cudnn.deepseek_sparse_attention import DSA as _DSA
+    except ImportError:
+        _DSA = None
+
+
 
 def rotate_activation(x: torch.Tensor) -> torch.Tensor:
     """Apply Hadamard rotation activation.
@@ -346,7 +355,18 @@ def fused_qk_topk_naive(
     # =========================================
     topk_k = min(index_topk, index_scores.size(-1))
     # [batch, seqlen, index_topk]
-    topk_indices = index_scores.topk(topk_k, dim=-1)[1]
+    if _DSA is not None:
+        b, sq, sk = index_scores.shape
+        flat = index_scores.reshape(b * sq, sk).contiguous().float()
+        seq_lens = torch.full((b * sq,), sk, dtype=torch.int32, device=flat.device)
+        with torch.cuda.nvtx.range("dsa_indexer_top_k_cudnn"):
+            topk_indices = _DSA.indexer_top_k_wrapper(
+                flat, seq_lens, top_k=topk_k, return_val=False,
+                stream=torch.cuda.current_stream(),
+            )["indices"].reshape(b, sq, topk_k)
+    else:
+        with torch.cuda.nvtx.range("dsa_indexer_top_k"):
+            topk_indices = index_scores.topk(topk_k, dim=-1)[1]
 
     return index_scores, topk_indices
 
