@@ -342,23 +342,34 @@ def fused_qk_topk_naive(
     use_cudnn: bool = False,
 ):
     """Naive implementation of QK Topk."""
-    # =========================================
-    # Compute index scores
-    # =========================================
-    # [batch, seqlen, seqlen]
-    index_scores = _compute_index_scores(q, weights, k)
-    if mask is not None:
-        assert mask.dtype == index_scores.dtype, "Mask dtype must match index scores dtype"
-        index_scores = index_scores + mask
+    topk_k = min(index_topk, k.size(0))
+    h_idx = q.size(2)
+    # indexer_forward_wrapper requires qhead_per_kv_head (= h_idx for MQA K) in {32, 64}
+    use_cudnn_forward = use_cudnn and _DSA is not None and h_idx in (32, 64)
 
-    # =========================================
-    # Select top-k indices
-    # =========================================
-    topk_k = min(index_topk, index_scores.size(-1))
-    # [batch, seqlen, index_topk]
-    if use_cudnn and _DSA is not None:
-        b, sq, sk = index_scores.shape
-        flat = index_scores.reshape(b * sq, sk).contiguous().float()
+    if use_cudnn_forward:
+        # =========================================
+        # Compute index scores via cuDNN
+        # =========================================
+        # Permute to batch-first; give K an explicit H_kv=1 dim (MQA)
+        sq, b, _, d_idx = q.shape
+        sk = k.size(0)
+        q_bf = q.permute(1, 0, 2, 3).contiguous()            # (B, S_q, H_idx, D_idx)
+        k_bf = k.permute(1, 0, 2).unsqueeze(2).contiguous()  # (B, S_k, 1, D_idx)
+        w_bf = weights.permute(1, 0, 2).contiguous()         # (B, S_q, H_idx)
+        with torch.cuda.nvtx.range("dsa_indexer_forward_cudnn"):
+            index_scores = _DSA.indexer_forward_wrapper(
+                q_bf, k_bf, w_bf,
+                ratio=1,
+                sm_scale=1.0,
+                stream=torch.cuda.current_stream(),
+            )["scores"]  # (B, S_q, S_k) FP32
+        if mask is not None:
+            index_scores = index_scores + mask.float()
+        # =========================================
+        # Select top-k indices via cuDNN
+        # =========================================
+        flat = index_scores.reshape(b * sq, sk).contiguous()
         seq_lens = torch.full((b * sq,), sk, dtype=torch.int32, device=flat.device)
         with torch.cuda.nvtx.range("dsa_indexer_top_k_cudnn"):
             topk_indices = _DSA.indexer_top_k_wrapper(
@@ -366,8 +377,30 @@ def fused_qk_topk_naive(
                 stream=torch.cuda.current_stream(),
             )["indices"].reshape(b, sq, topk_k)
     else:
-        with torch.cuda.nvtx.range("dsa_indexer_top_k"):
-            topk_indices = index_scores.topk(topk_k, dim=-1)[1]
+        # =========================================
+        # Compute index scores via PyTorch
+        # =========================================
+        # [batch, seqlen, seqlen]
+        index_scores = _compute_index_scores(q, weights, k)
+        if mask is not None:
+            assert mask.dtype == index_scores.dtype, "Mask dtype must match index scores dtype"
+            index_scores = index_scores + mask
+        # =========================================
+        # Select top-k indices
+        # =========================================
+        # [batch, seqlen, index_topk]
+        if use_cudnn and _DSA is not None:
+            b, sq, sk = index_scores.shape
+            flat = index_scores.reshape(b * sq, sk).contiguous().float()
+            seq_lens = torch.full((b * sq,), sk, dtype=torch.int32, device=flat.device)
+            with torch.cuda.nvtx.range("dsa_indexer_top_k_cudnn"):
+                topk_indices = _DSA.indexer_top_k_wrapper(
+                    flat, seq_lens, top_k=topk_k, return_val=False,
+                    stream=torch.cuda.current_stream(),
+                )["indices"].reshape(b, sq, topk_k)
+        else:
+            with torch.cuda.nvtx.range("dsa_indexer_top_k"):
+                topk_indices = index_scores.topk(topk_k, dim=-1)[1]
 
     return index_scores, topk_indices
 

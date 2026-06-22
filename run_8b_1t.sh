@@ -127,7 +127,7 @@ torchrun \
     --profile-ranks 0 \
     $( [ "${USE_DSA}" = "1" ] && echo "\
     --experimental-attention-variant dsa \
-    --dsa-indexer-n-heads 8 \
+    --dsa-indexer-n-heads 32 \
     --dsa-indexer-head-dim 64 \
     --dsa-indexer-topk 256 \
     --dsa-indexer-loss-coeff 0.0 \
