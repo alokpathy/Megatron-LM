@@ -381,7 +381,8 @@ def fused_qk_topk_naive(
         # Compute index scores via PyTorch
         # =========================================
         # [batch, seqlen, seqlen]
-        index_scores = _compute_index_scores(q, weights, k)
+        with torch.cuda.nvtx.range("dsa_indexer_forward"):
+            index_scores = _compute_index_scores(q, weights, k)
         if mask is not None:
             assert mask.dtype == index_scores.dtype, "Mask dtype must match index scores dtype"
             index_scores = index_scores + mask
