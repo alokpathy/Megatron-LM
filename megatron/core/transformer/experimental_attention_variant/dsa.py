@@ -363,7 +363,7 @@ def fused_qk_topk_naive(
                 q_bf, k_bf, w_bf,
                 ratio=1,
                 sm_scale=1.0,
-                stream=torch.cuda.current_stream(),
+                stream=torch.cuda.current_stream().cuda_stream,
             )["scores"]  # (B, S_q, S_k) FP32
         if mask is not None:
             index_scores = index_scores + mask.float()
@@ -375,7 +375,7 @@ def fused_qk_topk_naive(
         with torch.cuda.nvtx.range("dsa_indexer_top_k_cudnn"):
             topk_indices = _DSA.indexer_top_k_wrapper(
                 flat, seq_lens, top_k=topk_k, return_val=False,
-                stream=torch.cuda.current_stream(),
+                stream=torch.cuda.current_stream().cuda_stream,
             )["indices"].reshape(b, sq, topk_k)
     else:
         # =========================================
@@ -398,7 +398,7 @@ def fused_qk_topk_naive(
             with torch.cuda.nvtx.range("dsa_indexer_top_k_cudnn"):
                 topk_indices = _DSA.indexer_top_k_wrapper(
                     flat, seq_lens, top_k=topk_k, return_val=False,
-                    stream=torch.cuda.current_stream(),
+                    stream=torch.cuda.current_stream().cuda_stream,
                 )["indices"].reshape(b, sq, topk_k)
         else:
             with torch.cuda.nvtx.range("dsa_indexer_top_k"):
