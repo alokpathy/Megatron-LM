@@ -347,7 +347,6 @@ def fused_qk_topk_naive(
     # indexer_forward_wrapper requires qhead_per_kv_head (= h_idx for MQA K) in {32, 64}
     use_cudnn_forward = use_cudnn and _DSA is not None and h_idx in (32, 64)
 
-    print(f"use_cudnn_forward: {use_cudnn_forward} use_cudnn: {use_cudnn} h_idx: {h_idx}", flush=True)
     if use_cudnn_forward:
         # =========================================
         # Compute index scores via cuDNN
@@ -363,7 +362,7 @@ def fused_qk_topk_naive(
                 q_bf, k_bf, w_bf,
                 ratio=1,
                 sm_scale=1.0,
-                stream=torch.cuda.current_stream().cuda_stream,
+                stream=None,
             )["scores"]  # (B, S_q, S_k) FP32
         if mask is not None:
             index_scores = index_scores + mask.float()
@@ -375,7 +374,7 @@ def fused_qk_topk_naive(
         with torch.cuda.nvtx.range("dsa_indexer_top_k_cudnn"):
             topk_indices = _DSA.indexer_top_k_wrapper(
                 flat, seq_lens, top_k=topk_k, return_val=False,
-                stream=torch.cuda.current_stream().cuda_stream,
+                stream=None,
             )["indices"].reshape(b, sq, topk_k)
     else:
         # =========================================
@@ -398,7 +397,7 @@ def fused_qk_topk_naive(
             with torch.cuda.nvtx.range("dsa_indexer_top_k_cudnn"):
                 topk_indices = _DSA.indexer_top_k_wrapper(
                     flat, seq_lens, top_k=topk_k, return_val=False,
-                    stream=torch.cuda.current_stream().cuda_stream,
+                    stream=None,
                 )["indices"].reshape(b, sq, topk_k)
         else:
             with torch.cuda.nvtx.range("dsa_indexer_top_k"):
