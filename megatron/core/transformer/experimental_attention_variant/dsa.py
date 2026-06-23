@@ -347,6 +347,7 @@ def fused_qk_topk_naive(
     # indexer_forward_wrapper requires qhead_per_kv_head (= h_idx for MQA K) in {32, 64}
     use_cudnn_forward = use_cudnn and _DSA is not None and h_idx in (32, 64)
 
+    print(f"use_cudnn_forward: {use_cudnn_forward} use_cudnn: {use_cudnn} h_idx: {h_idx}", flush=True)
     if use_cudnn_forward:
         # =========================================
         # Compute index scores via cuDNN
@@ -669,6 +670,7 @@ class FusedDSAIndexerLoss(torch.autograd.Function):
         mask,
         sparse_loss,
         pg_collection,
+        use_cudnn,
     ):
         """
         Fused forward: index_scores never materialized in full.
@@ -685,6 +687,7 @@ class FusedDSAIndexerLoss(torch.autograd.Function):
             mask,
             sparse_loss,
             pg_collection,
+            use_cudnn=use_cudnn,
         )
 
         # Save for backward (recomputation strategy)
@@ -718,7 +721,7 @@ class FusedDSAIndexerLoss(torch.autograd.Function):
         )
 
         # query and key are detached in forward, so return None for their gradients
-        return grad_q, grad_weights, grad_k, None, None, None, None, None, None, None, None
+        return grad_q, grad_weights, grad_k, None, None, None, None, None, None, None, None, None
 
 
 class DSAIndexerLossAutoScaler(torch.autograd.Function):
@@ -1233,6 +1236,7 @@ class DSAttention(MegatronModule):
                 float_mask,
                 getattr(self.config, "dsa_indexer_use_sparse_loss", False),
                 self.indexer.pg_collection,
+                getattr(self.config, 'dsa_use_cudnn', False),
             )
             # Save indexer loss for logging
             if indexer_loss_coeff > 0:
