@@ -1,7 +1,7 @@
 #!/bin/bash
 
-# Use: bash train.sh [run-name] [1=enable-dsa (default 1)]
-# e.g. bash train.sh my_run 1
+# Use: bash train.sh [run-name] [1=enable-dsa (default 1)] [1=enable-nsys (default 0)]
+# e.g. bash train.sh my_run 1 1
 
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export NVTE_FWD_LAYERNORM_SM_MARGIN=16
@@ -13,6 +13,7 @@ export TRITON_CACHE_DIR="./triton-cache/"
 ROOT_DIR="/lustre/fsw/portfolios/nemotron/projects/nemotron_sw_pre/users/atripathy/Megatron-LM"
 NAME="${1:-8b_hybrid_dsa}"
 USE_DSA="${2:-1}"
+USE_NSYS="${3:-0}"
 
 TOKENIZER_MODEL="${ROOT_DIR}/tokenizers/multiMixV8.gpt4o_nc_sd.500000.128k.vocab.json"
 BLEND_PATH="${ROOT_DIR}/blend_files/1t_singlephase.json"
@@ -35,13 +36,13 @@ LR_WARMUP_SAMPLES=3051758
 LR_DECAY_SAMPLES=122070313
 LR_WSD_DECAY_SAMPLES=24414063
 
-nsys profile \
+$( [ "${USE_NSYS}" = "1" ] && echo "nsys profile \
     -s none \
     -t nvtx,cuda \
     -o ${ROOT_DIR}/profiles/${NAME} \
     --force-overwrite true \
     --capture-range=cudaProfilerApi \
-    --capture-range-end=stop \
+    --capture-range-end=stop" ) \
 torchrun \
     --nproc-per-node 4 \
     pretrain_mamba.py \
@@ -125,10 +126,11 @@ torchrun \
     --disable-gloo-process-groups \
     --disable-straggler-on-startup \
     --straggler-minmax-count 16 \
+    $( [ "${USE_NSYS}" = "1" ] && echo "\
     --profile \
     --profile-step-start 5 \
     --profile-step-end 8 \
-    --profile-ranks 0 \
+    --profile-ranks 0" ) \
     $( [ "${USE_DSA}" = "1" ] && echo "\
     --experimental-attention-variant dsa \
     --dsa-kernel-backend triton-min-memory \
