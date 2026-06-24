@@ -15,6 +15,8 @@ NAME="${1:-8b_hybrid_dsa}"
 USE_DSA="${2:-1}"
 USE_NSYS="${3:-0}"
 
+echo "NAME=${NAME} USE_DSA=${USE_DSA} USE_NSYS=${USE_NSYS}"
+
 TOKENIZER_MODEL="${ROOT_DIR}/tokenizers/multiMixV8.gpt4o_nc_sd.500000.128k.vocab.json"
 BLEND_PATH="${ROOT_DIR}/blend_files/1t_singlephase.json"
 
