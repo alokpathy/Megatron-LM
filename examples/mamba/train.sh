@@ -9,7 +9,6 @@ export NVTE_BWD_LAYERNORM_SM_MARGIN=16
 export NVTE_FUSED_ATTN=0
 
 export TRITON_CACHE_DIR="./triton-cache/"
-export TRITON_CACHE_MANAGER="megatron.core.ssm.triton_cache_manager:ParallelFileCacheManager"
 
 ROOT_DIR="/lustre/fsw/portfolios/nemotron/projects/nemotron_sw_pre/users/atripathy/Megatron-LM"
 NAME="${1:-8b_hybrid_dsa}"
@@ -138,4 +137,6 @@ torchrun \
     --dsa-indexer-topk 256 \
     --dsa-indexer-use-hadamard \
     --dsa-indexer-loss-coeff 0.01 \
+    --dsa-min-memory-profile \
+    --dsa-min-memory-profile-rank 0 \
     --no-rope-fusion" )
