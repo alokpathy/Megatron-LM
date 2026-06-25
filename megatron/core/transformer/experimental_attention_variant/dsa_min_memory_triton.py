@@ -1982,20 +1982,13 @@ def _dsa_sparse_attention_forward_kernel(
             mask=valid[:, None] & (offs_dv[None, :] < VALUE_DIM),
             other=0.0,
         )
-        if VALUE_DTYPE == 1:
-            probs_for_value = probs.to(tl.float16)
-        elif VALUE_DTYPE == 2:
-            probs_for_value = probs.to(tl.bfloat16)
-        else:
-            probs_for_value = probs
-        dot_rows = tl.arange(0, 16)
-        probs_for_dot = tl.where(dot_rows[:, None] == 0, probs_for_value[None, :], 0.0)
-        if VALUE_DTYPE == 1:
-            probs_for_dot = probs_for_dot.to(tl.float16)
-        elif VALUE_DTYPE == 2:
-            probs_for_dot = probs_for_dot.to(tl.bfloat16)
-        value_acc = tl.dot(probs_for_dot, v, out_dtype=tl.float32)
-        out_acc += tl.sum(value_acc, axis=0)
+        # NOTE: the original kernel padded `probs` into a 16-row matrix and used
+        # tl.dot to compute the weighted value sum. On Blackwell (sm_103) that
+        # MMA lowers through the TMEM/tcgen05 path, which triggers
+        # automatic-warp-specialization and an SSA dominance bug in Triton 3.7.
+        # Express the matvec as an elementwise reduction instead (no MMA, no
+        # warp-spec); mathematically identical to the dot-based version.
+        out_acc += tl.sum(probs[:, None] * v.to(tl.float32), axis=0)
 
     tl.store(
         output_ptr
