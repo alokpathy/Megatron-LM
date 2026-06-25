@@ -988,6 +988,8 @@ def _cudnn_indexer_topk_full_k(
     topk: int,
     q_start: int,
     q_end: int,
+    profile: Optional[_DSATimingProfiler] = None,
+    profile_suffix: str = "fwd",
 ) -> Tuple[Optional[torch.Tensor], torch.Tensor]:
     """Compute indexer scores + global top-k for a query chunk via cuDNN.
 
@@ -1002,19 +1004,21 @@ def _cudnn_indexer_topk_full_k(
     q_bf = q_index.permute(1, 0, 2, 3).contiguous()                 # (B, q_len, H, D)
     k_bf = k_index_full.permute(1, 0, 2).unsqueeze(2).contiguous()  # (B, k_total, 1, D)
     w_bf = weights.permute(1, 0, 2).contiguous()                   # (B, q_len, H)
-    with torch.cuda.nvtx.range("dsa_mm_indexer_forward_cudnn"):
-        scores = _DSA.indexer_forward_wrapper(
-            q_bf, k_bf, w_bf, ratio=1, sm_scale=1.0, stream=None,
-        )["scores"]                                                # (B, q_len, k_total) FP32
+    with _profile_record(profile, f"routing_cudnn_score_{profile_suffix}", q_index.device):
+        with torch.cuda.nvtx.range("dsa_mm_indexer_forward_cudnn"):
+            scores = _DSA.indexer_forward_wrapper(
+                q_bf, k_bf, w_bf, ratio=1, sm_scale=1.0, stream=None,
+            )["scores"]                                            # (B, q_len, k_total) FP32
     # Causal mask: query position q_start+i may attend to key positions <= q_start+i.
     invalid = _causal_invalid_mask(q_start, q_end, 0, k_total, scores.device)  # (q_len, k_total)
     scores = scores.masked_fill(invalid.unsqueeze(0), float("-inf"))
     flat = scores.reshape(b * q_len, k_total).contiguous()
     seq_lens = torch.full((b * q_len,), k_total, dtype=torch.int32, device=flat.device)
-    with torch.cuda.nvtx.range("dsa_mm_indexer_top_k_cudnn"):
-        topk_indices = _DSA.indexer_top_k_wrapper(
-            flat, seq_lens, top_k=topk, return_val=False, stream=None,
-        )["indices"].reshape(b, q_len, topk)
+    with _profile_record(profile, f"routing_cudnn_topk_{profile_suffix}", q_index.device):
+        with torch.cuda.nvtx.range("dsa_mm_indexer_top_k_cudnn"):
+            topk_indices = _DSA.indexer_top_k_wrapper(
+                flat, seq_lens, top_k=topk, return_val=False, stream=None,
+            )["indices"].reshape(b, q_len, topk)
     topk_indices, _ = torch.sort(topk_indices.to(torch.long), dim=-1)
     return None, topk_indices
 
@@ -1088,12 +1092,10 @@ def _topk_index_tile(
                 )
         else:
             k_index_full = full_k_index[:causal_key_limit]
-        with _profile_record(
-            profile, f"routing_cudnn_indexer_{profile_suffix}", hidden_states.device
-        ):
-            running_scores, running_indices = _cudnn_indexer_topk_full_k(
-                q_index, weights, k_index_full, topk, q_start, q_end
-            )
+        running_scores, running_indices = _cudnn_indexer_topk_full_k(
+            q_index, weights, k_index_full, topk, q_start, q_end,
+            profile=profile, profile_suffix=profile_suffix,
+        )
         return running_scores, running_indices, q_index, weights
 
     running_scores = None
