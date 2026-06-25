@@ -1131,15 +1131,22 @@ def _topk_index_tile(
         with _profile_record(
             profile, f"routing_block_score_topk_{profile_suffix}", hidden_states.device
         ):
-            triton_topk = triton_topk_index_block(
-                q_index, weights, k_index, block_topk, q_start, k_start
-            )
+            # Triton fuses indexer scores + top-k into one kernel; this single
+            # NVTX range is the counterpart to the cuDNN path's separate
+            # dsa_mm_indexer_forward_cudnn + dsa_mm_indexer_top_k_cudnn ranges.
+            with torch.cuda.nvtx.range("dsa_mm_indexer_topk_triton"):
+                triton_topk = triton_topk_index_block(
+                    q_index, weights, k_index, block_topk, q_start, k_start
+                )
             if triton_topk is None:
-                block_scores = _index_scores_for_block(q_index, weights, k_index)
-                invalid = _causal_invalid_mask(q_start, q_end, k_start, k_end, block_scores.device)
-                block_scores = block_scores.masked_fill(invalid.unsqueeze(0), float("-inf"))
-                block_scores, block_indices = block_scores.topk(block_topk, dim=-1)
-                block_indices = block_indices + k_start
+                with torch.cuda.nvtx.range("dsa_mm_indexer_topk_torch"):
+                    block_scores = _index_scores_for_block(q_index, weights, k_index)
+                    invalid = _causal_invalid_mask(
+                        q_start, q_end, k_start, k_end, block_scores.device
+                    )
+                    block_scores = block_scores.masked_fill(invalid.unsqueeze(0), float("-inf"))
+                    block_scores, block_indices = block_scores.topk(block_topk, dim=-1)
+                    block_indices = block_indices + k_start
             else:
                 block_scores, block_indices = triton_topk
         with _profile_record(profile, f"routing_merge_topk_{profile_suffix}", hidden_states.device):
