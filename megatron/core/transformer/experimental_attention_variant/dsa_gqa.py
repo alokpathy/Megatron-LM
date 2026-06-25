@@ -1099,6 +1099,7 @@ class DSGQACoreAttention(MegatronModule):
                 profile_rank=getattr(self.config, "dsa_min_memory_profile_rank", 0),
                 profile_label=f"layer={self.layer_number}",
                 use_triton=dsa_kernel_backend == "triton-min-memory",
+                use_cudnn=getattr(self.config, "dsa_use_cudnn", False),
             )
         if not self.training:
             raise NotImplementedError(
@@ -1133,6 +1134,7 @@ class DSGQACoreAttention(MegatronModule):
             profile_rank=getattr(self.config, "dsa_min_memory_profile_rank", 0),
             profile_label=f"layer={self.layer_number}",
             use_triton=dsa_kernel_backend == "triton-min-memory",
+            use_cudnn=getattr(self.config, "dsa_use_cudnn", False),
         )
         if sparse_fwd_dense_loss:
             indexer_loss = dsa_dense_indexer_loss(

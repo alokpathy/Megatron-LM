@@ -47,6 +47,16 @@ from megatron.core.transformer.experimental_attention_variant.dsa_min_memory_tri
     triton_scatter_selected_grad_to_sequence,
 )
 
+# Optional cuDNN DSA kernels, used to A/B the indexer (scores + top-k) against
+# the Triton min-memory kernels. Gated at runtime by `use_cudnn`.
+try:
+    from cudnn import DSA as _DSA
+except ImportError:
+    try:
+        from cudnn.deepseek_sparse_attention import DSA as _DSA
+    except ImportError:
+        _DSA = None
+
 
 def _module_weight(module) -> torch.Tensor:
     weight = getattr(module, "weight", None)
@@ -965,6 +975,50 @@ def _sort_topk_support_by_position(
     return torch.gather(scores, -1, order), torch.gather(indices, -1, order)
 
 
+def _cudnn_available_for_indexer(use_cudnn: bool, index_n_heads: int) -> bool:
+    # cuDNN indexer_forward_wrapper requires qhead_per_kv_head (= index_n_heads
+    # for MQA indexer K) in {32, 64}.
+    return use_cudnn and _DSA is not None and index_n_heads in (32, 64)
+
+
+def _cudnn_indexer_topk_full_k(
+    q_index: torch.Tensor,
+    weights: torch.Tensor,
+    k_index_full: torch.Tensor,
+    topk: int,
+    q_start: int,
+    q_end: int,
+) -> Tuple[Optional[torch.Tensor], torch.Tensor]:
+    """Compute indexer scores + global top-k for a query chunk via cuDNN.
+
+    Unlike the chunked Triton path (which merges top-k across key chunks), cuDNN
+    needs all scores for a query at once, so this scores the chunk against the
+    full causal key range in one shot. Returns (None, topk_indices); scores are
+    discarded by callers. topk_indices are global key positions, sorted ascending.
+    """
+    # q_index: (q_len, B, H, D); weights: (q_len, B, H); k_index_full: (k_total, B, D)
+    q_len, b, _, _ = q_index.shape
+    k_total = k_index_full.size(0)
+    q_bf = q_index.permute(1, 0, 2, 3).contiguous()                 # (B, q_len, H, D)
+    k_bf = k_index_full.permute(1, 0, 2).unsqueeze(2).contiguous()  # (B, k_total, 1, D)
+    w_bf = weights.permute(1, 0, 2).contiguous()                   # (B, q_len, H)
+    with torch.cuda.nvtx.range("dsa_mm_indexer_forward_cudnn"):
+        scores = _DSA.indexer_forward_wrapper(
+            q_bf, k_bf, w_bf, ratio=1, sm_scale=1.0, stream=None,
+        )["scores"]                                                # (B, q_len, k_total) FP32
+    # Causal mask: query position q_start+i may attend to key positions <= q_start+i.
+    invalid = _causal_invalid_mask(q_start, q_end, 0, k_total, scores.device)  # (q_len, k_total)
+    scores = scores.masked_fill(invalid.unsqueeze(0), float("-inf"))
+    flat = scores.reshape(b * q_len, k_total).contiguous()
+    seq_lens = torch.full((b * q_len,), k_total, dtype=torch.int32, device=flat.device)
+    with torch.cuda.nvtx.range("dsa_mm_indexer_top_k_cudnn"):
+        topk_indices = _DSA.indexer_top_k_wrapper(
+            flat, seq_lens, top_k=topk, return_val=False, stream=None,
+        )["indices"].reshape(b, q_len, topk)
+    topk_indices, _ = torch.sort(topk_indices.to(torch.long), dim=-1)
+    return None, topk_indices
+
+
 def _topk_index_tile(
     hidden_states: torch.Tensor,
     q_start: int,
@@ -988,6 +1042,7 @@ def _topk_index_tile(
     profile: Optional[_DSATimingProfiler] = None,
     profile_suffix: str = "fwd",
     full_k_index: Optional[torch.Tensor] = None,
+    use_cudnn: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     with _profile_record(profile, f"routing_q_project_{profile_suffix}", hidden_states.device):
         q_index, weights = _project_q_index_tile(
@@ -1006,6 +1061,41 @@ def _topk_index_tile(
         )
     causal_key_limit = min(q_end, hidden_states.size(0))
     topk = min(index_topk, causal_key_limit)
+
+    # cuDNN indexer path: score the query chunk against the full causal key
+    # range and pick global top-k in one shot (cuDNN can't do the incremental
+    # per-key-chunk merge the Triton path uses). Used to A/B against Triton.
+    if _cudnn_available_for_indexer(use_cudnn, index_n_heads):
+        if full_k_index is None:
+            with _profile_record(
+                profile, f"routing_k_project_{profile_suffix}", hidden_states.device
+            ):
+                k_index_full = _project_k_index_block(
+                    hidden_states,
+                    0,
+                    causal_key_limit,
+                    linear_k_weight,
+                    k_norm_weight,
+                    k_norm_bias,
+                    has_k_norm_bias,
+                    k_norm_eps,
+                    index_head_dim,
+                    index_rotary_dim,
+                    rotary_pos_emb,
+                    rotary_interleaved,
+                    use_indexer_rope,
+                    use_hadamard,
+                )
+        else:
+            k_index_full = full_k_index[:causal_key_limit]
+        with _profile_record(
+            profile, f"routing_cudnn_indexer_{profile_suffix}", hidden_states.device
+        ):
+            running_scores, running_indices = _cudnn_indexer_topk_full_k(
+                q_index, weights, k_index_full, topk, q_start, q_end
+            )
+        return running_scores, running_indices, q_index, weights
+
     running_scores = None
     running_indices = None
     for k_start in range(0, causal_key_limit, key_chunk_size):
@@ -1682,6 +1772,7 @@ def _forward_min_memory_impl(
     routing_topk_cache: Optional[list] = None,
     selected_scores_cache: Optional[list] = None,
     full_k_index: Optional[torch.Tensor] = None,
+    use_cudnn: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     sq, batch_size, num_query_heads, _ = query.shape
     output = value.new_empty((sq, batch_size, num_query_heads, value.size(-1)))
@@ -1716,6 +1807,7 @@ def _forward_min_memory_impl(
                 profile=profile,
                 profile_suffix="fwd",
                 full_k_index=full_k_index,
+                use_cudnn=use_cudnn,
             )
         if routing_topk_cache is not None:
             routing_topk_cache.append(topk_indices)
@@ -2280,6 +2372,7 @@ class DSAMinMemoryGQAFn(torch.autograd.Function):
         cache_indexer_k: bool = False,
         cache_selected_scores: bool = False,
         use_triton: bool = True,
+        use_cudnn: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         profile = _DSATimingProfiler(profile_enabled, profile_rank, profile_label, query.device)
         key_chunk_size = _routing_key_chunk_size(key_chunk_size, key.size(0), use_triton)
@@ -2340,6 +2433,7 @@ class DSAMinMemoryGQAFn(torch.autograd.Function):
                         routing_topk_cache=routing_topk_cache,
                         selected_scores_cache=selected_scores_cache,
                         full_k_index=full_k_index,
+                        use_cudnn=use_cudnn,
                     )
         profile.log("forward")
 
@@ -2385,6 +2479,7 @@ class DSAMinMemoryGQAFn(torch.autograd.Function):
             tuple(selected_scores_cache) if selected_scores_cache is not None else None
         )
         ctx.use_triton = use_triton
+        ctx.use_cudnn = use_cudnn
         return output, indexer_loss
 
     @staticmethod
@@ -2476,6 +2571,7 @@ class DSAMinMemoryGQAFn(torch.autograd.Function):
                                 profile=profile,
                                 profile_suffix="bwd",
                                 full_k_index=full_k_index,
+                                use_cudnn=ctx.use_cudnn,
                             )
 
                 triton_attention_done = False
@@ -2940,6 +3036,7 @@ class DSAMinMemoryGQAFn(torch.autograd.Function):
             None,
             None,
             None,
+            None,
         )
 
 
@@ -2958,6 +3055,7 @@ def dsa_min_memory_gqa_forward_only(
     profile_rank: int = 0,
     profile_label: str = "",
     use_triton: bool = True,
+    use_cudnn: bool = False,
 ) -> torch.Tensor:
     """Run min-memory DSA-GQA for no-grad validation/eval forward passes."""
     k_norm_bias, has_k_norm_bias = _module_bias(indexer.k_norm, query)
@@ -3021,6 +3119,7 @@ def dsa_min_memory_gqa_forward_only(
                 rotary_interleaved=rotary_interleaved,
                 profile=profile,
                 full_k_index=full_k_index,
+                use_cudnn=use_cudnn,
             )
     profile.log("forward")
     return output
@@ -3091,6 +3190,7 @@ def dsa_min_memory_gqa(
     profile_rank: int = 0,
     profile_label: str = "",
     use_triton: bool = True,
+    use_cudnn: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Run the minimum-activation DSA-GQA training backend."""
     k_norm_bias, has_k_norm_bias = _module_bias(indexer.k_norm, query)
@@ -3126,4 +3226,5 @@ def dsa_min_memory_gqa(
         cache_indexer_k,
         cache_selected_scores,
         use_triton,
+        use_cudnn,
     )

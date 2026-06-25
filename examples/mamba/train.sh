@@ -1,7 +1,10 @@
 #!/bin/bash
 
-# Use: bash train.sh [run-name] [1=enable-dsa (default 1)] [1=enable-nsys (default 0)]
-# e.g. bash train.sh my_run 1 1
+# Use: bash train.sh [run-name] [1=enable-dsa (default 1)] [1=enable-nsys (default 0)] [1=use-cudnn-indexer (default 0)]
+# e.g. bash train.sh my_run 1 1 1
+#   The 4th arg swaps the DSA indexer (scores + top-k) from the Triton
+#   min-memory kernels to cuDNN, for A/B perf comparison. Everything else
+#   (model, data, sparse attention) is identical between the two runs.
 
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export NVTE_FWD_LAYERNORM_SM_MARGIN=16
@@ -14,8 +17,9 @@ ROOT_DIR="/lustre/fsw/portfolios/nemotron/projects/nemotron_sw_pre/users/atripat
 NAME="${1:-8b_hybrid_dsa}"
 USE_DSA="${2:-1}"
 USE_NSYS="${3:-0}"
+USE_CUDNN="${4:-0}"
 
-echo "NAME=${NAME} USE_DSA=${USE_DSA} USE_NSYS=${USE_NSYS}"
+echo "NAME=${NAME} USE_DSA=${USE_DSA} USE_NSYS=${USE_NSYS} USE_CUDNN=${USE_CUDNN}"
 
 TOKENIZER_MODEL="${ROOT_DIR}/tokenizers/multiMixV8.gpt4o_nc_sd.500000.128k.vocab.json"
 BLEND_PATH="${ROOT_DIR}/blend_files/1t_singlephase.json"
@@ -143,4 +147,5 @@ torchrun \
     --dsa-indexer-loss-coeff 0.01 \
     --dsa-min-memory-profile \
     --dsa-min-memory-profile-rank 0 \
+    $( [ "${USE_CUDNN}" = "1" ] && echo "--dsa-use-cudnn" ) \
     --no-rope-fusion" )
