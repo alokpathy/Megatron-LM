@@ -178,11 +178,16 @@ def _value_dtype_tag(dtype: torch.dtype) -> int:
 
 
 def _sparse_attention_autotune_configs():
+    # num_stages=1 disables Triton's software pipeliner and Blackwell
+    # warp-specialization passes. On sm_103 (GB300) under Triton 3.7 those
+    # passes interact with triton-loop-aware-cse to sink a CSE'd loop-invariant
+    # value into a non-dominating warp region, producing an "operand does not
+    # dominate this use" SSA error in this two-loop (stats + output) kernel.
     return [
-        triton.Config({"BLOCK_K": 64}, num_warps=4, num_stages=3),
-        triton.Config({"BLOCK_K": 128}, num_warps=4, num_stages=3),
-        triton.Config({"BLOCK_K": 128}, num_warps=8, num_stages=4),
-        triton.Config({"BLOCK_K": 256}, num_warps=8, num_stages=4),
+        triton.Config({"BLOCK_K": 64}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_K": 128}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_K": 128}, num_warps=8, num_stages=1),
+        triton.Config({"BLOCK_K": 256}, num_warps=8, num_stages=1),
     ]
 
 
