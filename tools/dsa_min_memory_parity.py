@@ -15,6 +15,7 @@ import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Dict, Iterable, Optional, Tuple
 
 import torch
@@ -30,19 +31,25 @@ def _import_dsa_modules() -> None:
     global DSAMinMemoryGQAFn
     global dsa_dense_indexer_loss
     global dsa_min_memory_gqa
+    global dsa_min_memory_gqa_forward_only
     global _project_k_index_block
     global _project_q_index_tile
     global _selected_index_scores_tile
+    global _project_simplified_q_index_tile
+    global _simplified_index_scores_block
+    global _simplified_topk_index_tile
     global _sparse_attention_tile
     global _teacher_scores_tile
     global _topk_index_tile
     global _triton_dispatch_enabled
     global compute_gqa_dsa_indexer_loss
     global fused_qk_topk_naive
+    global rotate_activation
     global unfused_grouped_dsa_fn
 
     from megatron.core.transformer.experimental_attention_variant.dsa import (
         fused_qk_topk_naive as _fused_qk_topk_naive,
+        rotate_activation as _rotate_activation,
     )
     from megatron.core.transformer.experimental_attention_variant.dsa_gqa import (
         compute_gqa_dsa_indexer_loss as _compute_gqa_dsa_indexer_loss,
@@ -52,9 +59,13 @@ def _import_dsa_modules() -> None:
         DSAMinMemoryGQAFn as _DSAMinMemoryGQAFn,
         dsa_dense_indexer_loss as _dsa_dense_indexer_loss,
         dsa_min_memory_gqa as _dsa_min_memory_gqa,
+        dsa_min_memory_gqa_forward_only as _dsa_min_memory_gqa_forward_only,
         _project_k_index_block as _project_k_index_block_imported,
         _project_q_index_tile as _project_q_index_tile_imported,
+        _project_simplified_q_index_tile as _project_simplified_q_index_tile_imported,
         _selected_index_scores_tile as _selected_index_scores_tile_imported,
+        _simplified_index_scores_block as _simplified_index_scores_block_imported,
+        _simplified_topk_index_tile as _simplified_topk_index_tile_imported,
         _sparse_attention_tile as _sparse_attention_tile_imported,
         _teacher_scores_tile as _teacher_scores_tile_imported,
         _topk_index_tile as _topk_index_tile_imported,
@@ -64,15 +75,20 @@ def _import_dsa_modules() -> None:
     DSAMinMemoryGQAFn = _DSAMinMemoryGQAFn
     dsa_dense_indexer_loss = _dsa_dense_indexer_loss
     dsa_min_memory_gqa = _dsa_min_memory_gqa
+    dsa_min_memory_gqa_forward_only = _dsa_min_memory_gqa_forward_only
     _project_k_index_block = _project_k_index_block_imported
     _project_q_index_tile = _project_q_index_tile_imported
+    _project_simplified_q_index_tile = _project_simplified_q_index_tile_imported
     _selected_index_scores_tile = _selected_index_scores_tile_imported
+    _simplified_index_scores_block = _simplified_index_scores_block_imported
+    _simplified_topk_index_tile = _simplified_topk_index_tile_imported
     _sparse_attention_tile = _sparse_attention_tile_imported
     _teacher_scores_tile = _teacher_scores_tile_imported
     _topk_index_tile = _topk_index_tile_imported
     _triton_dispatch_enabled = _triton_dispatch_enabled_imported
     compute_gqa_dsa_indexer_loss = _compute_gqa_dsa_indexer_loss
     fused_qk_topk_naive = _fused_qk_topk_naive
+    rotate_activation = _rotate_activation
     unfused_grouped_dsa_fn = _unfused_grouped_dsa_fn
 
 
@@ -495,37 +511,105 @@ def _indexer_from_case(case: Case, args, pg_collection):
     )()
 
 
+def _simplified_indexer_from_case(case: Case, args, pg_collection):
+    return type(
+        "_SimplifiedIndexer",
+        (),
+        {
+            "linear_q": _WeightOnlyModule(case.linear_q_weight),
+            "index_n_heads": 1,
+            "index_head_dim": args.head_dim,
+            "index_topk": args.topk,
+            "softmax_scale": args.head_dim**-0.5,
+            "index_rotary_dim": args.indexer_rotary_dim,
+            "rotary_pos_emb": (
+                _SimpleRotary(
+                    args.indexer_rotary_dim,
+                    case.hidden_states.device,
+                    args.rotary_interleaved,
+                )
+                if args.indexer_rotary_dim > 0
+                else None
+            ),
+            "pg_collection": pg_collection,
+            "config": type(
+                "_SimplifiedIndexerConfig",
+                (),
+                {
+                    "dsa_indexer_mode": "simplified",
+                    "rotary_interleaved": args.rotary_interleaved,
+                },
+            )(),
+        },
+    )()
+
+
+def _apply_rope_oracle(
+    tensor: torch.Tensor,
+    head_dim: int,
+    rotary_dim: int,
+    rotary_pos_emb,
+    rotary_interleaved: bool,
+) -> torch.Tensor:
+    if rotary_pos_emb is None or rotary_dim == 0:
+        return tensor
+    tensor_nope, tensor_pe = torch.split(
+        tensor, [head_dim - rotary_dim, rotary_dim], dim=-1
+    )
+    positions = torch.arange(tensor.size(0), device=tensor.device, dtype=torch.float32)
+    inv_freq = rotary_pos_emb.inv_freq[: rotary_dim // 2].to(tensor.device)
+    interpolation_factor = getattr(rotary_pos_emb, "seq_len_interpolation_factor", None)
+    if interpolation_factor is not None:
+        positions = positions / interpolation_factor
+    freqs = positions[:, None] * inv_freq[None, :]
+    if rotary_interleaved:
+        freqs = torch.stack((freqs, freqs), dim=-1).flatten(-2)
+    else:
+        freqs = torch.cat((freqs, freqs), dim=-1)
+    cos = torch.cos(freqs).to(tensor_pe.dtype)[:, None, None, :]
+    sin = torch.sin(freqs).to(tensor_pe.dtype)[:, None, None, :]
+    tensor_pe = tensor_pe * cos + _rotate_half_oracle(tensor_pe, rotary_interleaved) * sin
+    return torch.cat((tensor_nope, tensor_pe), dim=-1)
+
+
 def _project_indexer(case: Case, args, rotary_pos_emb):
-    q_index, weights = _project_q_index_tile(
-        case.hidden_states,
-        0,
+    """Standard-DSA projection oracle independent of min-memory projection helpers."""
+    q_index = F.linear(case.hidden_states, case.linear_q_weight).reshape(
         args.seq_len,
-        case.linear_q_weight,
-        case.linear_weights_weight,
+        args.batch_size,
         args.indexer_heads,
         args.indexer_head_dim,
-        args.indexer_rotary_dim,
-        rotary_pos_emb,
-        args.rotary_interleaved,
-        args.indexer_rotary_dim > 0,
-        args.hadamard,
     )
-    k_index = _project_k_index_block(
-        case.hidden_states,
-        0,
-        args.seq_len,
-        case.linear_k_weight,
+    k_index = F.linear(case.hidden_states, case.linear_k_weight)
+    k_index = F.layer_norm(
+        k_index,
+        (args.indexer_head_dim,),
         case.k_norm_weight,
         case.k_norm_bias,
-        True,
         args.layernorm_eps,
+    ).reshape(args.seq_len, args.batch_size, 1, args.indexer_head_dim)
+    q_index = _apply_rope_oracle(
+        q_index,
         args.indexer_head_dim,
         args.indexer_rotary_dim,
         rotary_pos_emb,
         args.rotary_interleaved,
-        args.indexer_rotary_dim > 0,
-        args.hadamard,
     )
+    k_index = _apply_rope_oracle(
+        k_index,
+        args.indexer_head_dim,
+        args.indexer_rotary_dim,
+        rotary_pos_emb,
+        args.rotary_interleaved,
+    ).squeeze(2)
+    if args.hadamard:
+        # fast_hadamard_transform's BF16 reduction order is part of the reference DSA
+        # mixed-precision semantics. A Python butterfly rounds at every stage and is not a
+        # suitable elementwise oracle for this component.
+        q_index = rotate_activation(q_index)
+        k_index = rotate_activation(k_index)
+    weights = F.linear(case.hidden_states, case.linear_weights_weight)
+    weights = weights * (args.indexer_heads**-0.5) * (args.indexer_head_dim**-0.5)
     return q_index, k_index, weights
 
 
@@ -653,72 +737,96 @@ def _min_memory_run(case: Case, args, rotary_pos_emb, use_triton: bool):
 
 
 def _min_memory_components(case: Case, args, rotary_pos_emb, use_triton: bool):
-    key_block = args.key_block_size
+    # Match DSAMinMemoryGQAFn: the torch oracle deliberately uses a single full key block.
+    key_block = args.key_block_size if use_triton else args.seq_len
+    target_topk = min(args.topk, args.seq_len)
+    q_indices = []
+    all_weights = []
+    all_topk_scores = []
+    all_topk_indices = []
+    all_selected_scores = []
+    all_teacher_scores = []
+    all_sparse_outputs = []
     with _triton_dispatch_enabled(use_triton), torch.no_grad():
-        topk_scores, topk_indices, q_index, weights = _topk_index_tile(
-            case.hidden_states,
-            0,
-            args.seq_len,
-            case.linear_q_weight,
-            case.linear_k_weight,
-            case.k_norm_weight,
-            case.k_norm_bias,
-            True,
-            case.linear_weights_weight,
-            args.layernorm_eps,
-            args.indexer_heads,
-            args.indexer_head_dim,
-            args.topk,
-            args.indexer_rotary_dim,
-            rotary_pos_emb,
-            args.rotary_interleaved,
-            args.indexer_rotary_dim > 0,
-            args.hadamard,
-            key_block,
-        )
-        selected_scores = _selected_index_scores_tile(
-            case.hidden_states,
-            0,
-            args.seq_len,
-            topk_indices,
-            q_index,
-            weights,
-            case.linear_k_weight,
-            case.k_norm_weight,
-            case.k_norm_bias,
-            True,
-            args.layernorm_eps,
-            args.indexer_head_dim,
-            args.indexer_rotary_dim,
-            rotary_pos_emb,
-            args.rotary_interleaved,
-            args.indexer_rotary_dim > 0,
-            args.hadamard,
-        )
-        teacher_scores = _teacher_scores_tile(
-            case.query,
-            case.key,
-            topk_indices,
-            args.head_dim**-0.5,
-            0,
-            _DummyPGCollection(),
-        )
-        sparse_output = _sparse_attention_tile(
-            case.query,
-            case.key,
-            case.value,
-            topk_indices,
-            args.head_dim**-0.5,
-            0,
-        )
+        for q_start in range(0, args.seq_len, args.query_block_size):
+            q_end = min(q_start + args.query_block_size, args.seq_len)
+            topk_scores, topk_indices, q_index, weights = _topk_index_tile(
+                case.hidden_states,
+                q_start,
+                q_end,
+                case.linear_q_weight,
+                case.linear_k_weight,
+                case.k_norm_weight,
+                case.k_norm_bias,
+                True,
+                case.linear_weights_weight,
+                args.layernorm_eps,
+                args.indexer_heads,
+                args.indexer_head_dim,
+                args.topk,
+                args.indexer_rotary_dim,
+                rotary_pos_emb,
+                args.rotary_interleaved,
+                args.indexer_rotary_dim > 0,
+                args.hadamard,
+                key_block,
+            )
+            if topk_indices.size(-1) < target_topk:
+                pad = target_topk - topk_indices.size(-1)
+                # q_end is in-bounds and future-causal for every row in this non-final tile.
+                assert q_end < args.seq_len
+                topk_indices = F.pad(topk_indices, (0, pad), value=q_end)
+                topk_scores = F.pad(topk_scores, (0, pad), value=float("-inf"))
+            selected_scores = _selected_index_scores_tile(
+                case.hidden_states,
+                q_start,
+                q_end,
+                topk_indices,
+                q_index,
+                weights,
+                case.linear_k_weight,
+                case.k_norm_weight,
+                case.k_norm_bias,
+                True,
+                args.layernorm_eps,
+                args.indexer_head_dim,
+                args.indexer_rotary_dim,
+                rotary_pos_emb,
+                args.rotary_interleaved,
+                args.indexer_rotary_dim > 0,
+                args.hadamard,
+            )
+            teacher_scores = _teacher_scores_tile(
+                case.query[q_start:q_end],
+                case.key,
+                topk_indices,
+                args.head_dim**-0.5,
+                q_start,
+                _DummyPGCollection(),
+            )
+            sparse_output = _sparse_attention_tile(
+                case.query[q_start:q_end],
+                case.key,
+                case.value,
+                topk_indices,
+                args.head_dim**-0.5,
+                q_start,
+            )
+            q_indices.append(q_index)
+            all_weights.append(weights)
+            all_topk_scores.append(topk_scores)
+            all_topk_indices.append(topk_indices)
+            all_selected_scores.append(selected_scores)
+            all_teacher_scores.append(teacher_scores)
+            all_sparse_outputs.append(sparse_output)
     return {
-        "q_index": q_index,
-        "weights": weights,
-        "topk_scores": topk_scores,
-        "topk_indices": topk_indices,
-        "selected_scores": selected_scores,
-        "teacher_scores": teacher_scores,
-        "sparse_output": sparse_output,
+        "q_index": torch.cat(q_indices, dim=0),
+        "weights": torch.cat(all_weights, dim=0),
+        "topk_scores": torch.cat(all_topk_scores, dim=1),
+        "topk_indices": torch.cat(all_topk_indices, dim=1),
+        "selected_scores": torch.cat(all_selected_scores, dim=1),
+        "teacher_scores": torch.cat(all_teacher_scores, dim=1),
+        "sparse_output": torch.cat(all_sparse_outputs, dim=0),
     }
 
 
@@ -1027,6 +1135,7 @@ def _reference_sparse_fwd_dense_loss_run(
     )
     grads = torch.autograd.grad(output.float().sum() + loss.float(), grad_inputs)
     return {
+        "index_scores": index_scores.detach(),
         "natural_topk_indices": natural_topk_indices.detach(),
         "output": output.detach(),
         "loss": loss.detach(),
@@ -1371,10 +1480,11 @@ def _run_sparse_fwd_dense_loss_parity(args, device: torch.device, dtype: torch.d
     )
 
     failures = 0
-    failures += not _check_causal_support_indices(
+    failures += not _check_topk_support_with_score_error(
         "sparse_dense_loss_topk_support",
         components["topk_indices"],
-        reference["natural_topk_indices"],
+        components["topk_scores"],
+        reference["index_scores"],
         args.fail_fast,
     )
     failures += not _check_tensor(
@@ -1438,6 +1548,713 @@ def _run_sparse_fwd_dense_loss_parity(args, device: torch.device, dtype: torch.d
         print(f"\nFAIL: {failures} sparse-forward dense-loss parity checks failed.", flush=True)
         return 1
     print("\nPASS: all sparse-forward dense-loss parity checks passed.", flush=True)
+    return 0
+
+
+def _rotate_half_oracle(x: torch.Tensor, interleaved: bool) -> torch.Tensor:
+    """Independent RoPE rotation used by the simplified mathematical oracle."""
+    if interleaved:
+        pairs = x.unflatten(-1, (-1, 2))
+        return torch.stack((-pairs[..., 1], pairs[..., 0]), dim=-1).flatten(-2)
+    first, second = x.chunk(2, dim=-1)
+    return torch.cat((-second, first), dim=-1)
+
+
+def _simplified_input_oracle(hidden_states: torch.Tensor, norm_spec) -> torch.Tensor:
+    hidden_states = hidden_states.detach()
+    if norm_spec is None:
+        return hidden_states
+    weight = norm_spec.weight
+    if norm_spec.zero_centered_gamma:
+        weight = weight + 1.0
+    if norm_spec.normalization == "RMSNorm":
+        hidden_float = hidden_states.float()
+        normalized = hidden_float * torch.rsqrt(
+            hidden_float.square().mean(dim=-1, keepdim=True) + norm_spec.eps
+        )
+        return (normalized * weight.float()).to(hidden_states.dtype)
+    if norm_spec.normalization == "LayerNorm":
+        return F.layer_norm(
+            hidden_states,
+            (hidden_states.size(-1),),
+            weight,
+            norm_spec.bias,
+            norm_spec.eps,
+        )
+    raise AssertionError(f"Unsupported simplified oracle norm {norm_spec.normalization!r}")
+
+
+def _simplified_q_index_oracle(case: Case, args, norm_spec) -> torch.Tensor:
+    hidden = _simplified_input_oracle(case.hidden_states, norm_spec)
+    q_index = F.linear(hidden, case.linear_q_weight).reshape(
+        args.seq_len, args.batch_size, 1, args.head_dim
+    )
+    rotary_dim = args.indexer_rotary_dim
+    if rotary_dim == 0:
+        return q_index
+
+    q_nope, q_pe = torch.split(q_index, [args.head_dim - rotary_dim, rotary_dim], dim=-1)
+    positions = torch.arange(args.seq_len, device=q_index.device, dtype=torch.float32)
+    inv_freq = 1.0 / (
+        10000
+        ** (
+            torch.arange(0, rotary_dim, 2, device=q_index.device, dtype=torch.float32)
+            / rotary_dim
+        )
+    )
+    freqs = positions[:, None] * inv_freq[None, :]
+    if args.rotary_interleaved:
+        freqs = torch.stack((freqs, freqs), dim=-1).flatten(-2)
+    else:
+        freqs = torch.cat((freqs, freqs), dim=-1)
+    cos = torch.cos(freqs).to(q_pe.dtype)[:, None, None, :]
+    sin = torch.sin(freqs).to(q_pe.dtype)[:, None, None, :]
+    q_pe = q_pe * cos + _rotate_half_oracle(q_pe, args.rotary_interleaved) * sin
+    return torch.cat((q_nope, q_pe), dim=-1)
+
+
+def _simplified_scores_oracle(
+    q_index: torch.Tensor, key: torch.Tensor, score_scale: float
+) -> torch.Tensor:
+    scores = torch.einsum(
+        "qbd,kbd->bqk", q_index[:, :, 0].float(), key[:, :, 0].float()
+    ) * score_scale
+    return scores + _causal_mask(q_index.size(0), q_index.device).unsqueeze(0)
+
+
+def _simplified_sparse_attention_oracle(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    topk_indices: torch.Tensor,
+    softmax_scale: float,
+) -> torch.Tensor:
+    """Explicit one-KV-group sparse attention, independent of DSA attention helpers."""
+    sequence_length, batch_size, num_heads, head_dim = query.shape
+    value_dim = value.size(-1)
+    topk = topk_indices.size(-1)
+    key_by_batch = key[:, :, 0].permute(1, 0, 2)
+    value_by_batch = value[:, :, 0].permute(1, 0, 2)
+    key_index = topk_indices[..., None].expand(batch_size, sequence_length, topk, head_dim)
+    value_index = topk_indices[..., None].expand(
+        batch_size, sequence_length, topk, value_dim
+    )
+    selected_key = torch.gather(
+        key_by_batch[:, None].expand(batch_size, sequence_length, sequence_length, head_dim),
+        2,
+        key_index,
+    )
+    selected_value = torch.gather(
+        value_by_batch[:, None].expand(
+            batch_size, sequence_length, sequence_length, value_dim
+        ),
+        2,
+        value_index,
+    )
+    query_bhqd = query.permute(1, 2, 0, 3)
+    logits = torch.einsum("bhqd,bqkd->bhqk", query_bhqd.float(), selected_key.float())
+    logits = logits * softmax_scale
+    query_positions = torch.arange(sequence_length, device=query.device).view(
+        1, 1, sequence_length, 1
+    )
+    logits = logits.masked_fill(topk_indices[:, None] > query_positions, float("-inf"))
+    probabilities = torch.softmax(logits, dim=-1, dtype=torch.float32)
+    output = torch.einsum(
+        "bhqk,bqkd->bhqd", probabilities.to(selected_value.dtype), selected_value
+    )
+    return output.permute(2, 0, 1, 3).reshape(
+        sequence_length, batch_size, num_heads * value_dim
+    )
+
+
+def _simplified_teacher_oracle(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    topk_indices: Optional[torch.Tensor],
+    softmax_scale: float,
+    pg_collection,
+) -> torch.Tensor:
+    sequence_length, batch_size, _, head_dim = query.shape
+    query_bhqd = query.permute(1, 2, 0, 3).float()
+    key_bkd = key[:, :, 0].permute(1, 0, 2).float()
+    if topk_indices is None:
+        logits = torch.einsum("bhqd,bkd->bhqk", query_bhqd, key_bkd) * softmax_scale
+        logits = logits + _causal_mask(sequence_length, query.device)[None, None]
+    else:
+        topk = topk_indices.size(-1)
+        gather_index = topk_indices[..., None].expand(
+            batch_size, sequence_length, topk, head_dim
+        )
+        selected_key = torch.gather(
+            key_bkd[:, None].expand(batch_size, sequence_length, sequence_length, head_dim),
+            2,
+            gather_index,
+        )
+        logits = torch.einsum("bhqd,bqkd->bhqk", query_bhqd, selected_key) * softmax_scale
+        query_positions = torch.arange(sequence_length, device=query.device).view(
+            1, 1, sequence_length, 1
+        )
+        logits = logits.masked_fill(topk_indices[:, None] > query_positions, float("-inf"))
+    teacher = torch.softmax(logits, dim=-1, dtype=torch.float32).sum(dim=1)
+    if pg_collection.tp.size() > 1:
+        torch.distributed.all_reduce(teacher, group=pg_collection.tp)
+    return teacher / teacher.sum(dim=-1, keepdim=True)
+
+
+def _kl_oracle(teacher: torch.Tensor, student_logits: torch.Tensor, loss_coeff: float):
+    student = torch.softmax(student_logits, dim=-1, dtype=torch.float32)
+    return (
+        teacher
+        * (torch.log(teacher + 1.0e-10) - torch.log(student + 1.0e-10))
+    ).sum(dim=-1).mean() * loss_coeff
+
+
+def _simplified_sparse_kl_oracle(
+    scores: torch.Tensor,
+    topk_indices: torch.Tensor,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    softmax_scale: float,
+    loss_coeff: float,
+    pg_collection,
+) -> torch.Tensor:
+    teacher = _simplified_teacher_oracle(
+        query, key, topk_indices, softmax_scale, pg_collection
+    )
+    return _kl_oracle(teacher, scores.gather(-1, topk_indices), loss_coeff)
+
+
+def _simplified_dense_kl_oracle(
+    scores: torch.Tensor,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    softmax_scale: float,
+    loss_coeff: float,
+    pg_collection,
+) -> torch.Tensor:
+    teacher = _simplified_teacher_oracle(query, key, None, softmax_scale, pg_collection)
+    return _kl_oracle(teacher, scores, loss_coeff)
+
+
+def _simplified_reference_sparse_run(
+    case: Case,
+    args,
+    pg_collection,
+    simplified_input_norm,
+    topk_override: Optional[torch.Tensor] = None,
+):
+    attention_scale = (
+        args.attention_softmax_scale
+        if args.attention_softmax_scale is not None
+        else args.head_dim**-0.5
+    )
+    q_index = _simplified_q_index_oracle(case, args, simplified_input_norm)
+    scores = _simplified_scores_oracle(q_index, case.key.detach(), args.head_dim**-0.5)
+    natural_topk_indices = scores.topk(min(args.topk, args.seq_len), dim=-1).indices
+    topk_indices = natural_topk_indices if topk_override is None else topk_override
+    output = _simplified_sparse_attention_oracle(
+        case.query,
+        case.key,
+        case.value,
+        topk_indices,
+        attention_scale,
+    )
+    loss = _simplified_sparse_kl_oracle(
+        scores,
+        topk_indices,
+        case.query.detach(),
+        case.key.detach(),
+        attention_scale,
+        args.loss_coeff,
+        pg_collection,
+    )
+    grads = torch.autograd.grad(
+        output.float().sum() + loss,
+        (case.query, case.key, case.value, case.linear_q_weight),
+    )
+    return {
+        "q_index": q_index.detach(),
+        "scores": scores.detach(),
+        "natural_topk_indices": natural_topk_indices.detach(),
+        "topk_indices": topk_indices.detach(),
+        "output": output.detach(),
+        "loss": loss.detach(),
+        "grads": {
+            "query": grads[0].detach(),
+            "key": grads[1].detach(),
+            "value": grads[2].detach(),
+            "linear_q_weight": grads[3].detach(),
+        },
+    }
+
+
+def _simplified_min_sparse_run(
+    case: Case, args, pg_collection, use_triton: bool, simplified_input_norm
+):
+    attention_scale = (
+        args.attention_softmax_scale
+        if args.attention_softmax_scale is not None
+        else args.head_dim**-0.5
+    )
+    indexer = _simplified_indexer_from_case(case, args, pg_collection)
+    output, loss = dsa_min_memory_gqa(
+        query=case.query,
+        key=case.key,
+        value=case.value,
+        hidden_states=case.hidden_states,
+        indexer=indexer,
+        softmax_scale=attention_scale,
+        loss_coeff=args.loss_coeff,
+        use_indexer_rope=args.indexer_rotary_dim > 0,
+        query_chunk_size=args.query_block_size,
+        key_chunk_size=args.key_block_size,
+        cache_routing=args.cache_routing,
+        cache_indexer_k=False,
+        cache_selected_scores=args.cache_selected_scores,
+        use_triton=use_triton,
+        simplified_input_norm=simplified_input_norm,
+    )
+    grads = torch.autograd.grad(
+        output.float().sum() + loss,
+        (case.query, case.key, case.value, case.linear_q_weight),
+    )
+    return {
+        "output": output.detach(),
+        "loss": loss.detach(),
+        "grads": {
+            "query": grads[0].detach(),
+            "key": grads[1].detach(),
+            "value": grads[2].detach(),
+            "linear_q_weight": grads[3].detach(),
+        },
+    }
+
+
+def _simplified_dense_runs(
+    case: Case, args, pg_collection, use_triton: bool, simplified_input_norm
+):
+    attention_scale = (
+        args.attention_softmax_scale
+        if args.attention_softmax_scale is not None
+        else args.head_dim**-0.5
+    )
+    q_index = _simplified_q_index_oracle(case, args, simplified_input_norm)
+    scores = _simplified_scores_oracle(q_index, case.key.detach(), args.head_dim**-0.5)
+    reference_loss = _simplified_dense_kl_oracle(
+        scores,
+        case.query.detach(),
+        case.key.detach(),
+        attention_scale,
+        args.loss_coeff,
+        pg_collection,
+    )
+    reference_grad = torch.autograd.grad(reference_loss, case.linear_q_weight)[0]
+
+    min_case = _clone_case(case)
+    indexer = _simplified_indexer_from_case(min_case, args, pg_collection)
+    min_loss = dsa_dense_indexer_loss(
+        query=min_case.query.detach(),
+        key=min_case.key.detach(),
+        hidden_states=min_case.hidden_states,
+        indexer=indexer,
+        softmax_scale=attention_scale,
+        loss_coeff=args.loss_coeff,
+        use_indexer_rope=args.indexer_rotary_dim > 0,
+        query_chunk_size=args.query_block_size,
+        key_chunk_size=args.key_block_size,
+        use_triton=use_triton,
+        simplified_input_norm=simplified_input_norm,
+    )
+    min_grad = torch.autograd.grad(min_loss, min_case.linear_q_weight)[0]
+    return reference_loss.detach(), reference_grad.detach(), min_loss.detach(), min_grad.detach()
+
+
+def _simplified_sparse_fwd_dense_loss_runs(
+    case: Case,
+    args,
+    pg_collection,
+    use_triton: bool,
+    simplified_input_norm,
+    topk_indices: torch.Tensor,
+):
+    attention_scale = (
+        args.attention_softmax_scale
+        if args.attention_softmax_scale is not None
+        else args.head_dim**-0.5
+    )
+    reference_case = _clone_case(case)
+    q_index = _simplified_q_index_oracle(reference_case, args, simplified_input_norm)
+    scores = _simplified_scores_oracle(
+        q_index, reference_case.key.detach(), args.head_dim**-0.5
+    )
+    reference_output = _simplified_sparse_attention_oracle(
+        reference_case.query,
+        reference_case.key,
+        reference_case.value,
+        topk_indices,
+        attention_scale,
+    )
+    reference_loss = _simplified_dense_kl_oracle(
+        scores,
+        reference_case.query.detach(),
+        reference_case.key.detach(),
+        attention_scale,
+        args.loss_coeff,
+        pg_collection,
+    )
+    reference_grads = torch.autograd.grad(
+        reference_output.float().sum() + reference_loss,
+        (
+            reference_case.query,
+            reference_case.key,
+            reference_case.value,
+            reference_case.linear_q_weight,
+        ),
+    )
+
+    min_case = _clone_case(case)
+    indexer = _simplified_indexer_from_case(min_case, args, pg_collection)
+    min_output, internal_sparse_loss = dsa_min_memory_gqa(
+        query=min_case.query,
+        key=min_case.key,
+        value=min_case.value,
+        hidden_states=min_case.hidden_states,
+        indexer=indexer,
+        softmax_scale=attention_scale,
+        loss_coeff=0.0,
+        use_indexer_rope=args.indexer_rotary_dim > 0,
+        query_chunk_size=args.query_block_size,
+        key_chunk_size=args.key_block_size,
+        cache_routing=args.cache_routing,
+        cache_indexer_k=False,
+        cache_selected_scores=False,
+        use_triton=use_triton,
+        simplified_input_norm=simplified_input_norm,
+    )
+    min_loss = dsa_dense_indexer_loss(
+        query=min_case.query.detach(),
+        key=min_case.key.detach(),
+        hidden_states=min_case.hidden_states,
+        indexer=indexer,
+        softmax_scale=attention_scale,
+        loss_coeff=args.loss_coeff,
+        use_indexer_rope=args.indexer_rotary_dim > 0,
+        query_chunk_size=args.query_block_size,
+        key_chunk_size=args.key_block_size,
+        use_triton=use_triton,
+        simplified_input_norm=simplified_input_norm,
+    )
+    min_grads = torch.autograd.grad(
+        min_output.float().sum() + min_loss,
+        (min_case.query, min_case.key, min_case.value, min_case.linear_q_weight),
+    )
+    names = ("query", "key", "value", "linear_q_weight")
+    return {
+        "reference_output": reference_output.detach(),
+        "reference_loss": reference_loss.detach(),
+        "reference_grads": {
+            name: grad.detach() for name, grad in zip(names, reference_grads)
+        },
+        "min_output": min_output.detach(),
+        "internal_sparse_loss": internal_sparse_loss.detach(),
+        "min_loss": min_loss.detach(),
+        "min_grads": {name: grad.detach() for name, grad in zip(names, min_grads)},
+    }
+
+
+def _run_simplified_parity(args, device: torch.device, dtype: torch.dtype) -> int:
+    if args.num_query_groups != 1:
+        raise SystemExit("Simplified DSA parity requires --num-query-groups 1.")
+    if args.indexer_heads != 1 or args.indexer_head_dim != args.head_dim:
+        raise SystemExit(
+            "Simplified DSA parity requires --indexer-heads 1 and "
+            "--indexer-head-dim equal to --head-dim."
+        )
+    if args.hadamard or args.cache_indexer_k:
+        raise SystemExit("Simplified DSA does not use Hadamard or a separate indexer-K cache.")
+
+    use_triton = args.backend == "triton-min-memory"
+    device, rank, world_size, pg_collection = _configure_distributed_for_dense_mode(
+        device, args.distributed_backend
+    )
+    atol = args.atol if args.atol is not None else (5e-2 if dtype != torch.float32 else 5e-4)
+    rtol = args.rtol if args.rtol is not None else (5e-2 if dtype != torch.float32 else 5e-4)
+    print(
+        f"Simplified DSA parity backend={args.backend} rank={rank}/{world_size} "
+        f"device={device} dtype={dtype} local_Hq={args.num_query_heads} G=1 "
+        f"S={args.seq_len} topk={args.topk} D={args.head_dim} "
+        f"QBLOCK={args.query_block_size} KBLOCK={args.key_block_size} "
+        f"rotary_dim={args.indexer_rotary_dim} "
+        f"input_norm={args.simplified_input_norm} "
+        f"zero_centered_gamma={args.zero_centered_gamma} "
+        f"attention_scale={args.attention_softmax_scale}",
+        flush=True,
+    )
+
+    base = _make_case(args, device, dtype)
+    simplified_input_norm = None
+    if args.simplified_input_norm != "none":
+        generator = torch.Generator(device=device)
+        generator.manual_seed(args.seed + 2719)
+        norm_weight = torch.randn(
+            args.hidden_size, device=device, dtype=dtype, generator=generator
+        )
+        norm_bias = (
+            torch.randn(args.hidden_size, device=device, dtype=dtype, generator=generator)
+            if args.simplified_input_norm == "layernorm"
+            else None
+        )
+        simplified_input_norm = SimpleNamespace(
+            normalization=(
+                "LayerNorm" if args.simplified_input_norm == "layernorm" else "RMSNorm"
+            ),
+            weight=norm_weight,
+            bias=norm_bias,
+            eps=args.layernorm_eps,
+            zero_centered_gamma=args.zero_centered_gamma,
+        )
+    if world_size > 1:
+        generator = torch.Generator(device=device)
+        generator.manual_seed(args.seed + 1009 + rank)
+        base.query = torch.randn(
+            base.query.shape, device=device, dtype=dtype, generator=generator
+        ).requires_grad_(True)
+
+    component_case = _clone_case(base)
+    component_rotary = (
+        _SimpleRotary(args.indexer_rotary_dim, device, args.rotary_interleaved)
+        if args.indexer_rotary_dim > 0
+        else None
+    )
+    component_topk = []
+    component_topk_scores = []
+    component_q_index = []
+    with _triton_dispatch_enabled(use_triton), torch.no_grad():
+        for q_start in range(0, args.seq_len, args.query_block_size):
+            q_end = min(q_start + args.query_block_size, args.seq_len)
+            topk_scores, topk_indices, q_index = _simplified_topk_index_tile(
+                component_case.hidden_states,
+                component_case.key,
+                q_start,
+                q_end,
+                component_case.linear_q_weight,
+                args.topk,
+                args.head_dim,
+                args.indexer_rotary_dim,
+                component_rotary,
+                args.rotary_interleaved,
+                args.indexer_rotary_dim > 0,
+                args.head_dim**-0.5,
+                args.key_block_size,
+                simplified_input_norm,
+            )
+            if topk_indices.size(-1) < min(args.topk, args.seq_len):
+                assert q_end < args.seq_len
+                topk_indices = F.pad(
+                    topk_indices,
+                    (0, min(args.topk, args.seq_len) - topk_indices.size(-1)),
+                    value=q_end,
+                )
+                topk_scores = F.pad(
+                    topk_scores,
+                    (0, min(args.topk, args.seq_len) - topk_scores.size(-1)),
+                    value=float("-inf"),
+                )
+            component_topk.append(topk_indices)
+            component_topk_scores.append(topk_scores)
+            component_q_index.append(q_index)
+    component_topk = torch.cat(component_topk, dim=1)
+    component_topk_scores = torch.cat(component_topk_scores, dim=1)
+    component_q_index = torch.cat(component_q_index, dim=0)
+    with _triton_dispatch_enabled(False):
+        reference = _simplified_reference_sparse_run(
+            _clone_case(base),
+            args,
+            pg_collection,
+            simplified_input_norm,
+            topk_override=component_topk,
+        )
+    min_memory = _simplified_min_sparse_run(
+        _clone_case(base), args, pg_collection, use_triton, simplified_input_norm
+    )
+    forward_only_case = _clone_case(base)
+    forward_only_indexer = _simplified_indexer_from_case(
+        forward_only_case, args, pg_collection
+    )
+    attention_scale = (
+        args.attention_softmax_scale
+        if args.attention_softmax_scale is not None
+        else args.head_dim**-0.5
+    )
+    with torch.no_grad():
+        forward_only_output = dsa_min_memory_gqa_forward_only(
+            query=forward_only_case.query,
+            key=forward_only_case.key,
+            value=forward_only_case.value,
+            hidden_states=forward_only_case.hidden_states,
+            indexer=forward_only_indexer,
+            softmax_scale=attention_scale,
+            use_indexer_rope=args.indexer_rotary_dim > 0,
+            query_chunk_size=args.query_block_size,
+            key_chunk_size=args.key_block_size,
+            use_triton=use_triton,
+            simplified_input_norm=simplified_input_norm,
+        )
+    ref_dense_loss, ref_dense_grad, min_dense_loss, min_dense_grad = (
+        _simplified_dense_runs(
+            _clone_case(base), args, pg_collection, use_triton, simplified_input_norm
+        )
+    )
+    sparse_dense = _simplified_sparse_fwd_dense_loss_runs(
+        _clone_case(base),
+        args,
+        pg_collection,
+        use_triton,
+        simplified_input_norm,
+        component_topk,
+    )
+
+    failures = 0
+    failures += not _check_tensor(
+        "simplified_q_index",
+        component_q_index,
+        reference["q_index"],
+        atol,
+        rtol,
+        args.fail_fast,
+    )
+    failures += not _check_topk_support_with_score_error(
+        "simplified_topk_support",
+        component_topk,
+        component_topk_scores,
+        reference["scores"],
+        args.fail_fast,
+    )
+    valid_width = torch.arange(args.seq_len, device=device).add(1).clamp(max=args.topk)
+    query_positions = torch.arange(args.seq_len, device=device).view(1, args.seq_len, 1)
+    actual_valid_width = (component_topk <= query_positions).sum(dim=-1)
+    expected_valid_width = valid_width.view(1, -1).expand_as(actual_valid_width)
+    failures += not _check_tensor(
+        "simplified_causal_support_width",
+        actual_valid_width,
+        expected_valid_width,
+        0.0,
+        0.0,
+        args.fail_fast,
+    )
+    failures += not _check_tensor(
+        "simplified_sparse_output",
+        min_memory["output"],
+        reference["output"],
+        atol,
+        rtol,
+        args.fail_fast,
+    )
+    failures += not _check_tensor(
+        "simplified_forward_only_output",
+        forward_only_output,
+        reference["output"],
+        atol,
+        rtol,
+        args.fail_fast,
+    )
+    failures += not _check_tensor(
+        "simplified_sparse_loss",
+        min_memory["loss"],
+        reference["loss"],
+        atol,
+        rtol,
+        args.fail_fast,
+    )
+    for name, expected in reference["grads"].items():
+        failures += not _check_tensor(
+            f"simplified_sparse_grad_{name}",
+            min_memory["grads"][name],
+            expected,
+            atol,
+            rtol,
+            args.fail_fast,
+        )
+    failures += not _check_tensor(
+        "simplified_dense_loss",
+        min_dense_loss,
+        ref_dense_loss,
+        atol,
+        rtol,
+        args.fail_fast,
+    )
+    failures += not _check_tensor(
+        "simplified_dense_grad_linear_q_weight",
+        min_dense_grad,
+        ref_dense_grad,
+        atol,
+        rtol,
+        args.fail_fast,
+    )
+    failures += not _check_tensor(
+        "simplified_sparse_dense_output",
+        sparse_dense["min_output"],
+        sparse_dense["reference_output"],
+        atol,
+        rtol,
+        args.fail_fast,
+    )
+    failures += not _check_tensor(
+        "simplified_sparse_dense_internal_loss_zero",
+        sparse_dense["internal_sparse_loss"],
+        torch.zeros_like(sparse_dense["internal_sparse_loss"]),
+        0.0,
+        0.0,
+        args.fail_fast,
+    )
+    failures += not _check_tensor(
+        "simplified_sparse_dense_loss",
+        sparse_dense["min_loss"],
+        sparse_dense["reference_loss"],
+        atol,
+        rtol,
+        args.fail_fast,
+    )
+    for name, expected in sparse_dense["reference_grads"].items():
+        failures += not _check_tensor(
+            f"simplified_sparse_dense_grad_{name}",
+            sparse_dense["min_grads"][name],
+            expected,
+            atol,
+            rtol,
+            args.fail_fast,
+        )
+
+    if world_size > 1:
+        for name, tensor in (
+            ("simplified_tp_replicated_sparse_loss", min_memory["loss"]),
+            (
+                "simplified_tp_replicated_q_wgrad",
+                min_memory["grads"]["linear_q_weight"],
+            ),
+            ("simplified_tp_replicated_dense_loss", min_dense_loss),
+            ("simplified_tp_replicated_dense_q_wgrad", min_dense_grad),
+        ):
+            gathered = [torch.empty_like(tensor) for _ in range(world_size)]
+            torch.distributed.all_gather(gathered, tensor.contiguous())
+            for peer_rank, peer_tensor in enumerate(gathered[1:], start=1):
+                failures += not _check_tensor(
+                    f"{name}_rank{peer_rank}",
+                    peer_tensor,
+                    gathered[0],
+                    atol,
+                    rtol,
+                    args.fail_fast,
+                )
+
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        fail_tensor = torch.tensor([failures], device=device, dtype=torch.int32)
+        torch.distributed.all_reduce(fail_tensor, op=torch.distributed.ReduceOp.SUM)
+        failures = int(fail_tensor.item())
+    if failures:
+        print(f"\nFAIL: {failures} simplified DSA parity checks failed.", flush=True)
+        return 1
+    print("\nPASS: all simplified DSA parity checks passed.", flush=True)
     return 0
 
 
@@ -1506,31 +2323,97 @@ def _check_indices(name: str, actual: torch.Tensor, expected: torch.Tensor, fail
     return ok
 
 
-def _check_causal_support_indices(
-    name: str, actual: torch.Tensor, expected: torch.Tensor, fail_fast: bool
+def _check_topk_support_with_score_error(
+    name: str,
+    actual_indices: torch.Tensor,
+    actual_scores: torch.Tensor,
+    reference_scores: torch.Tensor,
+    fail_fast: bool,
 ) -> bool:
-    query_positions = torch.arange(actual.size(1), device=actual.device).view(1, actual.size(1), 1)
-    actual_valid = actual <= query_positions
-    expected_valid = expected <= query_positions
-    ok = bool(actual_valid.sum().item() == expected_valid.sum().item())
-    if ok:
-        actual_valid_sorted = actual.masked_fill(~actual_valid, -1).sort(dim=-1).values
-        expected_valid_sorted = expected.masked_fill(~expected_valid, -1).sort(dim=-1).values
-        ok = torch.equal(actual_valid_sorted, expected_valid_sorted)
-    status = "OK " if ok else "BAD"
-    print(f"{status} {name:<36} shape={tuple(actual.shape)}", flush=True)
-    if not ok:
-        actual_valid_sorted = actual.masked_fill(~actual_valid, -1).sort(dim=-1).values
-        expected_valid_sorted = expected.masked_fill(~expected_valid, -1).sort(dim=-1).values
-        mismatch = (actual_valid_sorted != expected_valid_sorted).nonzero()
-        if mismatch.numel() > 0:
-            index = tuple(int(v) for v in mismatch[0])
-            print(
-                f"    first valid-support mismatch at {index}: "
-                f"actual={actual_valid_sorted[index].item()} "
-                f"expected={expected_valid_sorted[index].item()}",
-                flush=True,
+    """Validate top-k support while allowing only numerically unresolved cutoff ties."""
+    if (
+        actual_indices.shape != actual_scores.shape
+        or actual_indices.shape[:2] != reference_scores.shape[:2]
+    ):
+        ok = False
+        detail = (
+            f"shape mismatch indices={tuple(actual_indices.shape)} "
+            f"scores={tuple(actual_scores.shape)} reference={tuple(reference_scores.shape)}"
+        )
+    else:
+        batch_size, query_len, topk = actual_indices.shape
+        key_len = reference_scores.size(-1)
+        query_positions = torch.arange(query_len, device=actual_indices.device).view(1, -1, 1)
+        in_bounds = (actual_indices >= 0) & (actual_indices < key_len)
+        causal = in_bounds & (actual_indices <= query_positions)
+        expected_width = torch.arange(query_len, device=actual_indices.device).add(1).clamp(
+            max=topk
+        )
+        expected_width = expected_width.view(1, -1).expand(batch_size, -1)
+        width_ok = causal.sum(dim=-1) == expected_width
+
+        sorted_support = actual_indices.masked_fill(~causal, key_len).sort(dim=-1).values
+        duplicate = (sorted_support[..., 1:] == sorted_support[..., :-1]) & (
+            sorted_support[..., 1:] < key_len
+        )
+        unique_ok = ~duplicate.any(dim=-1)
+
+        gather_indices = actual_indices.clamp(min=0, max=max(key_len - 1, 0))
+        reference_at_actual = reference_scores.gather(-1, gather_indices)
+        finite = causal & torch.isfinite(actual_scores) & torch.isfinite(reference_at_actual)
+        score_error = torch.where(
+            finite,
+            (actual_scores.float() - reference_at_actual.float()).abs(),
+            torch.zeros((), device=actual_scores.device, dtype=torch.float32),
+        )
+        row_error = score_error.amax(dim=-1)
+        allowance = row_error + 1.0e-5
+
+        reference_top_values, reference_top_indices = reference_scores.topk(topk, dim=-1)
+        threshold_index = (expected_width - 1).unsqueeze(-1)
+        reference_threshold = reference_top_values.gather(-1, threshold_index).squeeze(-1)
+        selected_min = reference_at_actual.masked_fill(~causal, float("inf")).amin(dim=-1)
+        optimal_ok = selected_min >= reference_threshold - allowance
+
+        actual_support = actual_indices.masked_fill(~causal, key_len).sort(dim=-1).values
+        reference_causal = reference_top_indices <= query_positions
+        reference_support = reference_top_indices.masked_fill(~reference_causal, key_len).sort(
+            dim=-1
+        ).values
+        exact_support = (actual_support == reference_support).all(dim=-1)
+
+        if topk < key_len:
+            top_plus_one = reference_scores.topk(topk + 1, dim=-1).values
+            boundary_margin = top_plus_one[..., topk - 1] - top_plus_one[..., topk]
+            has_omitted_causal_key = expected_width == topk
+            stable = has_omitted_causal_key & (boundary_margin > 2.0 * allowance)
+        else:
+            stable = torch.zeros_like(exact_support)
+        stable_support_ok = ~stable | exact_support
+
+        row_ok = width_ok & unique_ok & optimal_ok & stable_support_ok
+        ok = bool(row_ok.all().item())
+        near_tie_rows = (~exact_support & ~stable & width_ok & unique_ok & optimal_ok).sum()
+        if ok:
+            detail = (
+                f"near_tie_rows={int(near_tie_rows.item())} "
+                f"max_score_error={float(row_error.max().item()):.6e}"
             )
+        else:
+            batch_idx, query_idx = (int(v) for v in (~row_ok).nonzero()[0])
+            actual_row = set(actual_support[batch_idx, query_idx].tolist()) - {key_len}
+            reference_row = set(reference_support[batch_idx, query_idx].tolist()) - {key_len}
+            detail = (
+                f"first invalid row=({batch_idx}, {query_idx}) "
+                f"missing={sorted(reference_row - actual_row)[:8]} "
+                f"extra={sorted(actual_row - reference_row)[:8]} "
+                f"selected_min={float(selected_min[batch_idx, query_idx].item()):.6e} "
+                f"threshold={float(reference_threshold[batch_idx, query_idx].item()):.6e} "
+                f"allowance={float(allowance[batch_idx, query_idx].item()):.6e}"
+            )
+
+    status = "OK " if ok else "BAD"
+    print(f"{status} {name:<36} shape={tuple(actual_indices.shape)} {detail}", flush=True)
     if fail_fast and not ok:
         raise SystemExit(1)
     return ok
@@ -1556,7 +2439,13 @@ def _parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--mode",
-        choices=("sparse", "dense-warmup", "dense-vs-full-topk", "sparse-fwd-dense-loss"),
+        choices=(
+            "sparse",
+            "dense-warmup",
+            "dense-vs-full-topk",
+            "sparse-fwd-dense-loss",
+            "simplified",
+        ),
         default="sparse",
         help="Which parity surface to run.",
     )
@@ -1576,8 +2465,28 @@ def _parse_args():
     parser.add_argument("--topk", type=int, default=32)
     parser.add_argument("--indexer-rotary-dim", type=int, default=0)
     parser.add_argument("--rotary-interleaved", action="store_true")
+    parser.add_argument(
+        "--simplified-input-norm",
+        choices=("none", "rmsnorm", "layernorm"),
+        default="none",
+        help="Synthetic fused main-Q input norm used by simplified-mode parity checks.",
+    )
+    parser.add_argument(
+        "--zero-centered-gamma",
+        action="store_true",
+        help="Interpret the synthetic simplified input-norm weight as zero-centered gamma.",
+    )
     parser.add_argument("--hadamard", action="store_true")
     parser.add_argument("--loss-coeff", type=float, default=0.7)
+    parser.add_argument(
+        "--attention-softmax-scale",
+        type=float,
+        default=None,
+        help=(
+            "Optional main-attention/teacher softmax scale. Simplified routing remains fixed "
+            "at head_dim**-0.5."
+        ),
+    )
     parser.add_argument("--layernorm-eps", type=float, default=1e-5)
     parser.add_argument("--query-block-size", type=int, default=512)
     parser.add_argument("--key-block-size", type=int, default=1024)
@@ -1596,7 +2505,7 @@ def _parse_args():
         "--distributed-backend",
         choices=("nccl", "gloo"),
         default=None,
-        help="Distributed backend for dense-warmup TP checks. Defaults to nccl on CUDA.",
+        help="Distributed backend for TP parity checks. Defaults to nccl on CUDA.",
     )
     parser.add_argument(
         "--cuda-preflight-only",
@@ -1666,6 +2575,8 @@ def main() -> int:
         return _run_dense_vs_full_topk_parity(args, device, dtype)
     if args.mode == "sparse-fwd-dense-loss":
         return _run_sparse_fwd_dense_loss_parity(args, device, dtype)
+    if args.mode == "simplified":
+        return _run_simplified_parity(args, device, dtype)
 
     use_triton = args.backend == "triton-min-memory"
     atol = args.atol if args.atol is not None else (3e-2 if dtype != torch.float32 else 2e-4)
@@ -1699,10 +2610,11 @@ def main() -> int:
     failures = 0
     failures += not _check_tensor("q_index", components["q_index"], reference["q_index"], atol, rtol, args.fail_fast)
     failures += not _check_tensor("weights", components["weights"], reference["weights"], atol, rtol, args.fail_fast)
-    failures += not _check_causal_support_indices(
+    failures += not _check_topk_support_with_score_error(
         "topk_support",
         components["topk_indices"],
-        reference["natural_topk_indices"],
+        components["topk_scores"],
+        reference["index_scores"],
         args.fail_fast,
     )
     _report_exact_indices(

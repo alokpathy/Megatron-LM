@@ -49,6 +49,7 @@ from typing import Any, Optional, Dict
 import torch.distributed
 
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
+from megatron.core.optimizer.cpu_offloading import HybridDeviceOptimizer
 from megatron.core.optimizer_param_scheduler import (
     get_canonical_lr_for_logging,
     get_indexer_lr_for_logging,
@@ -696,7 +697,8 @@ def _freeze_non_dsa_indexer_parameters(model):
                 frozen_param_count += 1
                 frozen_element_count += param.nelement()
 
-    if indexer_param_count == 0:
+    global_indexer_param_count = _global_dsa_indexer_reset_count(indexer_param_count)
+    if global_indexer_param_count == 0:
         raise RuntimeError(
             "--dsa-train-indexer-only was set, but no DSA indexer parameters were found. "
             "Check that --experimental-attention-variant dsa is active and DSA layers are built."
@@ -704,7 +706,8 @@ def _freeze_non_dsa_indexer_parameters(model):
 
     print_rank_0(
         " > DSA train-indexer-only: trainable indexer params "
-        f"{indexer_param_count} tensors / {indexer_element_count} elements; "
+        f"{indexer_param_count} local tensors ({global_indexer_param_count} across ranks) / "
+        f"{indexer_element_count} local elements; "
         f"frozen non-indexer params {frozen_param_count} tensors / {frozen_element_count} elements."
     )
 
@@ -765,10 +768,6 @@ def _reset_dsa_indexer_modules_with_current_rng(model) -> int:
                             else:
                                 param.zero_()
 
-    if reset_module_count == 0:
-        raise RuntimeError(
-            "--dsa-reset-indexer-on-load was set, but no DSA indexer modules were found."
-        )
     return reset_module_count
 
 
@@ -780,9 +779,14 @@ def _reset_dsa_indexer_modules(model, seed: int) -> int:
         rng_tracker_states = cuda_rng_tracker.get_states()
         rng_tracker_name = tensor_parallel.get_data_parallel_rng_tracker_name()
         try:
-            with cuda_rng_tracker.fork(rng_tracker_name):
-                torch.cuda.manual_seed(seed)
-                return _reset_dsa_indexer_modules_with_current_rng(model)
+            # The loaded module is normally CUDA-resident, but CPU initialization and
+            # offloaded parameters are valid too. Preserve and seed both RNG domains so an
+            # out-of-band reset neither perturbs the training RNG nor depends on residency.
+            with torch.random.fork_rng(devices=[]):
+                torch.manual_seed(seed)
+                with cuda_rng_tracker.fork(rng_tracker_name):
+                    torch.cuda.manual_seed(seed)
+                    return _reset_dsa_indexer_modules_with_current_rng(model)
         finally:
             cuda_rng_tracker.set_states(rng_tracker_states)
 
@@ -792,6 +796,110 @@ def _reset_dsa_indexer_modules(model, seed: int) -> int:
         if cuda_available:
             torch.cuda.manual_seed(seed)
         return _reset_dsa_indexer_modules_with_current_rng(model)
+
+
+def _reset_simplified_dsa_indexers_from_main_q(model, rescale: bool = False) -> int:
+    """Initialize simplified indexer Q from the mean loaded main-Q projection."""
+    if not isinstance(model, list):
+        model = [model]
+
+    reset_count = 0
+    for model_chunk in model:
+        for module in model_chunk.modules():
+            core_attention = getattr(module, "core_attention", None)
+            indexer = getattr(core_attention, "indexer", None)
+            linear_qkv = getattr(module, "linear_qkv", None)
+            if indexer is None or linear_qkv is None:
+                continue
+            indexer_config = getattr(indexer, "config", None)
+            if getattr(indexer_config, "dsa_indexer_mode", "standard") != "simplified":
+                continue
+
+            main_weight = getattr(linear_qkv, "weight", None)
+            indexer_weight = getattr(getattr(indexer, "linear_q", None), "weight", None)
+            if main_weight is None or indexer_weight is None:
+                raise RuntimeError(
+                    "Main-Q reset requires exposed main linear_qkv and indexer linear_q weights."
+                )
+            tp_group = indexer.pg_collection.tp
+            tp_size = get_pg_size(tp_group)
+            if tp_size > 1:
+                gathered_weights = [torch.empty_like(main_weight) for _ in range(tp_size)]
+                torch.distributed.all_gather(
+                    gathered_weights, main_weight.detach().contiguous(), group=tp_group
+                )
+                full_qkv_weight = torch.cat(gathered_weights, dim=0)
+            else:
+                full_qkv_weight = main_weight.detach()
+
+            num_query_heads = indexer_config.num_attention_heads
+            head_dim = indexer_config.kv_channels
+            query_rows = num_query_heads * head_dim
+            if full_qkv_weight.ndim != 2 or full_qkv_weight.size(0) < query_rows:
+                raise RuntimeError(
+                    "Unable to extract main query heads from linear_qkv weight with shape "
+                    f"{tuple(full_qkv_weight.shape)}; expected at least {query_rows} output rows."
+                )
+            if indexer_weight.shape != (head_dim, full_qkv_weight.size(1)):
+                raise RuntimeError(
+                    "Simplified indexer Q weight shape does not match the main attention head: "
+                    f"indexer={tuple(indexer_weight.shape)}, expected="
+                    f"{(head_dim, full_qkv_weight.size(1))}."
+                )
+
+            main_q_heads = full_qkv_weight[:query_rows].reshape(
+                num_query_heads, head_dim, full_qkv_weight.size(1)
+            )
+            main_q_heads_float = main_q_heads.float()
+            mean_q_weight = main_q_heads_float.mean(dim=0)
+            if rescale:
+                target_norm_sq = main_q_heads_float.square().sum(dim=(1, 2)).mean()
+                mean_norm_sq = mean_q_weight.square().sum()
+                if mean_norm_sq > 0:
+                    mean_q_weight = mean_q_weight * torch.sqrt(
+                        target_norm_sq / mean_norm_sq
+                    )
+            mean_q_weight = mean_q_weight.to(dtype=indexer_weight.dtype)
+            with torch.no_grad():
+                indexer_weight.copy_(mean_q_weight)
+            reset_count += 1
+
+    return reset_count
+
+
+def _global_dsa_indexer_reset_count(local_reset_count: int) -> int:
+    """Sum reset modules across ranks so PP stages without DSA layers remain valid."""
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        return local_reset_count
+    backend = torch.distributed.get_backend()
+    device = (
+        torch.device("cuda", torch.cuda.current_device())
+        if backend == "nccl"
+        else torch.device("cpu")
+    )
+    count = torch.tensor(local_reset_count, device=device, dtype=torch.int64)
+    torch.distributed.all_reduce(count, op=torch.distributed.ReduceOp.SUM)
+    return int(count.item())
+
+
+@torch.no_grad()
+def _broadcast_dsa_indexer_params(model) -> None:
+    """Restore the DDP parameter-replica invariant after an out-of-band reset."""
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        return
+    if not isinstance(model, list):
+        model = [model]
+    data_parallel_group = mpu.get_data_parallel_group()
+    if get_pg_size(data_parallel_group) == 1:
+        return
+    src_rank = torch.distributed.get_global_rank(data_parallel_group, 0)
+    seen_param_ids = set()
+    for model_chunk in model:
+        for name, param in model_chunk.named_parameters():
+            if not _is_dsa_indexer_param_name(name) or id(param) in seen_param_ids:
+                continue
+            seen_param_ids.add(id(param))
+            torch.distributed.broadcast(param.data, src=src_rank, group=data_parallel_group)
 
 
 def _get_dsa_indexer_reset_seed(args) -> int:
@@ -840,6 +948,101 @@ def _clear_dsa_indexer_optimizer_state(model, optimizer) -> int:
     return cleared
 
 
+def _reset_dsa_indexer_optimizer_group_steps(optimizer) -> int:
+    """Reset group-level optimizer clocks for freshly reset DSA indexers.
+
+    TE and Apex FusedAdam keep ``step`` on parameter groups rather than in each
+    parameter's state. Indexer groups are deliberately separate from backbone
+    groups, so their clocks can be reset without changing backbone bias
+    correction.
+    """
+    if optimizer is None or getattr(optimizer, "is_stub_optimizer", False):
+        return 0
+    if hasattr(optimizer, "chained_optimizers"):
+        return sum(
+            _reset_dsa_indexer_optimizer_group_steps(child_optimizer)
+            for child_optimizer in optimizer.chained_optimizers
+        )
+
+    torch_optimizer = getattr(optimizer, "optimizer", None)
+    param_groups = getattr(torch_optimizer, "param_groups", None)
+    if param_groups is None:
+        return 0
+
+    optimizer_module = type(torch_optimizer).__module__
+    uses_group_step = optimizer_module.startswith(("transformer_engine", "apex")) or any(
+        "step" in param_group for param_group in param_groups
+    )
+    if not uses_group_step:
+        return 0
+
+    reset = 0
+    for param_group in param_groups:
+        if not param_group.get("is_dsa_indexer", False):
+            continue
+        step = param_group.get("step")
+        if torch.is_tensor(step):
+            step.zero_()
+        else:
+            param_group["step"] = 0
+        reset += 1
+    return reset
+
+
+@torch.no_grad()
+def _reload_dsa_indexer_optimizer_params(model, optimizer) -> int:
+    """Refresh only optimizer-owned indexer weights after an in-place model reset."""
+    if optimizer is None or getattr(optimizer, "is_stub_optimizer", False):
+        return 0
+    if not isinstance(model, list):
+        model = [model]
+    if hasattr(optimizer, "chained_optimizers"):
+        return sum(
+            _reload_dsa_indexer_optimizer_params(model, child_optimizer)
+            for child_optimizer in optimizer.chained_optimizers
+        )
+
+    param_to_optim_param = get_model_to_optimizer_param_map(optimizer)
+    precision_aware = getattr(
+        getattr(optimizer, "config", None),
+        "use_precision_aware_optimizer_no_fp8_or_ds_fp8",
+        False,
+    )
+    refreshed = 0
+    seen_param_ids = set()
+    for model_chunk in model:
+        for name, model_param in model_chunk.named_parameters():
+            if not _is_dsa_indexer_param_name(name) or id(model_param) in seen_param_ids:
+                continue
+            seen_param_ids.add(id(model_param))
+            optim_param = param_to_optim_param.get(model_param)
+            if optim_param is None:
+                # A distributed-optimizer rank need not own a shard of every model parameter.
+                continue
+
+            source = model_param.detach().reshape(-1)
+            if optim_param.numel() != source.numel():
+                get_range = getattr(optimizer, "_get_model_param_range_map", None)
+                if get_range is None:
+                    raise RuntimeError(
+                        "Cannot map a sharded DSA indexer parameter to its optimizer-owned shard."
+                    )
+                param_range = get_range(model_param)["param"]
+                source = source[param_range.start : param_range.end]
+
+            if precision_aware:
+                set_states = getattr(optimizer, "_set_main_param_and_optimizer_states", None)
+                if set_states is None:
+                    raise RuntimeError(
+                        "Precision-aware optimizer does not expose indexer master-parameter refresh."
+                    )
+                set_states(model_param, {"param": source.float()})
+            elif optim_param is not model_param:
+                optim_param.copy_(source.reshape_as(optim_param))
+            refreshed += 1
+    return refreshed
+
+
 def _apply_dsa_indexer_lr_warmup(args, optimizer, opt_param_scheduler) -> float | None:
     """Post-scale DSA indexer optimizer groups after the global scheduler step."""
     if optimizer is None or opt_param_scheduler is None:
@@ -864,12 +1067,69 @@ def _apply_dsa_indexer_lr_warmup(args, optimizer, opt_param_scheduler) -> float 
 
 def _reset_dsa_indexer_after_load(model, optimizer, opt_param_scheduler, args, explicit_start: bool):
     """Reset DSA indexer params/state after checkpoint load and initialize activation warmup."""
-    seed = _get_dsa_indexer_reset_seed(args)
-
-    reset_count = _reset_dsa_indexer_modules(model, seed)
+    if getattr(args, "use_torch_fsdp2", False) or getattr(args, "use_megatron_fsdp", False):
+        raise RuntimeError(
+            "DSA indexer reset-on-load currently supports DDP/distributed-optimizer models only."
+        )
+    if getattr(
+        getattr(optimizer, "config", None),
+        "use_precision_aware_optimizer_no_fp8_or_ds_fp8",
+        False,
+    ):
+        raise RuntimeError(
+            "DSA indexer reset-on-load does not support precision-aware optimizer state."
+        )
+    optimizers_to_check = getattr(optimizer, "chained_optimizers", [optimizer])
+    if any(
+        isinstance(getattr(child_optimizer, "optimizer", None), HybridDeviceOptimizer)
+        for child_optimizer in optimizers_to_check
+    ):
+        raise RuntimeError(
+            "DSA indexer reset-on-load does not support optimizer CPU offload."
+        )
+    reset_method = getattr(args, "dsa_indexer_reset_method", "random")
+    if reset_method in ("main-q-mean", "main-q-mean-rescaled"):
+        rescale = reset_method == "main-q-mean-rescaled"
+        reset_count = _reset_simplified_dsa_indexers_from_main_q(model, rescale=rescale)
+        reset_description = (
+            "from the norm-rescaled mean loaded main-Q projection"
+            if rescale
+            else "from the mean loaded main-Q projection"
+        )
+    else:
+        seed = _get_dsa_indexer_reset_seed(args)
+        reset_count = _reset_dsa_indexer_modules(model, seed)
+        reset_description = f"with seed {seed}"
+    global_reset_count = _global_dsa_indexer_reset_count(reset_count)
+    if global_reset_count == 0:
+        raise RuntimeError(
+            "--dsa-reset-indexer-on-load was set, but no DSA indexer modules were found "
+            "on any distributed rank."
+        )
+    _broadcast_dsa_indexer_params(model)
+    refreshed_param_count = 0
+    optimizer_state_loaded = not getattr(args, "no_load_optim", False) and not getattr(
+        args, "finetune", False
+    )
+    optimizer_refresh_description = "no optimizer parameter copies"
     if optimizer is not None and not getattr(optimizer, "is_stub_optimizer", False):
-        optimizer.reload_model_params()
-    cleared_state_count = _clear_dsa_indexer_optimizer_state(model, optimizer)
+        # load_checkpoint has already synchronized all optimizer-owned parameter copies when
+        # optimizer state was not loaded. Preserve backbone masters and refresh only the parameter
+        # changed by this out-of-band reset.
+        refreshed_param_count = _reload_dsa_indexer_optimizer_params(model, optimizer)
+        optimizer_refresh_description = (
+            f"{refreshed_param_count} local indexer optimizer parameter shards"
+        )
+    cleared_state_count = (
+        0
+        if not optimizer_state_loaded
+        else _clear_dsa_indexer_optimizer_state(model, optimizer)
+    )
+    reset_group_step_count = (
+        0
+        if not optimizer_state_loaded
+        else _reset_dsa_indexer_optimizer_group_steps(optimizer)
+    )
 
     if not explicit_start:
         args.dsa_indexer_activation_start_samples = getattr(
@@ -879,8 +1139,11 @@ def _reset_dsa_indexer_after_load(model, optimizer, opt_param_scheduler, args, e
 
     print_rank_0(
         " > DSA reset-indexer-on-load: reset "
-        f"{reset_count} indexer modules with seed {seed}; cleared optimizer state for "
-        f"{cleared_state_count} indexer tensors; activation_start_samples="
+        f"{reset_count} local indexer modules ({global_reset_count} across ranks) "
+        f"{reset_description}; refreshed {optimizer_refresh_description}; "
+        "cleared optimizer state for "
+        f"{cleared_state_count} indexer tensors and reset "
+        f"{reset_group_step_count} indexer optimizer group steps; activation_start_samples="
         f"{args.dsa_indexer_activation_start_samples}; indexer_lr={indexer_lr}."
     )
 

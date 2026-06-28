@@ -74,6 +74,10 @@ class MambaModel(LanguageModule):
             embeddings. Ignored unless position_embedding_type is 'rope'. Defaults to 1.0.
         rotary_base (int, optional): Base period for rotary position embeddings. Ignored unless
             position_embedding_type is 'rope'. Defaults to 10000.
+        rope_scaling (bool, optional): Apply Llama-style rotary-frequency scaling. Defaults to
+            False.
+        rope_scaling_factor (float, optional): Frequency-scaling factor used when rope_scaling is
+            enabled. Defaults to 8.0.
         seq_len_interpolation_factor (Optional[float], optional): scale of linearly
             interpolating RoPE for longer sequences. The value must be a float larger than 1.0.
              Defaults to None.
@@ -100,6 +104,8 @@ class MambaModel(LanguageModule):
         position_embedding_type: Literal['learned_absolute', 'rope', 'none'] = 'none',
         rotary_percent: float = 1.0,
         rotary_base: int = 10000,
+        rope_scaling: bool = False,
+        rope_scaling_factor: float = 8.0,
         scatter_embedding_sequence_parallel: bool = True,
         seq_len_interpolation_factor: Optional[float] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
@@ -217,8 +223,11 @@ class MambaModel(LanguageModule):
             self.rotary_pos_emb = RotaryEmbedding(
                 kv_channels=self.config.kv_channels,
                 rotary_percent=rotary_percent,
+                rotary_interleaved=self.config.rotary_interleaved,
                 seq_len_interpolation_factor=seq_len_interpolation_factor,
                 rotary_base=rotary_base,
+                rope_scaling=rope_scaling,
+                rope_scaling_factor=rope_scaling_factor,
                 use_cpu_initialization=self.config.use_cpu_initialization,
                 cp_group=self.pg_collection.cp,
             )

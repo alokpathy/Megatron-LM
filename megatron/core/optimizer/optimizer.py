@@ -443,6 +443,40 @@ class MegatronOptimizer(ABC):
         for param_idx, param_state in state_dict['state'].items():
             param_state['step'] = copy.deepcopy(step)
 
+    @staticmethod
+    def _move_per_param_steps_to_param_groups(state_dict: Dict) -> None:
+        """Move non-shardable per-parameter clocks to their logical groups."""
+        for group_idx, param_group in enumerate(state_dict['param_groups']):
+            group_step = None
+            group_step_value = None
+            for param_idx in param_group['params']:
+                param_state = state_dict['state'].get(param_idx, {})
+                param_step = param_state.get('step')
+                if param_step is None:
+                    continue
+                param_step_value = param_step.item() if torch.is_tensor(param_step) else param_step
+                if group_step is None:
+                    group_step = param_step
+                    group_step_value = param_step_value
+                elif group_step_value != param_step_value:
+                    raise ValueError(
+                        "The optimizer step differs within parameter group "
+                        f"{group_idx}: {group_step_value} vs {param_step_value}."
+                    )
+            if group_step is not None:
+                param_group['step'] = copy.deepcopy(group_step)
+
+    @staticmethod
+    def _restore_param_group_steps(state_dict: Dict) -> None:
+        """Restore per-parameter clocks from group metadata after sharded load."""
+        for param_group in state_dict['param_groups']:
+            if 'step' not in param_group:
+                continue
+            step = param_group['step']
+            for param_idx in param_group['params']:
+                if param_idx in state_dict['state']:
+                    state_dict['state'][param_idx]['step'] = copy.deepcopy(step)
+
     def offload_to_cpu(self):
         """Function used for RL training.
         Move optimizer state tensors to CPU to free GPU memory during inference."""
@@ -943,7 +977,11 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
             )
         ]
 
-        step = self._extract_common_per_param_step(state_dict['optimizer'])
+        try:
+            common_step = self._extract_common_per_param_step(state_dict['optimizer'])
+        except ValueError:
+            common_step = None
+            self._move_per_param_steps_to_param_groups(state_dict['optimizer'])
 
         # Convert regular optimizer state
         # all optimizer parameters passed to optim_state_to_sharding_state are
@@ -952,10 +990,8 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
         optim_state_to_sharding_state(
             state_dict['optimizer'], id_to_sharded_param_map, exclude_keys="step"
         )
-        # save step as a shared step among all parameters. Separate per-parameter
-        # steps are not supported
-        if step:
-            state_dict['optimizer']['state']['common_step'] = step
+        if common_step is not None:
+            state_dict['optimizer']['state']['common_step'] = common_step
         return state_dict
 
     def load_state_dict(self, state_dict):
@@ -967,6 +1003,8 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
         if 'common_step' in state_dict[optimizer_key]['state']:
             common_step = state_dict[optimizer_key]['state'].pop('common_step')
             self._restore_common_per_param_step(state_dict[optimizer_key], common_step)
+        else:
+            self._restore_param_group_steps(state_dict[optimizer_key])
 
         # Filter and reorder param groups to match current optimizer
         state_dict[optimizer_key]['param_groups'] = self._filter_and_reorder_param_groups(
@@ -1122,6 +1160,8 @@ class FP32Optimizer(MegatronOptimizer):
         if 'common_step' in state_dict['state']:
             common_step = state_dict['state'].pop('common_step')
             self._restore_common_per_param_step(state_dict, common_step)
+        else:
+            self._restore_param_group_steps(state_dict)
 
         # Filter and reorder param groups to match current optimizer
         state_dict['param_groups'] = self._filter_and_reorder_param_groups(
@@ -1142,16 +1182,18 @@ class FP32Optimizer(MegatronOptimizer):
         id_to_sharded_param_map = get_param_id_to_sharded_param_map(
             model_sharded_state_dict, self.get_parameters()
         )
-        step = self._extract_common_per_param_step(state_dict)
+        try:
+            common_step = self._extract_common_per_param_step(state_dict)
+        except ValueError:
+            common_step = None
+            self._move_per_param_steps_to_param_groups(state_dict)
 
         # all optimizer parameters passed to optim_state_to_sharding_state are
         # expected to have the same shape as the model parameters,
         # so we save the step separately and ignore it here
         optim_state_to_sharding_state(state_dict, id_to_sharded_param_map, exclude_keys="step")
-        # save step as a shared step among all parameters. Separate per-parameter
-        # steps are not supported
-        if step:
-            state_dict['state']['common_step'] = step
+        if common_step is not None:
+            state_dict['state']['common_step'] = common_step
         return state_dict
 
 
@@ -1591,25 +1633,36 @@ class ChainedOptimizer(MegatronOptimizer):
 
     def _synchronize_steps(self):
         """
-        Synchronize the step of all optimizers.
+        Synchronize optimizer steps within backbone and DSA-indexer buckets.
+
         TE FusedAdam will not accumulate "step" for empty param groups,
-        so we need to align the step across param groups before saving and after loading.
+        so we align empty groups before saving and after loading. A reset DSA
+        indexer intentionally has a fresh clock, which must remain independent
+        from the loaded backbone clock.
         """
 
-        steps = []
+        steps_by_dsa_bucket = {False: set(), True: set()}
         for optimizer in self.chained_optimizers:
             for param_group in optimizer.optimizer.param_groups:
                 if len(param_group['params']) > 0 and 'step' in param_group:
-                    steps.append(param_group['step'])
-        steps = list(set(steps))
-        assert len(steps) <= 1, f"steps: {steps}"
-        step = steps[0] if len(steps) == 1 else None
-        for optimizer in self.chained_optimizers:
-            for param_group in optimizer.optimizer.param_groups:
-                if len(param_group['params']) > 0 and 'step' in param_group:
-                    param_group['step'] = step
+                    bucket = bool(param_group.get('is_dsa_indexer', False))
+                    steps_by_dsa_bucket[bucket].add(int(param_group['step']))
+        for bucket, steps in steps_by_dsa_bucket.items():
+            assert len(steps) <= 1, f"is_dsa_indexer={bucket}, steps={steps}"
 
-        return step
+        synchronized_steps = {
+            bucket: next(iter(steps)) if steps else None
+            for bucket, steps in steps_by_dsa_bucket.items()
+        }
+        for optimizer in self.chained_optimizers:
+            for param_group in optimizer.optimizer.param_groups:
+                bucket = bool(param_group.get('is_dsa_indexer', False))
+                step = synchronized_steps[bucket]
+                if step is not None:
+                    if 'step' in param_group or len(param_group['params']) == 0:
+                        param_group['step'] = step
+
+        return synchronized_steps
 
     def offload_to_cpu(self):
         """Move optimizer state to CPU to free GPU memory during inference."""

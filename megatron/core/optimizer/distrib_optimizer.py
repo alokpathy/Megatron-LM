@@ -640,11 +640,25 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         inner_state_dict = self.optimizer.state_dict()
         state_dict = {}
 
-        # Extract 'step', for non-Apex/TE support.
+        # Extract optimizer clocks. A reset DSA indexer intentionally starts a
+        # fresh clock while backbone groups continue from the loaded checkpoint.
+        # Keep one clock per logical parameter group rather than collapsing all
+        # groups to a single global step.
+        group_steps = [None] * len(inner_state_dict["param_groups"])
         if not HAVE_APEX_OR_TE:
-            steps = list(set([s["step"].item() for s in inner_state_dict["state"].values()]))
-            assert len(steps) == 1
-            step = steps[0]
+            for group_idx, param_group in enumerate(inner_state_dict["param_groups"]):
+                steps = {
+                    inner_state_dict["state"][param_idx]["step"].item()
+                    for param_idx in param_group["params"]
+                    if param_idx in inner_state_dict["state"]
+                    and "step" in inner_state_dict["state"][param_idx]
+                }
+                assert len(steps) <= 1, (
+                    "Optimizer steps differ within one parameter group: "
+                    f"group={group_idx}, steps={steps}"
+                )
+                if steps:
+                    group_steps[group_idx] = next(iter(steps))
         elif isinstance(self.optimizer, HybridDeviceOptimizer):
             step = None
             for optimizer in self.optimizer.sub_optimizers:
@@ -655,34 +669,40 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     assert len(steps) == 1, f"steps: {optimizer.state}"
                     step = steps[0]
                     break
+            group_steps = [step] * len(group_steps)
         elif USING_TE_OPTIMIZER or USING_APEX_OPTIMIZER:
-            # Extract 'step', for TE FusedAdam support.
-            steps = list(
-                set(
-                    [
-                        g["step"]
-                        for g in inner_state_dict["param_groups"]
-                        if len(g["params"]) > 0 and "step" in g
-                    ]
+            # FusedAdam stores the clock directly on each parameter group.
+            # Empty local distributed-optimizer groups may not have advanced a
+            # clock, so fill them from a non-empty group in the same DSA bucket.
+            steps_by_dsa_bucket = {}
+            for group_idx, param_group in enumerate(inner_state_dict["param_groups"]):
+                if "step" not in param_group:
+                    continue
+                current_step = int(param_group["step"])
+                group_steps[group_idx] = current_step
+                if len(param_group["params"]) == 0:
+                    continue
+                bucket = bool(param_group.get("is_dsa_indexer", False))
+                known_step = steps_by_dsa_bucket.setdefault(bucket, current_step)
+                assert known_step == current_step, (
+                    "FusedAdam steps differ within the same DSA parameter bucket: "
+                    f"is_dsa_indexer={bucket}, steps="
+                    f"{known_step} and {current_step}"
                 )
-            )
-            assert len(steps) <= 1, f"steps: {steps}"
-            step = steps[0] if len(steps) == 1 else None
+            for group_idx, param_group in enumerate(inner_state_dict["param_groups"]):
+                bucket = bool(param_group.get("is_dsa_indexer", False))
+                bucket_step = steps_by_dsa_bucket.get(bucket)
+                if bucket_step is not None and (
+                    len(param_group["params"]) == 0 or group_steps[group_idx] is None
+                ):
+                    group_steps[group_idx] = bucket_step
 
         # Optimizer state (do not store parameter state here).
         state_dict['optimizer'] = {k: v for k, v in inner_state_dict.items() if k != "state"}
-        for param_group in state_dict["optimizer"]["param_groups"]:
+        for group_idx, param_group in enumerate(state_dict["optimizer"]["param_groups"]):
             del param_group["params"]
-            if not HAVE_APEX_OR_TE:
-                # Native PyTorch param group requires step (i.e., iteration).
-                param_group["step"] = step
-            elif (
-                USING_TE_OPTIMIZER
-                or USING_APEX_OPTIMIZER
-                or isinstance(self.optimizer, HybridDeviceOptimizer)
-            ) and step is not None:
-                # TE FusedAdam will not accumulate step for empty param groups, so we need to
-                # align the step across param groups.
+            step = group_steps[group_idx]
+            if step is not None:
                 param_group["step"] = int(step)
 
         # Grad scaler state.
@@ -814,26 +834,26 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             # Retrieve existing optimizer state.
             state_dict_state = inner_state_dict["state"]
 
-        # Extract 'step', for non-Apex/TE support.
+        # Restore per-group clocks for optimizers that keep ``step`` in each
+        # parameter state rather than directly on the parameter group.
         if not HAVE_APEX_OR_TE:
-            steps = list(set([g["step"] for g in state_dict["optimizer"]["param_groups"]]))
-            assert len(steps) == 1
-            step = torch.tensor(steps[0], dtype=torch.float)
-
-            for s in state_dict_state.values():
-                # Native PyTorch state dict requires step (i.e., iteration).
-                s["step"] = step
+            for param_group in state_dict_param_groups:
+                if "step" not in param_group:
+                    continue
+                step = torch.tensor(param_group["step"], dtype=torch.float)
+                for param_idx in param_group["params"]:
+                    if param_idx in state_dict_state:
+                        state_dict_state[param_idx]["step"] = step.detach().clone()
         elif isinstance(self.optimizer, HybridDeviceOptimizer):
             # Handle Torch AdamW special case, which, unlike FusedAdam, Torch AdamW
             # has an extra optimizer state "step".
-            steps = list(
-                set([g["step"] for g in state_dict["optimizer"]["param_groups"] if "step" in g])
-            )
-            if len(steps) != 0:
-                assert len(steps) == 1, f"steps: {steps}"
-                step = torch.tensor(steps[0], dtype=torch.float32, device="cpu")
-                for v in self.optimizer.state.values():
-                    v["step"] = step.detach().clone()
+            for param_group in state_dict_param_groups:
+                if "step" not in param_group:
+                    continue
+                step = torch.tensor(param_group["step"], dtype=torch.float32, device="cpu")
+                for param_idx in param_group["params"]:
+                    if param_idx in state_dict_state:
+                        state_dict_state[param_idx]["step"] = step.detach().clone()
 
         # Optimizer.
         self.optimizer.load_state_dict(

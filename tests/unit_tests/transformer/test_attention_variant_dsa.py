@@ -43,6 +43,20 @@ def mock_hadamard_transform(x: torch.Tensor, scale: float = 1.0) -> torch.Tensor
     return x * scale
 
 
+def _require_distributed_world_for_tp(tensor_model_parallel_size: int) -> None:
+    """Skip genuine TP tests when pytest was launched as a smaller distributed world."""
+    distributed_world_size = Utils.world_size
+    if (
+        distributed_world_size < tensor_model_parallel_size
+        or distributed_world_size % tensor_model_parallel_size != 0
+    ):
+        pytest.skip(
+            f"TP={tensor_model_parallel_size} requires a distributed world size divisible "
+            f"by {tensor_model_parallel_size}; current world size is {distributed_world_size}. "
+            "Launch this test with torchrun to exercise it."
+        )
+
+
 @pytest.fixture(autouse=True)
 def patch_hadamard_if_needed():
     """Automatically patch hadamard_transform in dsa module if not installed."""
@@ -268,6 +282,74 @@ class TestDSAIndexerLossAutoScaler:
         ), f"Gradient should be scaled by loss scale, expected {expected_grad_per_element}, got {dummy_input.grad[0].item()}"
 
 
+def test_dsa_indexer_loss_autoscaler_accumulates_multiple_microbatches_on_cpu():
+    """Each attached indexer loss receives the global scale divided by microbatch count."""
+    previous_scale = DSAIndexerLossAutoScaler.main_loss_backward_scale
+    DSAIndexerLossAutoScaler.main_loss_backward_scale = None
+    try:
+        scale = torch.tensor(0.5)
+        DSAIndexerLossAutoScaler.set_loss_scale(scale)
+        output_0 = torch.randn(3, requires_grad=True)
+        output_1 = torch.randn(3, requires_grad=True)
+        indexer_param_0 = torch.tensor(2.0, requires_grad=True)
+        indexer_param_1 = torch.tensor(-3.0, requires_grad=True)
+
+        attached_0 = DSAIndexerLossAutoScaler.apply(output_0, indexer_param_0.square())
+        attached_1 = DSAIndexerLossAutoScaler.apply(output_1, indexer_param_1.square())
+        (attached_0.sum() + attached_1.sum()).backward()
+
+        torch.testing.assert_close(output_0.grad, torch.ones_like(output_0))
+        torch.testing.assert_close(output_1.grad, torch.ones_like(output_1))
+        torch.testing.assert_close(indexer_param_0.grad, torch.tensor(2.0))
+        torch.testing.assert_close(indexer_param_1.grad, torch.tensor(-3.0))
+    finally:
+        DSAIndexerLossAutoScaler.main_loss_backward_scale = previous_scale
+
+
+@pytest.mark.parametrize(
+    "calculate_per_token_loss, expected_scale",
+    [(False, 2.0), (True, 8.0)],
+)
+def test_forward_step_sets_dsa_indexer_loss_scale_for_microbatch_mode(
+    calculate_per_token_loss, expected_scale
+):
+    from types import SimpleNamespace
+
+    from megatron.core.pipeline_parallel.schedules import forward_step_calc_loss
+
+    previous_scale = DSAIndexerLossAutoScaler.main_loss_backward_scale
+    DSAIndexerLossAutoScaler.main_loss_backward_scale = None
+    try:
+        config = SimpleNamespace(
+            calculate_per_token_loss=calculate_per_token_loss,
+            timers=None,
+            grad_scale_func=lambda tensor: tensor * 8.0,
+            experimental_attention_variant="dsa",
+            dsa_indexer_loss_coeff=0.1,
+            num_moe_experts=None,
+            mtp_num_layers=None,
+        )
+        forward_step_calc_loss(
+            model=SimpleNamespace(vp_stage=None),
+            output_tensor=torch.ones(2),
+            loss_func=lambda output: (output.sum(), {"loss": output.sum().detach()}),
+            config=config,
+            vp_stage=None,
+            collect_non_loss_data=False,
+            num_microbatches=4,
+            forward_data_store=[],
+            cp_group_size=1,
+            is_last_stage=True,
+        )
+
+        assert DSAIndexerLossAutoScaler.main_loss_backward_scale.numel() == 1
+        assert DSAIndexerLossAutoScaler.main_loss_backward_scale.item() == pytest.approx(
+            expected_scale
+        )
+    finally:
+        DSAIndexerLossAutoScaler.main_loss_backward_scale = previous_scale
+
+
 @pytest.mark.parametrize("seqlen_and_topk", [[16, 8], [32, 16], [64, 32]])
 @pytest.mark.parametrize("sparse_loss", [False, True])
 class TestFusedDSAIndexerLossGradient:
@@ -431,6 +513,8 @@ class TestFusedDSAIndexerLossGradientTP:
         Test that FusedDSAIndexerLoss produces consistent gradients across TP ranks
         and matches TP=1 baseline.
         """
+        _require_distributed_world_for_tp(tensor_model_parallel_size)
+
         seqlen = 64
         index_topk = 32
         batch_size = 2
@@ -1004,6 +1088,7 @@ class TestIndexerTensorParallel:
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_dsa_indexer_weight_consistency(self, tensor_model_parallel_size, sequence_parallel):
         """Test that indexer weights are identical across ALL GPUs."""
+        _require_distributed_world_for_tp(tensor_model_parallel_size)
         Utils.initialize_model_parallel(
             tensor_model_parallel_size=tensor_model_parallel_size, pipeline_model_parallel_size=1
         )
@@ -1035,6 +1120,7 @@ class TestIndexerTensorParallel:
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_dsa_indexer_forward_consistency(self, tensor_model_parallel_size, sequence_parallel):
         """Test that indexer gives consistent results across different TP sizes and SP settings."""
+        _require_distributed_world_for_tp(tensor_model_parallel_size)
         # First run with TP=1 to get baseline
         Utils.initialize_model_parallel(
             tensor_model_parallel_size=1, pipeline_model_parallel_size=1
@@ -1130,6 +1216,7 @@ class TestIndexerTensorParallel:
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_dsa_indexer_gradient_sync(self, tensor_model_parallel_size, sequence_parallel):
         """Test that gradients are properly synchronized within TP group."""
+        _require_distributed_world_for_tp(tensor_model_parallel_size)
         Utils.initialize_model_parallel(
             tensor_model_parallel_size=tensor_model_parallel_size, pipeline_model_parallel_size=1
         )
@@ -1255,6 +1342,7 @@ class TestDSAttentionTensorParallel:
         self, tensor_model_parallel_size, sequence_parallel, use_sparse_indexer_loss
     ):
         """Test that sparse attention indexer weights are identical across ALL GPUs."""
+        _require_distributed_world_for_tp(tensor_model_parallel_size)
         Utils.initialize_model_parallel(
             tensor_model_parallel_size=tensor_model_parallel_size, pipeline_model_parallel_size=1
         )
@@ -1288,6 +1376,7 @@ class TestDSAttentionTensorParallel:
         self, tensor_model_parallel_size, sequence_parallel, use_sparse_indexer_loss
     ):
         """Test that sparse attention gives consistent results across different TP, SP, and sparse loss settings."""
+        _require_distributed_world_for_tp(tensor_model_parallel_size)
         # First run with TP=1 to get baseline
         Utils.initialize_model_parallel(
             tensor_model_parallel_size=1, pipeline_model_parallel_size=1
@@ -1487,6 +1576,7 @@ class TestDSAttentionTensorParallel:
         self, tensor_model_parallel_size, sequence_parallel, use_sparse_indexer_loss
     ):
         """Test that indexer gradients are properly synchronized within TP group."""
+        _require_distributed_world_for_tp(tensor_model_parallel_size)
         Utils.initialize_model_parallel(
             tensor_model_parallel_size=tensor_model_parallel_size, pipeline_model_parallel_size=1
         )

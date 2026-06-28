@@ -15,15 +15,23 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
 from megatron.core.transformer.experimental_attention_variant.dsa_gqa import (
     DSGroupedSelfAttention,
     DSGQACoreAttention,
+    SimplifiedDSGQAIndexer,
+    SimplifiedDSGQAIndexerSubmodules,
+    _DSAZeroParamDependency,
     _build_shifted_causal_mask,
+    _simplified_indexer_input,
+    _simplified_indexer_norm_spec,
+    _simplified_index_scores,
     compute_gqa_dsa_indexer_loss,
     unfused_grouped_dsa_fn,
 )
 from megatron.core.transformer.experimental_attention_variant.dsa_min_memory import (
     DSAMinMemoryGQAFn,
     dsa_dense_indexer_loss,
+    dsa_min_memory_gqa,
     _forward_min_memory_impl,
     _native_indexer_loss_wgrad_chunk,
+    _project_k_index_block,
     _project_q_index_tile,
     _routing_key_chunk_size,
     _selected_index_scores_backward_torch,
@@ -32,9 +40,14 @@ from megatron.core.transformer.experimental_attention_variant.dsa_min_memory imp
 from megatron.core.transformer.experimental_attention_variant.dsa_min_memory_triton import (
     HAVE_TRITON,
     triton_indexer_loss_grad,
+    triton_k_ln_backward_prepare,
+    triton_k_ln_param_reduce,
     triton_linear_wgrad,
     triton_selected_k_linear,
     triton_selected_index_scores,
+    triton_simplified_index_scores_block,
+    triton_simplified_selected_index_scores,
+    triton_simplified_selected_index_scores_backward,
     triton_topk_index_block,
 )
 from megatron.core.transformer.enums import AttnMaskType
@@ -57,6 +70,119 @@ class _DummyRotary:
         )
         self.rotary_interleaved = rotary_interleaved
         self.seq_len_interpolation_factor = None
+
+
+@pytest.mark.parametrize("normalization", ["RMSNorm", "LayerNorm"])
+def test_simplified_indexer_uses_fused_main_qkv_normalized_input(normalization):
+    torch.manual_seed(123)
+    hidden = torch.randn(5, 2, 8, requires_grad=True)
+    weight = torch.randn(8)
+    bias = torch.randn(8) if normalization == "LayerNorm" else None
+    linear_qkv = SimpleNamespace(
+        layer_norm_weight=weight,
+        layer_norm_bias=bias,
+        eps=1.0e-5,
+        skip_norm_and_all_gather=False,
+    )
+    config = SimpleNamespace(
+        normalization=normalization,
+        layernorm_epsilon=1.0e-5,
+        layernorm_zero_centered_gamma=False,
+    )
+
+    norm_spec = _simplified_indexer_norm_spec(linear_qkv, config)
+    actual = _simplified_indexer_input(hidden, norm_spec)
+    if normalization == "RMSNorm":
+        hidden_float = hidden.detach().float()
+        expected = (
+            hidden_float
+            * torch.rsqrt(hidden_float.square().mean(dim=-1, keepdim=True) + 1.0e-5)
+            * weight.float()
+        ).to(hidden.dtype)
+    else:
+        expected = F.layer_norm(hidden.detach(), (8,), weight, bias, 1.0e-5)
+
+    torch.testing.assert_close(actual, expected)
+    assert not actual.requires_grad
+
+
+def test_simplified_indexer_recomputes_norm_when_qkv_uses_fused_input_buffer():
+    hidden = torch.randn(5, 2, 8, requires_grad=True)
+    linear_qkv = SimpleNamespace(
+        layer_norm_weight=torch.randn(8),
+        skip_norm_and_all_gather=True,
+    )
+    config = SimpleNamespace(
+        normalization="RMSNorm",
+        layernorm_epsilon=1.0e-5,
+        layernorm_zero_centered_gamma=False,
+    )
+
+    norm_spec = _simplified_indexer_norm_spec(linear_qkv, config)
+    actual = _simplified_indexer_input(hidden, norm_spec)
+    hidden_float = hidden.detach().float()
+    expected = (
+        hidden_float
+        * torch.rsqrt(hidden_float.square().mean(dim=-1, keepdim=True) + 1.0e-5)
+        * linear_qkv.layer_norm_weight.float()
+    ).to(hidden.dtype)
+
+    torch.testing.assert_close(actual, expected)
+    assert not actual.requires_grad
+
+
+@pytest.mark.parametrize("normalization", ["RMSNorm", "LayerNorm"])
+def test_simplified_indexer_input_honors_zero_centered_gamma_without_norm_grads(
+    normalization,
+):
+    torch.manual_seed(321)
+    hidden = torch.randn(4, 2, 6, requires_grad=True)
+    weight = torch.nn.Parameter(torch.randn(6))
+    bias = torch.nn.Parameter(torch.randn(6)) if normalization == "LayerNorm" else None
+    linear_qkv = SimpleNamespace(
+        layer_norm_weight=weight,
+        layer_norm_bias=bias,
+        eps=2.0e-5,
+        skip_norm_and_all_gather=False,
+    )
+    config = SimpleNamespace(
+        normalization=normalization,
+        layernorm_epsilon=2.0e-5,
+        layernorm_zero_centered_gamma=True,
+    )
+
+    norm_spec = _simplified_indexer_norm_spec(linear_qkv, config)
+    actual = _simplified_indexer_input(hidden, norm_spec)
+    effective_weight = weight.detach() + 1.0
+    if normalization == "RMSNorm":
+        hidden_float = hidden.detach().float()
+        expected = (
+            hidden_float
+            * torch.rsqrt(hidden_float.square().mean(dim=-1, keepdim=True) + 2.0e-5)
+            * effective_weight.float()
+        ).to(hidden.dtype)
+    else:
+        expected = F.layer_norm(
+            hidden.detach(), (6,), effective_weight, bias.detach(), 2.0e-5
+        )
+
+    torch.testing.assert_close(actual, expected)
+    assert not actual.requires_grad
+    assert weight.grad is None
+    if bias is not None:
+        assert bias.grad is None
+
+
+def test_skip_dsa_zero_dependency_preserves_output_and_produces_zero_param_grads():
+    output = torch.randn(4, 3, requires_grad=True)
+    indexer_weight = torch.nn.Parameter(torch.randn(5, 7))
+
+    attached = _DSAZeroParamDependency.apply(output, indexer_weight)
+    attached.square().sum().backward()
+
+    torch.testing.assert_close(attached, output)
+    torch.testing.assert_close(output.grad, 2.0 * output.detach())
+    torch.testing.assert_close(indexer_weight.grad, torch.zeros_like(indexer_weight))
 
 
 def test_mamba_stack_spec_uses_dsa_grouped_self_attention():
@@ -291,6 +417,845 @@ def test_transformer_config_accepts_min_memory_backend():
         assert config.dsa_min_memory_profile_rank == -1
 
 
+def _simplified_test_indexer(hidden_size, head_dim, topk):
+    indexer = SimpleNamespace(
+        index_n_heads=1,
+        index_head_dim=head_dim,
+        index_topk=topk,
+        softmax_scale=head_dim**-0.5,
+        index_rotary_dim=0,
+        rotary_pos_emb=None,
+        pg_collection=_DummyPGCollection(),
+        config=SimpleNamespace(
+            dsa_indexer_mode="simplified",
+            rotary_interleaved=False,
+        ),
+    )
+    indexer.linear_q = torch.nn.Linear(hidden_size, head_dim, bias=False)
+    return indexer
+
+
+def test_transformer_config_accepts_simplified_dsa_and_derives_shape():
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=32,
+        num_attention_heads=4,
+        num_query_groups=1,
+        kv_channels=8,
+        experimental_attention_variant="dsa",
+        dsa_indexer_mode="simplified",
+        dsa_indexer_topk=4,
+        dsa_kernel_backend="torch-min-memory",
+        dsa_indexer_loss_coeff=0.1,
+        dsa_indexer_use_sparse_loss=True,
+    )
+
+    assert config.dsa_indexer_n_heads == 1
+    assert config.dsa_indexer_head_dim == 8
+    assert not config.dsa_indexer_use_hadamard
+
+
+def test_transformer_config_rejects_simplified_mode_without_dsa_variant():
+    with pytest.raises(AssertionError, match="requires experimental_attention_variant='dsa'"):
+        TransformerConfig(
+            num_layers=1,
+            hidden_size=32,
+            num_attention_heads=4,
+            dsa_indexer_mode="simplified",
+        )
+
+
+def test_transformer_config_rejects_reset_while_dsa_is_still_skipped():
+    with pytest.raises(AssertionError, match="disabled when resetting"):
+        TransformerConfig(
+            num_layers=1,
+            hidden_size=32,
+            num_attention_heads=4,
+            num_query_groups=1,
+            kv_channels=8,
+            experimental_attention_variant="dsa",
+            dsa_indexer_mode="simplified",
+            dsa_indexer_topk=4,
+            dsa_fwd_skip_dsa=True,
+            dsa_reset_indexer_on_load=True,
+        )
+
+
+def test_simplified_indexer_accepts_internal_tp_group_rewrite(monkeypatch):
+    import megatron.core.transformer.experimental_attention_variant.dsa_gqa as dsa_gqa
+
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=32,
+        num_attention_heads=4,
+        num_query_groups=1,
+        kv_channels=8,
+        rotary_percent=0.0,
+        experimental_attention_variant="dsa",
+        dsa_indexer_mode="simplified",
+        dsa_indexer_topk=4,
+        dsa_kernel_backend="torch-min-memory",
+        dsa_indexer_loss_coeff=0.1,
+        dsa_indexer_use_sparse_loss=True,
+    )
+    # Attention performs this rewrite internally when the global KV-group count is below TP.
+    config.num_query_groups = 2
+
+    class _TP2Group:
+        def size(self):
+            return 2
+
+    pg_collection = SimpleNamespace(tp=_TP2Group(), cp=None)
+
+    def _build_linear(_spec, input_size, output_size, **_kwargs):
+        return torch.nn.Linear(input_size, output_size, bias=False)
+
+    monkeypatch.setattr(dsa_gqa, "build_module", _build_linear)
+    indexer = SimplifiedDSGQAIndexer(
+        config,
+        SimplifiedDSGQAIndexerSubmodules(linear_q=torch.nn.Linear),
+        pg_collection=pg_collection,
+    )
+
+    assert indexer.linear_q.weight.shape == (8, 32)
+    assert getattr(indexer.linear_q.weight, "average_gradients_across_tp_domain")
+
+
+def test_simplified_indexer_rope_matches_model_rotary_config(monkeypatch):
+    import megatron.core.transformer.experimental_attention_variant.dsa_gqa as dsa_gqa
+
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=32,
+        num_attention_heads=4,
+        num_query_groups=1,
+        kv_channels=8,
+        rotary_percent=1.0,
+        rotary_interleaved=True,
+        rotary_seq_len_interpolation_factor=2.0,
+        use_rope_scaling=True,
+        rope_scaling_factor=4.0,
+        use_cpu_initialization=True,
+        experimental_attention_variant="dsa",
+        dsa_indexer_mode="simplified",
+        dsa_indexer_topk=4,
+        dsa_kernel_backend="torch-min-memory",
+        dsa_indexer_loss_coeff=0.1,
+        dsa_indexer_use_sparse_loss=True,
+    )
+
+    def _build_linear(_spec, input_size, output_size, **_kwargs):
+        return torch.nn.Linear(input_size, output_size, bias=False)
+
+    monkeypatch.setattr(dsa_gqa, "build_module", _build_linear)
+    indexer = SimplifiedDSGQAIndexer(
+        config,
+        SimplifiedDSGQAIndexerSubmodules(linear_q=torch.nn.Linear),
+        pg_collection=SimpleNamespace(tp=_DummyTPGroup(), cp=None),
+    )
+
+    assert indexer.rotary_pos_emb.rotary_interleaved
+    assert indexer.rotary_pos_emb.seq_len_interpolation_factor == 2.0
+    assert indexer.rotary_pos_emb.inv_freq.device.type == "cpu"
+
+
+@pytest.mark.parametrize(
+    "kwargs, message",
+    [
+        ({"num_query_groups": 2}, "num_query_groups == 1"),
+        ({"dsa_indexer_n_heads": 2}, "one indexer Q head"),
+        ({"dsa_indexer_head_dim": 4}, "main attention head dimension"),
+        ({"dsa_indexer_use_hadamard": True}, "does not support Hadamard"),
+        ({"dsa_kernel_cache_indexer_k": True}, "no separate indexer K cache"),
+    ],
+)
+def test_transformer_config_rejects_incompatible_simplified_dsa_options(kwargs, message):
+    config_kwargs = dict(
+        num_layers=1,
+        hidden_size=32,
+        num_attention_heads=4,
+        num_query_groups=1,
+        kv_channels=8,
+        experimental_attention_variant="dsa",
+        dsa_indexer_mode="simplified",
+        dsa_indexer_topk=4,
+        dsa_kernel_backend="torch-min-memory",
+        dsa_indexer_loss_coeff=0.1,
+        dsa_indexer_use_sparse_loss=True,
+    )
+    config_kwargs.update(kwargs)
+    with pytest.raises(AssertionError, match=message):
+        TransformerConfig(**config_kwargs)
+
+
+def test_simplified_dense_loss_matches_reference_and_only_grads_indexer_q():
+    torch.manual_seed(123)
+    seqlen, batch_size, hidden_size = 7, 2, 12
+    num_query_heads, head_dim = 4, 3
+    score_scale = 0.37
+    loss_coeff = 0.4
+    query = torch.randn(seqlen, batch_size, num_query_heads, head_dim)
+    key = torch.randn(seqlen, batch_size, 1, head_dim, requires_grad=True)
+    hidden_states = torch.randn(seqlen, batch_size, hidden_size, requires_grad=True)
+    indexer = _simplified_test_indexer(hidden_size, head_dim, topk=3)
+    linear_qkv = SimpleNamespace(
+        layer_norm_weight=torch.randn(hidden_size),
+        layer_norm_bias=None,
+        eps=1.0e-5,
+        skip_norm_and_all_gather=False,
+    )
+    norm_config = SimpleNamespace(
+        normalization="RMSNorm",
+        layernorm_epsilon=1.0e-5,
+        layernorm_zero_centered_gamma=False,
+    )
+    input_norm = _simplified_indexer_norm_spec(linear_qkv, norm_config)
+    normalized_hidden = _simplified_indexer_input(hidden_states, input_norm)
+
+    q_index = indexer.linear_q(normalized_hidden).reshape(
+        seqlen, batch_size, 1, head_dim
+    )
+    index_scores = _simplified_index_scores(q_index, key.detach(), indexer.softmax_scale)
+    index_scores = index_scores + _causal_mask(seqlen, query.device)
+    topk_indices = index_scores.topk(indexer.index_topk, dim=-1).indices
+    reference_loss = compute_gqa_dsa_indexer_loss(
+        index_scores,
+        topk_indices,
+        query,
+        key.detach(),
+        score_scale,
+        loss_coeff,
+        False,
+        indexer.pg_collection,
+    )
+    reference_grad = torch.autograd.grad(reference_loss, indexer.linear_q.weight)[0]
+
+    dense_loss = dsa_dense_indexer_loss(
+        query.detach(),
+        key.detach(),
+        hidden_states.detach(),
+        indexer,
+        score_scale,
+        loss_coeff,
+        False,
+        query_chunk_size=3,
+        key_chunk_size=4,
+        use_triton=False,
+        simplified_input_norm=input_norm,
+    )
+    dense_grad, key_grad, hidden_grad = torch.autograd.grad(
+        dense_loss,
+        (indexer.linear_q.weight, key, hidden_states),
+        allow_unused=True,
+    )
+
+    torch.testing.assert_close(dense_loss, reference_loss)
+    torch.testing.assert_close(dense_grad, reference_grad, atol=2e-6, rtol=2e-5)
+    assert key_grad is None
+    assert hidden_grad is None
+
+
+def test_simplified_sparse_min_memory_matches_reference_forward_loss_and_grads():
+    torch.manual_seed(456)
+    seqlen, batch_size, hidden_size = 8, 2, 12
+    num_query_heads, head_dim, topk = 4, 3, 4
+    score_scale = 0.37
+    loss_coeff = 0.3
+    query = torch.randn(
+        seqlen, batch_size, num_query_heads, head_dim, requires_grad=True
+    )
+    key = torch.randn(seqlen, batch_size, 1, head_dim, requires_grad=True)
+    value = torch.randn(seqlen, batch_size, 1, head_dim, requires_grad=True)
+    hidden_states = torch.randn(seqlen, batch_size, hidden_size)
+    indexer = _simplified_test_indexer(hidden_size, head_dim, topk)
+    linear_qkv = SimpleNamespace(
+        layer_norm_weight=torch.randn(hidden_size),
+        layer_norm_bias=None,
+        eps=1.0e-5,
+        skip_norm_and_all_gather=False,
+    )
+    norm_config = SimpleNamespace(
+        normalization="RMSNorm",
+        layernorm_epsilon=1.0e-5,
+        layernorm_zero_centered_gamma=False,
+    )
+    input_norm = _simplified_indexer_norm_spec(linear_qkv, norm_config)
+    normalized_hidden = _simplified_indexer_input(hidden_states, input_norm)
+
+    q_index = indexer.linear_q(normalized_hidden).reshape(seqlen, batch_size, 1, head_dim)
+    index_scores = _simplified_index_scores(q_index, key.detach(), indexer.softmax_scale)
+    index_scores = index_scores + _causal_mask(seqlen, query.device)
+    topk_indices = index_scores.topk(topk, dim=-1).indices
+    reference_output = unfused_grouped_dsa_fn(
+        query, key, value, topk_indices, score_scale, use_gather=True
+    )
+    reference_loss = compute_gqa_dsa_indexer_loss(
+        None,
+        topk_indices,
+        query.detach(),
+        key.detach(),
+        score_scale,
+        loss_coeff,
+        True,
+        indexer.pg_collection,
+        sparse_loss_use_topk_only=True,
+        selected_index_scores=index_scores.gather(-1, topk_indices),
+    )
+    reference_grads = torch.autograd.grad(
+        reference_output.float().sum() + reference_loss,
+        (query, key, value, indexer.linear_q.weight),
+    )
+
+    min_query = query.detach().clone().requires_grad_(True)
+    min_key = key.detach().clone().requires_grad_(True)
+    min_value = value.detach().clone().requires_grad_(True)
+    min_output, min_loss = dsa_min_memory_gqa(
+        min_query,
+        min_key,
+        min_value,
+        hidden_states.detach(),
+        indexer,
+        score_scale,
+        loss_coeff,
+        False,
+        query_chunk_size=seqlen,
+        key_chunk_size=seqlen,
+        use_triton=False,
+        simplified_input_norm=input_norm,
+    )
+    min_grads = torch.autograd.grad(
+        min_output.float().sum() + min_loss,
+        (min_query, min_key, min_value, indexer.linear_q.weight),
+    )
+
+    torch.testing.assert_close(min_output, reference_output)
+    torch.testing.assert_close(min_loss, reference_loss)
+    for actual, expected in zip(min_grads, reference_grads):
+        torch.testing.assert_close(actual, expected, atol=3e-6, rtol=3e-5)
+
+
+def test_simplified_zero_loss_coefficient_produces_zero_indexer_gradient():
+    torch.manual_seed(654)
+    seqlen, batch_size, hidden_size = 6, 1, 8
+    num_query_heads, head_dim, topk = 4, 2, 3
+    query = torch.randn(seqlen, batch_size, num_query_heads, head_dim, requires_grad=True)
+    key = torch.randn(seqlen, batch_size, 1, head_dim, requires_grad=True)
+    value = torch.randn(seqlen, batch_size, 1, head_dim, requires_grad=True)
+    hidden_states = torch.randn(seqlen, batch_size, hidden_size)
+    indexer = _simplified_test_indexer(hidden_size, head_dim, topk)
+
+    output, indexer_loss = dsa_min_memory_gqa(
+        query,
+        key,
+        value,
+        hidden_states,
+        indexer,
+        head_dim**-0.5,
+        0.0,
+        False,
+        query_chunk_size=4,
+        key_chunk_size=3,
+        use_triton=False,
+    )
+    grads = torch.autograd.grad(
+        output.float().sum() + indexer_loss,
+        (query, key, value, indexer.linear_q.weight),
+    )
+
+    torch.testing.assert_close(indexer_loss, torch.zeros_like(indexer_loss))
+    assert any(torch.count_nonzero(grad) for grad in grads[:3])
+    torch.testing.assert_close(grads[3], torch.zeros_like(grads[3]))
+
+
+def test_simplified_main_q_mean_reset_uses_all_query_heads():
+    from megatron.training.training import _reset_simplified_dsa_indexers_from_main_q
+
+    hidden_size, num_query_heads, head_dim = 5, 4, 3
+
+    class _FakeIndexer(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.linear_q = torch.nn.Linear(hidden_size, head_dim, bias=False)
+            self.config = SimpleNamespace(
+                dsa_indexer_mode="simplified",
+                num_attention_heads=num_query_heads,
+                kv_channels=head_dim,
+            )
+            self.pg_collection = SimpleNamespace(tp=None)
+
+    class _FakeCore(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.indexer = _FakeIndexer()
+
+    class _FakeAttention(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.linear_qkv = torch.nn.Linear(
+                hidden_size, (num_query_heads + 2) * head_dim, bias=False
+            )
+            self.core_attention = _FakeCore()
+
+    attention = _FakeAttention()
+    with torch.no_grad():
+        attention.linear_qkv.weight.copy_(
+            torch.arange(attention.linear_qkv.weight.numel(), dtype=torch.float32).reshape_as(
+                attention.linear_qkv.weight
+            )
+        )
+    expected = attention.linear_qkv.weight[: num_query_heads * head_dim].reshape(
+        num_query_heads, head_dim, hidden_size
+    ).mean(dim=0)
+
+    assert _reset_simplified_dsa_indexers_from_main_q([attention]) == 1
+    torch.testing.assert_close(attention.core_attention.indexer.linear_q.weight, expected)
+
+
+def test_simplified_main_q_mean_rescaled_reset_gathers_fused_qkv_across_tp(monkeypatch):
+    import megatron.training.training as training
+
+    hidden_size, num_query_heads, head_dim, tp_size = 5, 4, 3, 2
+    full_rows = (num_query_heads + 2) * head_dim
+    full_weight = torch.arange(full_rows * hidden_size, dtype=torch.float32).reshape(
+        full_rows, hidden_size
+    )
+    shards = list(full_weight.chunk(tp_size, dim=0))
+
+    class _WeightModule(torch.nn.Module):
+        def __init__(self, weight):
+            super().__init__()
+            self.weight = torch.nn.Parameter(weight.clone())
+
+    class _FakeIndexer(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.linear_q = torch.nn.Linear(hidden_size, head_dim, bias=False)
+            self.config = SimpleNamespace(
+                dsa_indexer_mode="simplified",
+                num_attention_heads=num_query_heads,
+                kv_channels=head_dim,
+            )
+            self.pg_collection = SimpleNamespace(tp=object())
+
+    class _FakeAttention(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.linear_qkv = _WeightModule(shards[0])
+            self.core_attention = torch.nn.Module()
+            self.core_attention.indexer = _FakeIndexer()
+
+    def _fake_all_gather(outputs, local_weight, group):
+        assert torch.equal(local_weight, shards[0])
+        for output, shard in zip(outputs, shards):
+            output.copy_(shard)
+
+    monkeypatch.setattr(training, "get_pg_size", lambda group: tp_size)
+    monkeypatch.setattr(torch.distributed, "all_gather", _fake_all_gather)
+
+    attention = _FakeAttention()
+    main_q_heads = full_weight[: num_query_heads * head_dim].reshape(
+        num_query_heads, head_dim, hidden_size
+    )
+    expected = main_q_heads.mean(dim=0)
+    expected = expected * torch.sqrt(
+        main_q_heads.square().sum(dim=(1, 2)).mean() / expected.square().sum()
+    )
+    assert (
+        training._reset_simplified_dsa_indexers_from_main_q([attention], rescale=True) == 1
+    )
+    torch.testing.assert_close(attention.core_attention.indexer.linear_q.weight, expected)
+
+
+@pytest.mark.parametrize("no_load_optim", [False, True])
+@pytest.mark.parametrize("reset_method", ["main-q-mean", "main-q-mean-rescaled"])
+def test_simplified_main_q_reset_handles_optimizer_load_modes(
+    monkeypatch, no_load_optim, reset_method
+):
+    import megatron.training.training as training
+
+    hidden_size, num_query_heads, head_dim = 5, 4, 3
+
+    class _FakeIndexer(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.linear_q = torch.nn.Linear(hidden_size, head_dim, bias=False)
+            self.config = SimpleNamespace(
+                dsa_indexer_mode="simplified",
+                num_attention_heads=num_query_heads,
+                kv_channels=head_dim,
+            )
+            self.pg_collection = SimpleNamespace(tp=None)
+
+    class _FakeAttention(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.linear_qkv = torch.nn.Linear(
+                hidden_size, (num_query_heads + 2) * head_dim, bias=False
+            )
+            self.core_attention = torch.nn.Module()
+            self.core_attention.indexer = _FakeIndexer()
+
+    class _FakeOptimizer:
+        is_stub_optimizer = False
+
+        def __init__(self):
+            self.reload_count = 0
+
+        def reload_model_params(self):
+            self.reload_count += 1
+
+    attention = _FakeAttention()
+    optimizer = _FakeOptimizer()
+    clear_calls = []
+    group_step_reset_calls = []
+    refresh_calls = []
+    monkeypatch.setattr(
+        training,
+        "_clear_dsa_indexer_optimizer_state",
+        lambda model, optimizer: clear_calls.append((model, optimizer)) or 1,
+    )
+    monkeypatch.setattr(
+        training,
+        "_apply_dsa_indexer_lr_warmup",
+        lambda args, optimizer, scheduler: 0.0,
+    )
+    monkeypatch.setattr(
+        training,
+        "_reload_dsa_indexer_optimizer_params",
+        lambda model, optimizer: refresh_calls.append((model, optimizer)) or 1,
+    )
+    monkeypatch.setattr(
+        training,
+        "_reset_dsa_indexer_optimizer_group_steps",
+        lambda optimizer: group_step_reset_calls.append(optimizer) or 1,
+    )
+    monkeypatch.setattr(training, "_broadcast_dsa_indexer_params", lambda model: None)
+    args = SimpleNamespace(
+        dsa_indexer_reset_seed=None,
+        dsa_indexer_reset_method=reset_method,
+        no_load_optim=no_load_optim,
+        finetune=False,
+        dsa_indexer_activation_start_samples=0,
+        consumed_train_samples=0,
+    )
+
+    training._reset_dsa_indexer_after_load(
+        [attention], optimizer, None, args, explicit_start=True
+    )
+
+    assert optimizer.reload_count == 0
+    assert len(refresh_calls) == 1
+    assert len(clear_calls) == (0 if no_load_optim else 1)
+    assert len(group_step_reset_calls) == (0 if no_load_optim else 1)
+
+
+def test_dsa_reset_on_load_allows_pipeline_stage_without_local_indexer(monkeypatch):
+    import megatron.training.training as training
+
+    monkeypatch.setattr(
+        training, "_reset_simplified_dsa_indexers_from_main_q", lambda model, rescale: 0
+    )
+    monkeypatch.setattr(training, "_global_dsa_indexer_reset_count", lambda local_count: 4)
+    monkeypatch.setattr(training, "_broadcast_dsa_indexer_params", lambda model: None)
+    monkeypatch.setattr(
+        training, "_apply_dsa_indexer_lr_warmup", lambda args, optimizer, scheduler: None
+    )
+    args = SimpleNamespace(
+        dsa_indexer_reset_method="main-q-mean",
+        no_load_optim=True,
+        dsa_indexer_activation_start_samples=0,
+        consumed_train_samples=0,
+    )
+
+    training._reset_dsa_indexer_after_load(
+        [], None, None, args, explicit_start=True
+    )
+
+
+@pytest.mark.parametrize("fsdp_arg", ["use_torch_fsdp2", "use_megatron_fsdp"])
+def test_dsa_reset_on_load_rejects_fsdp(fsdp_arg):
+    import megatron.training.training as training
+
+    args = SimpleNamespace(use_torch_fsdp2=False, use_megatron_fsdp=False)
+    setattr(args, fsdp_arg, True)
+
+    with pytest.raises(RuntimeError, match="DDP/distributed-optimizer"):
+        training._reset_dsa_indexer_after_load(
+            [], None, None, args, explicit_start=True
+        )
+
+
+def test_dsa_reset_on_load_rejects_optimizer_cpu_offload(monkeypatch):
+    import megatron.training.training as training
+
+    class _FakeHybridDeviceOptimizer:
+        pass
+
+    monkeypatch.setattr(training, "HybridDeviceOptimizer", _FakeHybridDeviceOptimizer)
+    optimizer = SimpleNamespace(
+        chained_optimizers=[
+            SimpleNamespace(optimizer=_FakeHybridDeviceOptimizer())
+        ]
+    )
+    args = SimpleNamespace(use_torch_fsdp2=False, use_megatron_fsdp=False)
+
+    with pytest.raises(RuntimeError, match="optimizer CPU offload"):
+        training._reset_dsa_indexer_after_load(
+            [], optimizer, None, args, explicit_start=True
+        )
+
+
+def test_dsa_train_indexer_only_allows_pipeline_stage_without_local_indexer(monkeypatch):
+    import megatron.training.training as training
+
+    model = torch.nn.Linear(3, 2)
+    monkeypatch.setattr(training, "_global_dsa_indexer_reset_count", lambda local_count: 5)
+
+    training._freeze_non_dsa_indexer_parameters([model])
+
+    assert all(not param.requires_grad for param in model.parameters())
+
+
+def test_dsa_train_indexer_only_freezes_exactly_indexer_submodule_parameters(monkeypatch):
+    import megatron.training.training as training
+
+    class _Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.backbone = torch.nn.Linear(3, 2)
+            self.block = torch.nn.Module()
+            self.block.indexer = torch.nn.Linear(3, 2)
+            self.indexer_aux = torch.nn.Linear(3, 2)
+
+    model = _Model()
+    monkeypatch.setattr(training, "_global_dsa_indexer_reset_count", lambda count: count)
+
+    training._freeze_non_dsa_indexer_parameters([model])
+
+    for name, param in model.named_parameters():
+        assert param.requires_grad == name.startswith("block.indexer.")
+
+
+def test_dsa_indexer_optimizer_refresh_preserves_backbone_master_weights(monkeypatch):
+    import megatron.training.training as training
+
+    class _Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.backbone = torch.nn.Linear(3, 2, bias=False)
+            self.indexer = torch.nn.Linear(3, 2, bias=False)
+
+    model = _Model()
+    backbone_master = torch.full_like(model.backbone.weight, 17.0, dtype=torch.float32)
+    indexer_master = torch.full_like(model.indexer.weight, -5.0, dtype=torch.float32)
+    with torch.no_grad():
+        model.backbone.weight.fill_(1.0)
+        model.indexer.weight.fill_(3.0)
+
+    optimizer = SimpleNamespace(
+        is_stub_optimizer=False,
+        config=SimpleNamespace(use_precision_aware_optimizer_no_fp8_or_ds_fp8=False),
+    )
+    monkeypatch.setattr(
+        training,
+        "get_model_to_optimizer_param_map",
+        lambda optimizer: {
+            model.backbone.weight: backbone_master,
+            model.indexer.weight: indexer_master,
+        },
+    )
+
+    assert training._reload_dsa_indexer_optimizer_params([model], optimizer) == 1
+    torch.testing.assert_close(indexer_master, model.indexer.weight.float())
+    torch.testing.assert_close(backbone_master, torch.full_like(backbone_master, 17.0))
+
+
+def test_dsa_indexer_optimizer_group_step_reset_preserves_backbone_clock():
+    import megatron.training.training as training
+
+    backbone_group = {"params": [object()], "is_dsa_indexer": False, "step": 123}
+    indexer_weight_group = {"params": [object()], "is_dsa_indexer": True, "step": 123}
+    indexer_bias_step = torch.tensor(123.0)
+    indexer_bias_group = {
+        "params": [object()],
+        "is_dsa_indexer": True,
+        "step": indexer_bias_step,
+    }
+    empty_indexer_group = {"params": [], "is_dsa_indexer": True}
+    optimizer = SimpleNamespace(
+        is_stub_optimizer=False,
+        optimizer=SimpleNamespace(
+            param_groups=[
+                backbone_group,
+                indexer_weight_group,
+                indexer_bias_group,
+                empty_indexer_group,
+            ]
+        ),
+    )
+
+    assert training._reset_dsa_indexer_optimizer_group_steps(optimizer) == 3
+    assert backbone_group["step"] == 123
+    assert indexer_weight_group["step"] == 0
+    assert indexer_bias_group["step"] is indexer_bias_step
+    assert indexer_bias_group["step"].item() == 0.0
+    assert empty_indexer_group["step"] == 0
+
+
+def test_dsa_indexer_optimizer_refresh_copies_only_owned_distributed_shard(monkeypatch):
+    import megatron.training.training as training
+
+    class _Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.indexer = torch.nn.Linear(4, 2, bias=False)
+
+    model = _Model()
+    with torch.no_grad():
+        model.indexer.weight.copy_(torch.arange(8, dtype=torch.float32).reshape(2, 4))
+    indexer_shard = torch.full((3,), -1.0, dtype=torch.float32)
+
+    class _Optimizer:
+        is_stub_optimizer = False
+        config = SimpleNamespace(use_precision_aware_optimizer_no_fp8_or_ds_fp8=False)
+
+        @staticmethod
+        def _get_model_param_range_map(param):
+            assert param is model.indexer.weight
+            return {"param": SimpleNamespace(start=2, end=5)}
+
+    optimizer = _Optimizer()
+    monkeypatch.setattr(
+        training,
+        "get_model_to_optimizer_param_map",
+        lambda optimizer: {model.indexer.weight: indexer_shard},
+    )
+
+    assert training._reload_dsa_indexer_optimizer_params([model], optimizer) == 1
+    torch.testing.assert_close(indexer_shard, torch.tensor([2.0, 3.0, 4.0]))
+
+
+def test_dsa_indexer_random_reset_is_deterministic_and_preserves_global_rng():
+    import megatron.training.training as training
+
+    class _Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.config = SimpleNamespace(init_method=lambda tensor: torch.nn.init.normal_(tensor))
+            self.backbone = torch.nn.Linear(4, 3)
+            self.indexer = torch.nn.Sequential(
+                torch.nn.Linear(4, 3),
+                torch.nn.LayerNorm(3),
+            )
+
+    model_a = _Model()
+    model_b = _Model()
+    backbone_before = {name: tensor.detach().clone() for name, tensor in model_a.backbone.state_dict().items()}
+    rng_before = torch.random.get_rng_state().clone()
+
+    assert training._reset_dsa_indexer_modules([model_a], seed=9876) == 1
+    rng_after = torch.random.get_rng_state()
+    assert training._reset_dsa_indexer_modules([model_b], seed=9876) == 1
+
+    assert torch.equal(rng_before, rng_after)
+    for name, expected in backbone_before.items():
+        torch.testing.assert_close(model_a.backbone.state_dict()[name], expected)
+    for actual, expected in zip(model_a.indexer.parameters(), model_b.indexer.parameters()):
+        torch.testing.assert_close(actual, expected)
+
+
+def test_dsa_indexer_reset_seed_derivation_is_tp_invariant_and_dp_aware(monkeypatch):
+    import megatron.training.training as training
+
+    monkeypatch.setattr(training.mpu, "get_pipeline_model_parallel_rank", lambda: 2)
+    monkeypatch.setattr(training.mpu, "get_data_parallel_rank", lambda: 3)
+
+    args = SimpleNamespace(
+        dsa_indexer_reset_seed=None,
+        seed=1234,
+        data_parallel_random_init=False,
+    )
+    assert training._get_dsa_indexer_reset_seed(args) == 1434
+
+    args.data_parallel_random_init = True
+    assert training._get_dsa_indexer_reset_seed(args) == 1464
+
+    args.dsa_indexer_reset_seed = 77
+    assert training._get_dsa_indexer_reset_seed(args) == 77
+
+
+def test_dsa_indexer_optimizer_state_clear_preserves_backbone_state(monkeypatch):
+    import megatron.training.training as training
+
+    class _Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.backbone = torch.nn.Linear(3, 2)
+            self.indexer = torch.nn.Linear(3, 2)
+
+    model = _Model()
+    torch_optimizer = torch.optim.AdamW(model.parameters(), lr=1.0e-3)
+    for param in model.parameters():
+        torch_optimizer.state[param] = {
+            "step": torch.tensor(7.0),
+            "exp_avg": torch.full_like(param, 2.0),
+            "exp_avg_sq": torch.full_like(param, 3.0),
+        }
+    backbone_state = {
+        param: {
+            name: value.detach().clone() if torch.is_tensor(value) else value
+            for name, value in torch_optimizer.state[param].items()
+        }
+        for param in model.backbone.parameters()
+    }
+    optimizer = SimpleNamespace(is_stub_optimizer=False, optimizer=torch_optimizer)
+    monkeypatch.setattr(
+        training,
+        "get_model_to_optimizer_param_map",
+        lambda _optimizer: {param: param for param in model.parameters()},
+    )
+
+    assert training._clear_dsa_indexer_optimizer_state([model], optimizer) == 2
+    assert all(param not in torch_optimizer.state for param in model.indexer.parameters())
+    for param, expected_state in backbone_state.items():
+        assert param in torch_optimizer.state
+        for name, expected in expected_state.items():
+            actual = torch_optimizer.state[param][name]
+            if torch.is_tensor(expected):
+                torch.testing.assert_close(actual, expected)
+            else:
+                assert actual == expected
+
+
+def test_dsa_indexer_reset_broadcasts_only_indexer_params_across_dp(monkeypatch):
+    import megatron.training.training as training
+
+    class _Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.backbone = torch.nn.Linear(3, 2, bias=False)
+            self.indexer = torch.nn.Linear(3, 2, bias=False)
+
+    model = _Model()
+    dp_group = object()
+    calls = []
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(training.mpu, "get_data_parallel_group", lambda: dp_group)
+    monkeypatch.setattr(training, "get_pg_size", lambda group: 2)
+    monkeypatch.setattr(torch.distributed, "get_global_rank", lambda group, rank: 11)
+    monkeypatch.setattr(
+        torch.distributed,
+        "broadcast",
+        lambda tensor, src, group: calls.append((tensor, src, group)),
+    )
+
+    training._broadcast_dsa_indexer_params([model])
+
+    assert len(calls) == 1
+    assert calls[0][0].data_ptr() == model.indexer.weight.data_ptr()
+    assert calls[0][1:] == (11, dp_group)
+
+
 def test_transformer_config_min_memory_accepts_sparse_loss_without_topk_only_flag():
     config = TransformerConfig(
         num_layers=1,
@@ -467,6 +1432,93 @@ def test_min_memory_backend_supports_no_grad_validation_forward(monkeypatch):
     assert [call["use_triton"] for call in calls] == [False, True]
 
 
+def test_simplified_dynamic_inference_uses_sparse_gather_and_main_k_cache(monkeypatch):
+    import megatron.core.transformer.experimental_attention_variant.dsa_gqa as dsa_gqa
+
+    calls = []
+
+    def _fake_sparse_attention(query, key, value, topk_indices, softmax_scale, **kwargs):
+        calls.append(
+            {
+                "topk_indices": topk_indices,
+                "softmax_scale": softmax_scale,
+                **kwargs,
+            }
+        )
+        return value.new_zeros(query.size(0), query.size(1), query.size(2) * value.size(-1))
+
+    monkeypatch.setattr(dsa_gqa, "unfused_grouped_dsa_fn", _fake_sparse_attention)
+
+    query_length = 3
+    key_length = 4
+    head_dim = 2
+    query = torch.randn(query_length, 1, 2, head_dim)
+    hidden_states = torch.randn(query_length, 1, 4)
+    key_cache = torch.randn(1, key_length, 1, head_dim)
+    value_cache = torch.randn(1, key_length, 1, head_dim)
+
+    class _Indexer:
+        index_topk = 2
+        softmax_scale = head_dim**-0.5
+
+        @staticmethod
+        def forward_q_dynamic(hidden_states, use_rope, inference_context):
+            del use_rope, inference_context
+            return hidden_states[..., :head_dim].unsqueeze(2)
+
+    class _InferenceContext:
+        block_size_tokens = key_length
+        padded_active_request_count = 1
+        paused_request_count = 0
+        total_request_count = 1
+        active_token_count = query_length
+        request_kv_length_offsets = torch.tensor([key_length - query_length])
+        active_attn_metadata = {
+            "mha_metadata": SimpleNamespace(
+                state_data={
+                    "query_lengths": torch.tensor([query_length]),
+                    "kv_seq_lengths": torch.tensor([key_length]),
+                }
+            )
+        }
+
+        @staticmethod
+        def append_dsa_key_cache(*args, **kwargs):
+            raise AssertionError("simplified inference must not allocate a separate DSA K cache")
+
+    core = SimpleNamespace(
+        training=False,
+        config=SimpleNamespace(
+            dsa_fwd_skip_dsa=False,
+            dsa_indexer_mode="simplified",
+            dsa_indexer_topk_key_chunk_size=None,
+            dsa_kernel_query_block_size=2,
+            dsa_kernel_key_block_size=3,
+            dsa_sparse_attention_query_chunk_size=None,
+            dsa_sparse_attention_use_gather=False,
+        ),
+        indexer=_Indexer(),
+        softmax_scale=head_dim**-0.5,
+    )
+
+    output = DSGQACoreAttention.forward_dynamic(
+        core,
+        query,
+        key_cache,
+        value_cache,
+        hidden_states,
+        _InferenceContext(),
+        provider_layer_number=1,
+        block_table=torch.tensor([[0]]),
+    )
+
+    assert output.shape == (query_length, 1, 2 * head_dim)
+    assert len(calls) == 1
+    assert calls[0]["use_gather"] is True
+    assert calls[0]["query_chunk_size"] == 2
+    assert calls[0]["topk_indices"].shape == (1, query_length, 2)
+
+
 def test_dense_warmup_no_grad_validation_uses_dense_core_attention():
     torch.manual_seed(123)
     calls = []
@@ -631,9 +1683,23 @@ def test_triton_topk_index_block_matches_reference():
     topk = 7
     q_start = 256
 
-    q_index = torch.randn(query_len, batch_size, index_heads, index_head_dim, device=device)
-    k_index = torch.randn(key_len, batch_size, index_head_dim, device=device)
-    weights = torch.randn(query_len, batch_size, index_heads, device=device)
+    # Standard DSA routes BF16 activations and accumulates their dot products in FP32. The
+    # Triton kernel deliberately uses Tensor Core input precision, so an FP32-input test with
+    # 1e-5 tolerance would incorrectly require an IEEE-FP32 routing contract.
+    q_index = torch.randn(
+        query_len,
+        batch_size,
+        index_heads,
+        index_head_dim,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    k_index = torch.randn(
+        key_len, batch_size, index_head_dim, device=device, dtype=torch.bfloat16
+    )
+    weights = torch.randn(
+        query_len, batch_size, index_heads, device=device, dtype=torch.bfloat16
+    )
     scores = torch.einsum("qbhd,tbd->bqht", q_index.float(), k_index.float())
     scores = torch.relu(scores)
     scores = (scores * weights.permute(1, 0, 2).unsqueeze(-1).float()).sum(dim=2)
@@ -641,13 +1707,229 @@ def test_triton_topk_index_block_matches_reference():
     key_positions = torch.arange(key_len, device=device).view(1, key_len)
     scores = scores.masked_fill((key_positions > query_positions).unsqueeze(0), float("-inf"))
     ref_scores, ref_indices = scores.topk(topk, dim=-1)
+    ref_topk_plus_one = scores.topk(topk + 1, dim=-1).values
 
     tri_scores, tri_indices = triton_topk_index_block(
         q_index, weights, k_index, topk, q_start=q_start, k_start=0
     )
 
-    torch.testing.assert_close(tri_scores, ref_scores, rtol=1e-5, atol=1e-5)
-    torch.testing.assert_close(tri_indices, ref_indices)
+    # Every returned score must correspond to its returned key and be numerically close to the
+    # FP32 oracle evaluated on the same BF16 operands.
+    ref_scores_at_tri_indices = scores.gather(-1, tri_indices)
+    torch.testing.assert_close(
+        tri_scores, ref_scores_at_tri_indices, rtol=5e-3, atol=5e-3
+    )
+    torch.testing.assert_close(
+        tri_scores, tri_scores.sort(dim=-1, descending=True).values, rtol=0, atol=0
+    )
+
+    # A small score perturbation may legitimately exchange nearly tied candidates at the top-k
+    # boundary. Require exact support for rows whose reference margin is larger than the measured
+    # score error, and otherwise require every selected candidate to remain within that error of
+    # the true top-k threshold.
+    row_error = (tri_scores - ref_scores_at_tri_indices).abs().amax(dim=-1)
+    allowance = row_error + 1.0e-5
+    ref_threshold = ref_scores[..., -1]
+    assert torch.all(
+        ref_scores_at_tri_indices.amin(dim=-1) >= ref_threshold - allowance
+    )
+    ref_margin = ref_topk_plus_one[..., -2] - ref_topk_plus_one[..., -1]
+    stable_rows = ref_margin > (2.0 * allowance)
+    if stable_rows.any():
+        tri_support = tri_indices.sort(dim=-1).values
+        ref_support = ref_indices.sort(dim=-1).values
+        assert torch.equal(tri_support[stable_rows], ref_support[stable_rows])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or not HAVE_TRITON, reason="CUDA Triton only")
+def test_triton_topk_index_block_large_topk_is_numerically_optimal():
+    """Exercise the 256-key sub-block merge used by production top-k=512 routing."""
+    torch.manual_seed(789)
+    device = torch.device("cuda")
+    batch_size = 1
+    query_len = 3
+    key_len = 1024
+    index_heads = 64
+    index_head_dim = 128
+    topk = 512
+    q_start = 764
+
+    q_index = torch.randn(
+        query_len,
+        batch_size,
+        index_heads,
+        index_head_dim,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    k_index = torch.randn(
+        key_len, batch_size, index_head_dim, device=device, dtype=torch.bfloat16
+    )
+    weights = torch.randn(
+        query_len, batch_size, index_heads, device=device, dtype=torch.bfloat16
+    )
+    weights.mul_((index_heads * index_head_dim) ** -0.5)
+
+    reference_scores = torch.einsum(
+        "qbhd,tbd->bqht", q_index.float(), k_index.float()
+    )
+    reference_scores = torch.relu(reference_scores)
+    reference_scores = (
+        reference_scores * weights.permute(1, 0, 2).unsqueeze(-1).float()
+    ).sum(dim=2)
+    query_positions = q_start + torch.arange(query_len, device=device)
+    key_positions = torch.arange(key_len, device=device)
+    reference_scores.masked_fill_(
+        key_positions.view(1, 1, key_len) > query_positions.view(1, query_len, 1),
+        float("-inf"),
+    )
+
+    actual = triton_topk_index_block(
+        q_index, weights, k_index, topk, q_start=q_start, k_start=0
+    )
+    assert actual is not None
+    actual_scores, actual_indices = actual
+    sorted_indices = actual_indices.sort(dim=-1).values
+    assert not (sorted_indices[..., 1:] == sorted_indices[..., :-1]).any()
+
+    reference_at_actual = reference_scores.gather(-1, actual_indices)
+    score_error = (actual_scores - reference_at_actual).abs()
+    max_allowed = 5.0e-3 + 5.0e-3 * reference_at_actual.abs()
+    assert torch.all(score_error <= max_allowed)
+
+    reference_top_values, reference_top_indices = reference_scores.topk(topk, dim=-1)
+    row_error = score_error.amax(dim=-1)
+    allowance = row_error + 1.0e-5
+    selected_min = reference_at_actual.amin(dim=-1)
+    threshold = reference_top_values[..., -1]
+    assert torch.all(selected_min >= threshold - allowance)
+
+    top_plus_one = reference_scores.topk(topk + 1, dim=-1).values
+    boundary_margin = top_plus_one[..., -2] - top_plus_one[..., -1]
+    stable_rows = boundary_margin > (2.0 * allowance)
+    if stable_rows.any():
+        actual_support = actual_indices.sort(dim=-1).values
+        reference_support = reference_top_indices.sort(dim=-1).values
+        assert torch.equal(actual_support[stable_rows], reference_support[stable_rows])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or not HAVE_TRITON, reason="CUDA Triton only")
+def test_triton_simplified_selected_scores_matches_reference():
+    torch.manual_seed(123)
+    device = torch.device("cuda")
+    sequence_length = 83
+    query_len = 37
+    batch_size = 2
+    topk = 67
+    head_dim = 128
+    q_start = 11
+    score_scale = head_dim**-0.5
+
+    q_index = torch.randn(
+        query_len, batch_size, 1, head_dim, device=device, dtype=torch.bfloat16
+    )
+    key = torch.randn(
+        sequence_length, batch_size, 1, head_dim, device=device, dtype=torch.bfloat16
+    )
+    topk_indices = torch.randint(
+        0, sequence_length, (batch_size, query_len, topk), device=device
+    )
+
+    actual = triton_simplified_selected_index_scores(
+        q_index, key, topk_indices, score_scale, q_start
+    )
+    assert actual is not None
+    assert actual.dtype == torch.float32
+
+    key_by_batch = key[:, :, 0, :].permute(1, 0, 2)
+    batch_indices = torch.arange(batch_size, device=device).view(batch_size, 1, 1)
+    selected_key = key_by_batch[batch_indices, topk_indices]
+    q_by_batch = q_index[:, :, 0, :].permute(1, 0, 2).float()
+    expected = (q_by_batch.unsqueeze(2) * selected_key.float()).sum(dim=-1) * score_scale
+    query_positions = q_start + torch.arange(query_len, device=device)
+    invalid = topk_indices > query_positions.view(1, query_len, 1)
+    expected = expected.masked_fill(invalid, float("-inf"))
+
+    assert torch.equal(torch.isneginf(actual), invalid)
+    torch.testing.assert_close(actual[~invalid], expected[~invalid], rtol=2e-3, atol=2e-3)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or not HAVE_TRITON, reason="CUDA Triton only")
+def test_triton_simplified_selected_scores_backward_matches_reference():
+    torch.manual_seed(321)
+    device = torch.device("cuda")
+    sequence_length = 83
+    query_len = 37
+    batch_size = 2
+    topk = 67
+    head_dim = 128
+    q_start = 11
+    score_scale = head_dim**-0.5
+
+    key = torch.randn(
+        sequence_length, batch_size, 1, head_dim, device=device, dtype=torch.bfloat16
+    )
+    topk_indices = torch.randint(
+        0, sequence_length, (batch_size, query_len, topk), device=device
+    )
+    grad_scores = torch.randn(batch_size, query_len, topk, device=device, dtype=torch.float32)
+
+    actual = triton_simplified_selected_index_scores_backward(
+        key, topk_indices, grad_scores, score_scale, q_start
+    )
+    assert actual is not None
+    assert actual.dtype == torch.float32
+
+    query_positions = q_start + torch.arange(query_len, device=device)
+    invalid = topk_indices > query_positions.view(1, query_len, 1)
+    masked_grad_scores = grad_scores.masked_fill(invalid, 0.0)
+    key_by_batch = key[:, :, 0, :].permute(1, 0, 2)
+    batch_indices = torch.arange(batch_size, device=device).view(batch_size, 1, 1)
+    selected_key = key_by_batch[batch_indices, topk_indices]
+    expected = (masked_grad_scores.unsqueeze(-1) * selected_key.float()).sum(dim=2)
+    expected = (expected * score_scale).permute(1, 0, 2).unsqueeze(2).contiguous()
+
+    torch.testing.assert_close(actual, expected, rtol=2e-3, atol=2e-3)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or not HAVE_TRITON, reason="CUDA Triton only")
+def test_triton_simplified_score_block_matches_reference():
+    torch.manual_seed(456)
+    device = torch.device("cuda")
+    query_len = 37
+    key_len = 73
+    batch_size = 2
+    head_dim = 128
+    q_start = 19
+    k_start = 7
+    score_scale = head_dim**-0.5
+
+    q_index = torch.randn(
+        query_len, batch_size, 1, head_dim, device=device, dtype=torch.bfloat16
+    )
+    key_block = torch.randn(
+        key_len, batch_size, 1, head_dim, device=device, dtype=torch.bfloat16
+    )
+
+    actual = triton_simplified_index_scores_block(
+        q_index, key_block, score_scale, q_start, k_start
+    )
+    assert actual is not None
+    assert actual.dtype == torch.float32
+
+    q_by_batch = q_index[:, :, 0, :].permute(1, 0, 2).float()
+    key_by_batch = key_block[:, :, 0, :].permute(1, 0, 2).float()
+    expected = (
+        q_by_batch.unsqueeze(2) * key_by_batch.unsqueeze(1)
+    ).sum(dim=-1) * score_scale
+    query_positions = q_start + torch.arange(query_len, device=device)
+    key_positions = k_start + torch.arange(key_len, device=device)
+    invalid = key_positions.view(1, 1, key_len) > query_positions.view(1, query_len, 1)
+    invalid = invalid.expand(batch_size, -1, -1)
+    expected = expected.masked_fill(invalid, float("-inf"))
+
+    assert torch.equal(torch.isneginf(actual), invalid)
+    torch.testing.assert_close(actual[~invalid], expected[~invalid], rtol=5e-3, atol=5e-3)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available() or not HAVE_TRITON, reason="CUDA Triton only")
@@ -724,10 +2006,31 @@ def test_triton_linear_wgrad_matches_reference(dtype):
 
     assert triton_linear_wgrad(grad_output, input_tensor, grad_weight)
 
-    ref = grad_output.float().t().matmul(input_tensor.float())
-    rtol = 2e-2 if dtype == torch.bfloat16 else 3e-3
-    atol = 2e-2 if dtype == torch.bfloat16 else 3e-3
-    torch.testing.assert_close(grad_weight, ref, rtol=rtol, atol=atol)
+    if dtype == torch.float32:
+        # The kernel explicitly requests TF32 dot inputs with FP32 accumulation. Emulate the
+        # hardware's round-to-nearest-even 10-bit mantissa instead of comparing against an
+        # IEEE-FP32 matmul that the kernel does not claim to implement.
+        def _round_to_tf32(tensor):
+            bits = tensor.contiguous().view(torch.int32)
+            rounding_bias = 0xFFF + ((bits >> 13) & 1)
+            return ((bits + rounding_bias) & ~0x1FFF).view(torch.float32)
+
+        ref = _round_to_tf32(grad_output).t().matmul(_round_to_tf32(input_tensor))
+    else:
+        ref = grad_output.float().t().matmul(input_tensor.float())
+    if dtype == torch.float32:
+        # Different autotuned BLOCK_N choices regroup the FP32 partial sums after TF32 operand
+        # rounding. Bound the resulting reduction error relative to the WGRAD magnitude rather
+        # than requiring the same reduction tree as cuBLAS.
+        error = (grad_weight - ref).abs()
+        max_allowed = 1.0e-2 + 5.0e-3 * ref.abs()
+        assert torch.all(error <= max_allowed), (
+            f"TF32 WGRAD error exceeded its mixed-precision bound: "
+            f"max_abs={error.max().item():.6e}, "
+            f"max_allowed={max_allowed.max().item():.6e}"
+        )
+    else:
+        torch.testing.assert_close(grad_weight, ref, rtol=2e-2, atol=2e-2)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available() or not HAVE_TRITON, reason="CUDA Triton only")
@@ -738,7 +2041,11 @@ def test_native_indexer_loss_wgrad_matches_autograd(rotary_interleaved, use_hada
         pytest.skip("fast_hadamard_transform is not installed")
     torch.manual_seed(1234)
     device = torch.device("cuda")
-    dtype = torch.bfloat16 if use_hadamard else torch.float32
+    # The native chain is a mixed-precision training path regardless of whether Hadamard is
+    # enabled: model operands are BF16, reductions/WGRAD accumulation are FP32, and returned
+    # parameter gradients are rounded to the parameter dtype. Using FP32 only for the
+    # no-Hadamard cases accidentally tested the kernel's TF32 debug behavior instead.
+    dtype = torch.bfloat16
     seqlen = 9
     batch_size = 2
     hidden_size = 16
@@ -848,10 +2155,54 @@ def test_native_indexer_loss_wgrad_matches_autograd(rotary_interleaved, use_hada
         )
 
     assert native_done
-    rtol = 3e-2 if use_hadamard else 2e-3
-    atol = 3e-2 if use_hadamard else 2e-3
     for native_grad, ref_grad in zip(native_grads, ref_grads):
-        torch.testing.assert_close(native_grad, ref_grad.float(), rtol=rtol, atol=atol)
+        torch.testing.assert_close(native_grad, ref_grad.float(), rtol=3e-2, atol=3e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or not HAVE_TRITON, reason="CUDA Triton only")
+def test_triton_k_ln_backward_autotune_clears_partial_reductions():
+    """Autotune configs with different row blocks must not leave stale LN partials."""
+    torch.manual_seed(123)
+    device = torch.device("cuda")
+    batch_size, query_len, topk, out_features = 2, 256, 16, 128
+    k_linear = torch.randn(
+        batch_size,
+        query_len,
+        topk,
+        out_features,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    grad_k_norm = torch.randn_like(k_linear, dtype=torch.float32)
+    k_norm_weight = torch.randn(out_features, device=device, dtype=torch.bfloat16)
+    grad_weight = torch.zeros(out_features, device=device, dtype=torch.float32)
+    grad_bias = torch.zeros_like(grad_weight)
+
+    prepared = triton_k_ln_backward_prepare(
+        grad_k_norm,
+        k_linear,
+        k_norm_weight,
+        1.0e-5,
+        grad_weight,
+        grad_bias,
+        torch.bfloat16,
+    )
+    assert prepared is not None
+    _, partial_weight, partial_bias = prepared
+    assert triton_k_ln_param_reduce(
+        partial_weight, partial_bias, grad_weight, grad_bias
+    )
+
+    k_float = k_linear.float()
+    mean = k_float.mean(dim=-1, keepdim=True)
+    centered = k_float - mean
+    rstd = torch.rsqrt(centered.square().mean(dim=-1, keepdim=True) + 1.0e-5)
+    normalized = centered * rstd
+    expected_weight = (grad_k_norm * normalized).sum(dim=(0, 1, 2))
+    expected_bias = grad_k_norm.sum(dim=(0, 1, 2))
+
+    torch.testing.assert_close(grad_weight, expected_weight, rtol=5e-3, atol=5e-3)
+    torch.testing.assert_close(grad_bias, expected_bias, rtol=5e-3, atol=5e-3)
 
 
 def test_transformer_config_accepts_min_memory_sparse_forward_dense_loss():
@@ -1006,7 +2357,9 @@ def test_min_memory_impl_matches_reference_rope_interleaved_layout():
     k_norm_bias = torch.randn(index_head_dim)
     linear_weights_weight = torch.randn(index_heads, hidden_size)
     pg_collection = _DummyPGCollection()
-    rotary = _DummyRotary(rotary_dim, rotary_interleaved=False)
+    rotary = _DummyRotary(
+        rotary_dim, rotary_interleaved=config_rotary_interleaved
+    )
 
     q_index = F.linear(hidden_states, linear_q_weight).reshape(
         seqlen, batch_size, index_heads, index_head_dim
@@ -1026,30 +2379,44 @@ def test_min_memory_impl_matches_reference_rope_interleaved_layout():
     weights = F.linear(hidden_states, linear_weights_weight)
     weights = weights * (index_heads**-0.5) * (index_head_dim**-0.5)
 
-    index_scores, topk_indices = fused_qk_topk_naive(
+    index_scores, _ = fused_qk_topk_naive(
         q_index, k_index, weights, topk, _causal_mask(seqlen, hidden_states.device)
     )
-    reference_output = unfused_grouped_dsa_fn(
-        query,
-        key,
-        value,
-        topk_indices,
-        head_dim**-0.5,
-        use_gather=True,
+    projected_q, projected_weights = _project_q_index_tile(
+        hidden_states,
+        0,
+        seqlen,
+        linear_q_weight,
+        linear_weights_weight,
+        index_heads,
+        index_head_dim,
+        rotary_dim,
+        rotary,
+        config_rotary_interleaved,
+        use_indexer_rope=True,
+        use_hadamard=False,
     )
-    reference_loss = compute_gqa_dsa_indexer_loss(
-        index_scores=None,
-        topk_indices=topk_indices,
-        query=query,
-        key=key,
-        softmax_scale=head_dim**-0.5,
-        loss_coeff=loss_coeff,
-        sparse_loss=True,
-        pg_collection=pg_collection,
-        sparse_loss_use_topk_only=True,
-        selected_index_scores=index_scores.gather(-1, topk_indices),
+    projected_k = _project_k_index_block(
+        hidden_states,
+        0,
+        seqlen,
+        linear_k_weight,
+        k_norm_weight,
+        k_norm_bias,
+        True,
+        1.0e-5,
+        index_head_dim,
+        rotary_dim,
+        rotary,
+        config_rotary_interleaved,
+        use_indexer_rope=True,
+        use_hadamard=False,
     )
+    torch.testing.assert_close(projected_q, q_index, msg="interleaved RoPE Q projection")
+    torch.testing.assert_close(projected_k, k_index, msg="interleaved RoPE K projection")
+    torch.testing.assert_close(projected_weights, weights, msg="routing-weight projection")
 
+    routing_topk_cache = []
     output, loss = _forward_min_memory_impl(
         query,
         key,
@@ -1075,10 +2442,45 @@ def test_min_memory_impl_matches_reference_rope_interleaved_layout():
         3,
         pg_collection,
         rotary_interleaved=config_rotary_interleaved,
+        routing_topk_cache=routing_topk_cache,
     )
 
-    torch.testing.assert_close(output, reference_output)
-    torch.testing.assert_close(loss, reference_loss)
+    padded_topk = []
+    q_offset = 0
+    target_topk = min(topk, seqlen)
+    for tile_topk in routing_topk_cache:
+        q_end = q_offset + tile_topk.size(1)
+        if tile_topk.size(-1) < target_topk:
+            assert q_end < seqlen
+            tile_topk = F.pad(
+                tile_topk, (0, target_topk - tile_topk.size(-1)), value=q_end
+            )
+        padded_topk.append(tile_topk)
+        q_offset = q_end
+    min_memory_topk = torch.cat(padded_topk, dim=1)
+    reference_output = unfused_grouped_dsa_fn(
+        query,
+        key,
+        value,
+        min_memory_topk,
+        head_dim**-0.5,
+        use_gather=True,
+    )
+    reference_loss = compute_gqa_dsa_indexer_loss(
+        index_scores=None,
+        topk_indices=min_memory_topk,
+        query=query,
+        key=key,
+        softmax_scale=head_dim**-0.5,
+        loss_coeff=loss_coeff,
+        sparse_loss=True,
+        pg_collection=pg_collection,
+        sparse_loss_use_topk_only=True,
+        selected_index_scores=index_scores.gather(-1, min_memory_topk),
+    )
+
+    torch.testing.assert_close(output, reference_output, msg="interleaved RoPE sparse output")
+    torch.testing.assert_close(loss, reference_loss, msg="interleaved RoPE sparse KL")
 
 
 def test_min_memory_impl_matches_reference_gradients():

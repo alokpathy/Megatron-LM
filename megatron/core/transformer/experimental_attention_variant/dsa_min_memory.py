@@ -38,6 +38,9 @@ from megatron.core.transformer.experimental_attention_variant.dsa_min_memory_tri
     triton_selected_index_scores,
     triton_selected_index_scores_backward,
     triton_selected_index_kl_loss,
+    triton_simplified_index_scores_block,
+    triton_simplified_selected_index_scores,
+    triton_simplified_selected_index_scores_backward,
     triton_sparse_attention_backward_accumulate,
     triton_sparse_attention_backward_path,
     triton_sparse_attention_backward_supported,
@@ -1653,6 +1656,300 @@ def _native_indexer_loss_wgrad_chunk(
     return True
 
 
+def _apply_simplified_input_norm_tile(
+    hidden_tile: torch.Tensor, simplified_input_norm
+) -> torch.Tensor:
+    """Apply the detached main-Q input norm using only query-tile scratch."""
+    if simplified_input_norm is None:
+        return hidden_tile
+    weight = simplified_input_norm.weight
+    if simplified_input_norm.zero_centered_gamma:
+        weight = weight + 1.0
+    if simplified_input_norm.normalization == "RMSNorm":
+        hidden_float = hidden_tile.float()
+        inv_rms = torch.rsqrt(
+            hidden_float.square().mean(dim=-1, keepdim=True) + simplified_input_norm.eps
+        )
+        return (hidden_float * inv_rms * weight.float()).to(hidden_tile.dtype)
+    if simplified_input_norm.normalization == "LayerNorm":
+        return F.layer_norm(
+            hidden_tile,
+            (hidden_tile.size(-1),),
+            weight,
+            simplified_input_norm.bias,
+            simplified_input_norm.eps,
+        )
+    raise NotImplementedError(
+        "Simplified DSA cannot reproduce the fused main-Q input normalization "
+        f"for normalization={simplified_input_norm.normalization!r}."
+    )
+
+
+def _project_simplified_q_index_tile(
+    hidden_states: torch.Tensor,
+    q_start: int,
+    q_end: int,
+    linear_q_weight: torch.Tensor,
+    index_head_dim: int,
+    index_rotary_dim: int,
+    rotary_pos_emb,
+    rotary_interleaved: bool,
+    use_indexer_rope: bool,
+    simplified_input_norm=None,
+) -> torch.Tensor:
+    hidden_tile = _apply_simplified_input_norm_tile(
+        hidden_states[q_start:q_end], simplified_input_norm
+    )
+    q_index = _linear(hidden_tile, linear_q_weight).reshape(
+        q_end - q_start, hidden_states.size(1), 1, index_head_dim
+    )
+    if use_indexer_rope:
+        positions = torch.arange(q_start, q_end, device=q_index.device, dtype=torch.long)
+        q_index = _apply_rope_at_positions(
+            q_index,
+            positions,
+            index_head_dim,
+            index_rotary_dim,
+            rotary_pos_emb,
+            rotary_interleaved,
+        )
+    return q_index
+
+
+def _simplified_index_scores_block(
+    q_index: torch.Tensor,
+    key_block: torch.Tensor,
+    score_scale: float,
+    q_start: int,
+    k_start: int,
+) -> torch.Tensor:
+    scores = triton_simplified_index_scores_block(
+        q_index, key_block, score_scale, q_start, k_start
+    )
+    if scores is not None:
+        return scores
+    scores = torch.einsum(
+        "qbd,kbd->bqk",
+        q_index[:, :, 0, :].float(),
+        key_block[:, :, 0, :].float(),
+    ) * score_scale
+    return _mask_dense_causal_scores(
+        scores,
+        q_start,
+        q_start + q_index.size(0),
+        k_start,
+        k_start + key_block.size(0),
+    )
+
+
+def _gather_simplified_selected_key(
+    key: torch.Tensor, topk_indices: torch.Tensor
+) -> torch.Tensor:
+    key_by_batch = key[:, :, 0, :].permute(1, 0, 2)
+    batch_size, query_length, topk = topk_indices.shape
+    gather_index = topk_indices[..., None].expand(
+        batch_size, query_length, topk, key.size(-1)
+    )
+    return torch.gather(
+        key_by_batch[:, None, :, :].expand(
+            batch_size, query_length, key.size(0), key.size(-1)
+        ),
+        2,
+        gather_index,
+    )
+
+
+def _simplified_selected_index_scores(
+    q_index: torch.Tensor,
+    key: torch.Tensor,
+    topk_indices: torch.Tensor,
+    score_scale: float,
+    q_start: int,
+) -> torch.Tensor:
+    scores = triton_simplified_selected_index_scores(
+        q_index, key, topk_indices, score_scale, q_start
+    )
+    if scores is not None:
+        return scores
+    selected_key = _gather_simplified_selected_key(key, topk_indices)
+    scores = torch.einsum(
+        "bqd,bqkd->bqk",
+        q_index[:, :, 0, :].permute(1, 0, 2).float(),
+        selected_key.float(),
+    ) * score_scale
+    invalid = _selected_causal_invalid_mask(topk_indices, q_start)
+    return scores.masked_fill(invalid, float("-inf"))
+
+
+def _simplified_selected_index_scores_backward(
+    key: torch.Tensor,
+    topk_indices: torch.Tensor,
+    grad_scores: torch.Tensor,
+    score_scale: float,
+    q_start: int,
+) -> torch.Tensor:
+    grad_q = triton_simplified_selected_index_scores_backward(
+        key, topk_indices, grad_scores, score_scale, q_start
+    )
+    if grad_q is not None:
+        return grad_q
+    invalid = _selected_causal_invalid_mask(topk_indices, q_start)
+    grad_scores = grad_scores.float().masked_fill(invalid, 0.0)
+    selected_key = _gather_simplified_selected_key(key, topk_indices)
+    grad_q = torch.einsum("bqk,bqkd->bqd", grad_scores, selected_key.float())
+    return (grad_q * score_scale).permute(1, 0, 2).unsqueeze(2).contiguous()
+
+
+def _simplified_topk_index_tile(
+    hidden_states: torch.Tensor,
+    key: torch.Tensor,
+    q_start: int,
+    q_end: int,
+    linear_q_weight: torch.Tensor,
+    index_topk: int,
+    index_head_dim: int,
+    index_rotary_dim: int,
+    rotary_pos_emb,
+    rotary_interleaved: bool,
+    use_indexer_rope: bool,
+    score_scale: float,
+    key_chunk_size: int,
+    simplified_input_norm=None,
+    profile: Optional[_DSATimingProfiler] = None,
+    profile_suffix: str = "fwd",
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    with _profile_record(profile, f"routing_q_project_{profile_suffix}", hidden_states.device):
+        q_index = _project_simplified_q_index_tile(
+            hidden_states,
+            q_start,
+            q_end,
+            linear_q_weight,
+            index_head_dim,
+            index_rotary_dim,
+            rotary_pos_emb,
+            rotary_interleaved,
+            use_indexer_rope,
+            simplified_input_norm,
+        )
+    causal_key_limit = min(q_end, key.size(0))
+    topk = min(index_topk, causal_key_limit)
+    running_scores = None
+    running_indices = None
+    unit_weights = q_index.new_ones((q_end - q_start, hidden_states.size(1), 1))
+    for k_start in range(0, causal_key_limit, key_chunk_size):
+        k_end = min(k_start + key_chunk_size, causal_key_limit)
+        key_block = key[k_start:k_end]
+        block_topk = min(topk, k_end - k_start)
+        with _profile_record(
+            profile, f"routing_block_score_topk_{profile_suffix}", hidden_states.device
+        ):
+            triton_topk = triton_topk_index_block(
+                q_index,
+                unit_weights,
+                key_block[:, :, 0, :],
+                block_topk,
+                q_start,
+                k_start,
+                apply_relu=False,
+                score_scale=score_scale,
+            )
+            if triton_topk is None:
+                block_scores = _simplified_index_scores_block(
+                    q_index, key_block, score_scale, q_start, k_start
+                )
+                block_scores, block_indices = block_scores.topk(block_topk, dim=-1)
+                block_indices = block_indices + k_start
+            else:
+                block_scores, block_indices = triton_topk
+        with _profile_record(profile, f"routing_merge_topk_{profile_suffix}", hidden_states.device):
+            running_scores, running_indices = _merge_topk(
+                running_scores, running_indices, block_scores, block_indices, topk
+            )
+    with _profile_record(profile, f"routing_final_sort_{profile_suffix}", hidden_states.device):
+        running_scores, running_indices = _sort_topk_support_by_position(
+            running_scores, running_indices
+        )
+    return running_scores, running_indices, q_index
+
+
+def _simplified_sparse_forward_impl(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    hidden_states: torch.Tensor,
+    linear_q_weight: torch.Tensor,
+    index_topk: int,
+    index_head_dim: int,
+    index_rotary_dim: int,
+    rotary_pos_emb,
+    use_indexer_rope: bool,
+    attention_softmax_scale: float,
+    indexer_score_scale: float,
+    loss_coeff: float,
+    query_chunk_size: int,
+    key_chunk_size: int,
+    pg_collection: ProcessGroupCollection,
+    rotary_interleaved: bool,
+    simplified_input_norm=None,
+    profile: Optional[_DSATimingProfiler] = None,
+    routing_topk_cache: Optional[list] = None,
+    selected_scores_cache: Optional[list] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    sq, batch_size, num_query_heads, _ = query.shape
+    output = value.new_empty((sq, batch_size, num_query_heads, value.size(-1)))
+    indexer_loss = query.new_zeros((), dtype=torch.float32)
+    total_positions = batch_size * sq
+    for q_start in range(0, sq, query_chunk_size):
+        q_end = min(q_start + query_chunk_size, sq)
+        with _profile_record(profile, "routing_topk_fwd", query.device):
+            _, topk_indices, q_index = _simplified_topk_index_tile(
+                hidden_states,
+                key,
+                q_start,
+                q_end,
+                linear_q_weight,
+                index_topk,
+                index_head_dim,
+                index_rotary_dim,
+                rotary_pos_emb,
+                rotary_interleaved,
+                use_indexer_rope,
+                indexer_score_scale,
+                key_chunk_size,
+                simplified_input_norm,
+                profile=profile,
+                profile_suffix="fwd",
+            )
+        if routing_topk_cache is not None:
+            routing_topk_cache.append(topk_indices)
+        query_tile = query[q_start:q_end]
+        with _profile_record(profile, "sparse_attention_fwd", query.device):
+            output[q_start:q_end] = _sparse_attention_tile(
+                query_tile, key, value, topk_indices, attention_softmax_scale, q_start
+            )
+        if loss_coeff > 0:
+            with _profile_record(profile, "selected_index_scores_fwd", query.device):
+                selected_scores = _simplified_selected_index_scores(
+                    q_index, key, topk_indices, indexer_score_scale, q_start
+                )
+            if selected_scores_cache is not None:
+                selected_scores_cache.append(selected_scores)
+            indexer_loss = indexer_loss + _indexer_loss_tile(
+                selected_scores,
+                query_tile,
+                key,
+                topk_indices,
+                attention_softmax_scale,
+                loss_coeff,
+                total_positions,
+                q_start,
+                pg_collection,
+                profile=profile,
+                profile_suffix="fwd",
+            )
+    return output.reshape(sq, batch_size, num_query_heads * value.size(-1)), indexer_loss
+
+
 def _forward_min_memory_impl(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -2943,6 +3240,761 @@ class DSAMinMemoryGQAFn(torch.autograd.Function):
         )
 
 
+class DSASimplifiedMinMemoryGQAFn(torch.autograd.Function):
+    """Min-memory sparse attention with a Q-only router over detached main K."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        hidden_states: torch.Tensor,
+        linear_q_weight: torch.Tensor,
+        index_topk: int,
+        index_head_dim: int,
+        index_rotary_dim: int,
+        rotary_pos_emb,
+        use_indexer_rope: bool,
+        attention_softmax_scale: float,
+        indexer_score_scale: float,
+        loss_coeff: float,
+        query_chunk_size: int,
+        key_chunk_size: int,
+        pg_collection: ProcessGroupCollection,
+        rotary_interleaved: bool,
+        simplified_input_norm=None,
+        profile_enabled: bool = False,
+        profile_rank: int = 0,
+        profile_label: str = "",
+        cache_routing: bool = False,
+        cache_selected_scores: bool = False,
+        use_triton: bool = True,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        profile = _DSATimingProfiler(profile_enabled, profile_rank, profile_label, query.device)
+        key_chunk_size = _chunk_size(
+            key_chunk_size, _default_key_chunk_size(key.size(0)), key.size(0)
+        )
+        routing_topk_cache = [] if cache_routing else None
+        selected_scores_cache = [] if cache_selected_scores else None
+        with _triton_dispatch_enabled(use_triton):
+            with profile.record("forward_total", query.device):
+                with torch.no_grad():
+                    output, indexer_loss = _simplified_sparse_forward_impl(
+                        query,
+                        key,
+                        value,
+                        hidden_states,
+                        linear_q_weight,
+                        index_topk,
+                        index_head_dim,
+                        index_rotary_dim,
+                        rotary_pos_emb,
+                        use_indexer_rope,
+                        attention_softmax_scale,
+                        indexer_score_scale,
+                        loss_coeff,
+                        query_chunk_size,
+                        key_chunk_size,
+                        pg_collection,
+                        rotary_interleaved,
+                        simplified_input_norm,
+                        profile=profile,
+                        routing_topk_cache=routing_topk_cache,
+                        selected_scores_cache=selected_scores_cache,
+                    )
+        profile.log("forward")
+
+        ctx.save_for_backward(query, key, value, hidden_states, linear_q_weight)
+        ctx.index_topk = index_topk
+        ctx.index_head_dim = index_head_dim
+        ctx.index_rotary_dim = index_rotary_dim
+        ctx.rotary_pos_emb = rotary_pos_emb
+        ctx.use_indexer_rope = use_indexer_rope
+        ctx.attention_softmax_scale = attention_softmax_scale
+        ctx.indexer_score_scale = indexer_score_scale
+        ctx.loss_coeff = loss_coeff
+        ctx.query_chunk_size = query_chunk_size
+        ctx.key_chunk_size = key_chunk_size
+        ctx.pg_collection = pg_collection
+        ctx.rotary_interleaved = rotary_interleaved
+        ctx.simplified_input_norm = simplified_input_norm
+        ctx.profile_enabled = profile_enabled
+        ctx.profile_rank = profile_rank
+        ctx.profile_label = profile_label
+        ctx.routing_topk_cache = (
+            tuple(routing_topk_cache) if routing_topk_cache is not None else None
+        )
+        ctx.selected_scores_cache = (
+            tuple(selected_scores_cache) if selected_scores_cache is not None else None
+        )
+        ctx.use_triton = use_triton
+        return output, indexer_loss
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor, grad_indexer_loss: torch.Tensor):
+        query, key, value, hidden_states, linear_q_weight = ctx.saved_tensors
+        sq, batch_size, num_query_heads, _ = query.shape
+        grad_output = grad_output.reshape(
+            sq, batch_size, num_query_heads, value.size(-1)
+        )
+        grad_query = _grad_accumulator(query) if ctx.needs_input_grad[0] else None
+        grad_key = _grad_accumulator(key) if ctx.needs_input_grad[1] else None
+        grad_value = _grad_accumulator(value) if ctx.needs_input_grad[2] else None
+        grad_linear_q_weight = (
+            _grad_accumulator(linear_q_weight) if ctx.needs_input_grad[4] else None
+        )
+        compute_loss_grad = (
+            grad_indexer_loss is not None
+            and ctx.loss_coeff > 0
+            and grad_linear_q_weight is not None
+        )
+        use_triton_attention_backward = (
+            ctx.needs_input_grad[0] and ctx.needs_input_grad[1] and ctx.needs_input_grad[2]
+        )
+        grad_key_accum = None
+        grad_value_accum = None
+        profile = _DSATimingProfiler(
+            ctx.profile_enabled, ctx.profile_rank, ctx.profile_label, query.device
+        )
+
+        with _triton_dispatch_enabled(ctx.use_triton), profile.record(
+            "backward_total", query.device
+        ):
+            for chunk_idx, q_start in enumerate(range(0, sq, ctx.query_chunk_size)):
+                q_end = min(q_start + ctx.query_chunk_size, sq)
+                q_index = None
+                if ctx.routing_topk_cache is not None:
+                    with _profile_record(profile, "routing_topk_bwd_cached", query.device):
+                        topk_indices = ctx.routing_topk_cache[chunk_idx]
+                else:
+                    with _profile_record(profile, "routing_topk_bwd", query.device):
+                        with torch.no_grad():
+                            _, topk_indices, q_index = _simplified_topk_index_tile(
+                                hidden_states,
+                                key,
+                                q_start,
+                                q_end,
+                                linear_q_weight,
+                                ctx.index_topk,
+                                ctx.index_head_dim,
+                                ctx.index_rotary_dim,
+                                ctx.rotary_pos_emb,
+                                ctx.rotary_interleaved,
+                                ctx.use_indexer_rope,
+                                ctx.indexer_score_scale,
+                                ctx.key_chunk_size,
+                                ctx.simplified_input_norm,
+                                profile=profile,
+                                profile_suffix="bwd",
+                            )
+
+                triton_attention_done = False
+                if use_triton_attention_backward:
+                    query_tile = query[q_start:q_end]
+                    grad_output_tile = grad_output[q_start:q_end]
+                    grad_query_tile = grad_query[q_start:q_end]
+                    if grad_key_accum is None and triton_sparse_attention_backward_supported(
+                        query_tile,
+                        key,
+                        value,
+                        topk_indices,
+                        grad_output_tile,
+                        grad_query_tile,
+                    ):
+                        with _profile_record(
+                            profile, "sparse_attention_bwd_scratch_alloc", query.device
+                        ):
+                            grad_key_accum = torch.zeros(
+                                key.shape, device=key.device, dtype=torch.float32
+                            )
+                            grad_value_accum = torch.zeros(
+                                value.shape, device=value.device, dtype=torch.float32
+                            )
+                    if grad_key_accum is not None and grad_value_accum is not None:
+                        attention_path = triton_sparse_attention_backward_path(
+                            query_tile, key, value, topk_indices
+                        )
+                        with _profile_record(profile, "sparse_attention_bwd_triton", query.device):
+                            with _profile_record(
+                                profile,
+                                f"sparse_attention_bwd_triton_{attention_path}",
+                                query.device,
+                            ):
+                                triton_attention_done = triton_sparse_attention_backward_accumulate(
+                                    query_tile,
+                                    key,
+                                    value,
+                                    topk_indices,
+                                    grad_output_tile,
+                                    grad_query_tile,
+                                    grad_key_accum,
+                                    grad_value_accum,
+                                    ctx.attention_softmax_scale,
+                                    q_start,
+                                )
+
+                if not triton_attention_done:
+                    attention_inputs = []
+                    query_tile = query[q_start:q_end].detach().requires_grad_(
+                        ctx.needs_input_grad[0]
+                    )
+                    key_leaf = key.detach().requires_grad_(ctx.needs_input_grad[1])
+                    value_leaf = value.detach().requires_grad_(ctx.needs_input_grad[2])
+                    if ctx.needs_input_grad[0]:
+                        attention_inputs.append(query_tile)
+                    if ctx.needs_input_grad[1]:
+                        attention_inputs.append(key_leaf)
+                    if ctx.needs_input_grad[2]:
+                        attention_inputs.append(value_leaf)
+                    if attention_inputs:
+                        with _profile_record(
+                            profile, "sparse_attention_bwd_fallback", query.device
+                        ):
+                            with torch.enable_grad():
+                                output_tile = _sparse_attention_tile(
+                                    query_tile,
+                                    key_leaf,
+                                    value_leaf,
+                                    topk_indices,
+                                    ctx.attention_softmax_scale,
+                                    q_start,
+                                )
+                            attention_grads = torch.autograd.grad(
+                                output_tile,
+                                attention_inputs,
+                                grad_outputs=grad_output[q_start:q_end],
+                                retain_graph=False,
+                                allow_unused=True,
+                            )
+                            grad_iter = iter(attention_grads)
+                            if ctx.needs_input_grad[0]:
+                                grad = next(grad_iter)
+                                if grad is not None:
+                                    grad_query[q_start:q_end] = grad
+                            if ctx.needs_input_grad[1]:
+                                grad = next(grad_iter)
+                                if grad is not None:
+                                    grad_key.add_(grad)
+                            if ctx.needs_input_grad[2]:
+                                grad = next(grad_iter)
+                                if grad is not None:
+                                    grad_value.add_(grad)
+
+                if compute_loss_grad:
+                    with _profile_record(profile, "indexer_loss_bwd_prepare", query.device):
+                        with torch.no_grad():
+                            if q_index is None and ctx.selected_scores_cache is None:
+                                q_index = _project_simplified_q_index_tile(
+                                    hidden_states,
+                                    q_start,
+                                    q_end,
+                                    linear_q_weight,
+                                    ctx.index_head_dim,
+                                    ctx.index_rotary_dim,
+                                    ctx.rotary_pos_emb,
+                                    ctx.rotary_interleaved,
+                                    ctx.use_indexer_rope,
+                                    ctx.simplified_input_norm,
+                                )
+                            selected_scores = (
+                                ctx.selected_scores_cache[chunk_idx]
+                                if ctx.selected_scores_cache is not None
+                                else _simplified_selected_index_scores(
+                                    q_index,
+                                    key,
+                                    topk_indices,
+                                    ctx.indexer_score_scale,
+                                    q_start,
+                                )
+                            )
+                            teacher = _teacher_scores_tile(
+                                query[q_start:q_end].detach(),
+                                key.detach(),
+                                topk_indices,
+                                ctx.attention_softmax_scale,
+                                q_start,
+                                ctx.pg_collection,
+                                profile=profile,
+                                profile_suffix="bwd",
+                            )
+                            scale = grad_indexer_loss * (
+                                ctx.loss_coeff / (batch_size * sq)
+                            )
+                            grad_scores = triton_indexer_loss_grad(
+                                selected_scores, teacher, scale
+                            )
+                            if grad_scores is None:
+                                student = torch.nn.functional.softmax(
+                                    selected_scores, dim=-1, dtype=torch.float32
+                                )
+                                alpha = teacher * student / (student + 1.0e-10)
+                                grad_scores = (
+                                    student * alpha.sum(dim=-1, keepdim=True) - alpha
+                                ) * scale
+                    with _profile_record(
+                        profile, "indexer_loss_bwd_simplified_q_wgrad", query.device
+                    ):
+                        grad_q_index = _simplified_selected_index_scores_backward(
+                            key.detach(),
+                            topk_indices,
+                            grad_scores,
+                            ctx.indexer_score_scale,
+                            q_start,
+                        )
+                        positions = torch.arange(
+                            q_start, q_end, device=query.device, dtype=torch.long
+                        )
+                        grad_q_linear = _backward_indexer_transform(
+                            grad_q_index,
+                            positions,
+                            ctx.index_head_dim,
+                            ctx.index_rotary_dim,
+                            ctx.rotary_pos_emb,
+                            ctx.rotary_interleaved,
+                            ctx.use_indexer_rope,
+                            False,
+                        ).reshape(q_end - q_start, batch_size, ctx.index_head_dim)
+                        # Match BF16/FP16 linear backward: round the activation-gradient operand,
+                        # then accumulate the WGRAD reduction in FP32.
+                        grad_q_linear = grad_q_linear.to(dtype=hidden_states.dtype)
+                        q_input_tile = _apply_simplified_input_norm_tile(
+                            hidden_states[q_start:q_end], ctx.simplified_input_norm
+                        )
+                        _accumulate_linear_weight_grad(
+                            grad_linear_q_weight,
+                            grad_q_linear,
+                            q_input_tile,
+                        )
+
+            with _profile_record(profile, "sparse_attention_bwd_finalize", query.device):
+                if grad_key_accum is not None:
+                    grad_key.add_(grad_key_accum)
+                if grad_value_accum is not None:
+                    grad_value.add_(grad_value_accum)
+        profile.log("backward")
+        return (
+            grad_query,
+            grad_key,
+            grad_value,
+            None,
+            grad_linear_q_weight,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+
+
+def _simplified_dense_softmax_stats(
+    q_index: torch.Tensor,
+    query_tile: torch.Tensor,
+    key: torch.Tensor,
+    teacher_softmax_scale: float,
+    student_score_scale: float,
+    q_start: int,
+    key_chunk_size: int,
+    profile: Optional[_DSATimingProfiler],
+    profile_suffix: str,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    teacher_max = None
+    teacher_sum = None
+    student_max = None
+    student_sum = None
+    for k_start in range(0, key.size(0), key_chunk_size):
+        k_end = min(k_start + key_chunk_size, key.size(0))
+        with _profile_record(
+            profile, f"dense_indexer_kl_{profile_suffix}_teacher_stats", query_tile.device
+        ):
+            teacher_logits = _dense_teacher_logits_block(
+                query_tile, key[k_start:k_end], teacher_softmax_scale, q_start, k_start
+            )
+            teacher_max, teacher_sum = _update_running_softmax_stats(
+                teacher_logits, teacher_max, teacher_sum
+            )
+        with _profile_record(
+            profile, f"dense_indexer_kl_{profile_suffix}_student_stats", query_tile.device
+        ):
+            student_logits = _simplified_index_scores_block(
+                q_index, key[k_start:k_end], student_score_scale, q_start, k_start
+            )
+            student_max, student_sum = _update_running_softmax_stats(
+                student_logits, student_max, student_sum
+            )
+    assert teacher_max is not None and teacher_sum is not None
+    assert student_max is not None and student_sum is not None
+    return teacher_max, teacher_sum, student_max, student_sum
+
+
+def _simplified_dense_indexer_kl_loss_impl(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    hidden_states: torch.Tensor,
+    linear_q_weight: torch.Tensor,
+    index_head_dim: int,
+    index_rotary_dim: int,
+    rotary_pos_emb,
+    use_indexer_rope: bool,
+    teacher_softmax_scale: float,
+    student_score_scale: float,
+    loss_coeff: float,
+    query_chunk_size: int,
+    key_chunk_size: int,
+    pg_collection: ProcessGroupCollection,
+    rotary_interleaved: bool,
+    simplified_input_norm,
+    profile: Optional[_DSATimingProfiler],
+) -> torch.Tensor:
+    total_kl = query.new_zeros((), dtype=torch.float32)
+    total_positions = query.size(0) * query.size(1)
+    for q_start in range(0, query.size(0), query_chunk_size):
+        q_end = min(q_start + query_chunk_size, query.size(0))
+        query_tile = query[q_start:q_end]
+        with _profile_record(profile, "dense_indexer_kl_fwd_q_project", query.device):
+            q_index = _project_simplified_q_index_tile(
+                hidden_states,
+                q_start,
+                q_end,
+                linear_q_weight,
+                index_head_dim,
+                index_rotary_dim,
+                rotary_pos_emb,
+                rotary_interleaved,
+                use_indexer_rope,
+                simplified_input_norm,
+            )
+        teacher_max, teacher_sum, student_max, student_sum = (
+            _simplified_dense_softmax_stats(
+                q_index,
+                query_tile,
+                key,
+                teacher_softmax_scale,
+                student_score_scale,
+                q_start,
+                key_chunk_size,
+                profile,
+                "fwd",
+            )
+        )
+        with _profile_record(profile, "dense_indexer_kl_fwd_loss", query.device):
+            teacher_norm = _dense_teacher_norm(
+                query_tile,
+                key,
+                teacher_max,
+                teacher_sum,
+                teacher_softmax_scale,
+                q_start,
+                key_chunk_size,
+                pg_collection,
+            )
+            for k_start in range(0, key.size(0), key_chunk_size):
+                k_end = min(k_start + key_chunk_size, key.size(0))
+                teacher = _dense_teacher_mass_block(
+                    query_tile,
+                    key[k_start:k_end],
+                    teacher_max,
+                    teacher_sum,
+                    teacher_softmax_scale,
+                    q_start,
+                    k_start,
+                    pg_collection,
+                )
+                teacher = teacher / teacher_norm.unsqueeze(-1)
+                student_logits = _simplified_index_scores_block(
+                    q_index, key[k_start:k_end], student_score_scale, q_start, k_start
+                )
+                student = (
+                    torch.exp(student_logits - student_max.unsqueeze(-1))
+                    / student_sum.unsqueeze(-1)
+                )
+                total_kl = total_kl + (
+                    teacher
+                    * (torch.log(teacher + 1.0e-10) - torch.log(student + 1.0e-10))
+                ).sum()
+    return total_kl / total_positions * loss_coeff
+
+
+class DSASimplifiedDenseIndexerLossFn(torch.autograd.Function):
+    """Tiled dense KL for the simplified Q-only indexer."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        hidden_states: torch.Tensor,
+        linear_q_weight: torch.Tensor,
+        index_head_dim: int,
+        index_rotary_dim: int,
+        rotary_pos_emb,
+        use_indexer_rope: bool,
+        teacher_softmax_scale: float,
+        student_score_scale: float,
+        loss_coeff: float,
+        query_chunk_size: int,
+        key_chunk_size: int,
+        pg_collection: ProcessGroupCollection,
+        rotary_interleaved: bool,
+        simplified_input_norm=None,
+        profile_enabled: bool = False,
+        profile_rank: int = 0,
+        profile_label: str = "",
+        use_triton: bool = True,
+    ) -> torch.Tensor:
+        profile = _DSATimingProfiler(profile_enabled, profile_rank, profile_label, query.device)
+        with torch.no_grad(), _triton_dispatch_enabled(use_triton):
+            with profile.record("dense_indexer_kl_fwd_total", query.device):
+                loss = _simplified_dense_indexer_kl_loss_impl(
+                    query,
+                    key,
+                    hidden_states,
+                    linear_q_weight,
+                    index_head_dim,
+                    index_rotary_dim,
+                    rotary_pos_emb,
+                    use_indexer_rope,
+                    teacher_softmax_scale,
+                    student_score_scale,
+                    loss_coeff,
+                    query_chunk_size,
+                    key_chunk_size,
+                    pg_collection,
+                    rotary_interleaved,
+                    simplified_input_norm,
+                    profile,
+                )
+        profile.log("forward")
+        ctx.save_for_backward(query, key, hidden_states, linear_q_weight)
+        ctx.index_head_dim = index_head_dim
+        ctx.index_rotary_dim = index_rotary_dim
+        ctx.rotary_pos_emb = rotary_pos_emb
+        ctx.use_indexer_rope = use_indexer_rope
+        ctx.teacher_softmax_scale = teacher_softmax_scale
+        ctx.student_score_scale = student_score_scale
+        ctx.loss_coeff = loss_coeff
+        ctx.query_chunk_size = query_chunk_size
+        ctx.key_chunk_size = key_chunk_size
+        ctx.pg_collection = pg_collection
+        ctx.rotary_interleaved = rotary_interleaved
+        ctx.simplified_input_norm = simplified_input_norm
+        ctx.profile_enabled = profile_enabled
+        ctx.profile_rank = profile_rank
+        ctx.profile_label = profile_label
+        ctx.use_triton = use_triton
+        return loss
+
+    @staticmethod
+    def backward(ctx, grad_loss: torch.Tensor):
+        query, key, hidden_states, linear_q_weight = ctx.saved_tensors
+        grad_linear_q_weight = (
+            _grad_accumulator(linear_q_weight) if ctx.needs_input_grad[3] else None
+        )
+        if grad_loss is None or ctx.loss_coeff <= 0 or grad_linear_q_weight is None:
+            return (
+                None,
+                None,
+                None,
+                grad_linear_q_weight,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+
+        profile = _DSATimingProfiler(
+            ctx.profile_enabled, ctx.profile_rank, ctx.profile_label, query.device
+        )
+        total_positions = query.size(0) * query.size(1)
+        loss_scale = grad_loss * (ctx.loss_coeff / total_positions)
+        with _triton_dispatch_enabled(ctx.use_triton), profile.record(
+            "dense_indexer_kl_bwd_total", query.device
+        ):
+            for q_start in range(0, query.size(0), ctx.query_chunk_size):
+                q_end = min(q_start + ctx.query_chunk_size, query.size(0))
+                query_tile = query[q_start:q_end]
+                with torch.no_grad():
+                    q_index = _project_simplified_q_index_tile(
+                        hidden_states,
+                        q_start,
+                        q_end,
+                        linear_q_weight,
+                        ctx.index_head_dim,
+                        ctx.index_rotary_dim,
+                        ctx.rotary_pos_emb,
+                        ctx.rotary_interleaved,
+                        ctx.use_indexer_rope,
+                        ctx.simplified_input_norm,
+                    )
+                    teacher_max, teacher_sum, student_max, student_sum = (
+                        _simplified_dense_softmax_stats(
+                            q_index,
+                            query_tile,
+                            key,
+                            ctx.teacher_softmax_scale,
+                            ctx.student_score_scale,
+                            q_start,
+                            ctx.key_chunk_size,
+                            profile,
+                            "bwd",
+                        )
+                    )
+                    teacher_norm = _dense_teacher_norm(
+                        query_tile,
+                        key,
+                        teacher_max,
+                        teacher_sum,
+                        ctx.teacher_softmax_scale,
+                        q_start,
+                        ctx.key_chunk_size,
+                        ctx.pg_collection,
+                    )
+                    student_grad_norm = query_tile.new_zeros(
+                        (query_tile.size(1), query_tile.size(0)), dtype=torch.float32
+                    )
+                    for k_start in range(0, key.size(0), ctx.key_chunk_size):
+                        k_end = min(k_start + ctx.key_chunk_size, key.size(0))
+                        teacher = _dense_teacher_mass_block(
+                            query_tile,
+                            key[k_start:k_end],
+                            teacher_max,
+                            teacher_sum,
+                            ctx.teacher_softmax_scale,
+                            q_start,
+                            k_start,
+                            ctx.pg_collection,
+                        )
+                        teacher = teacher / teacher_norm.unsqueeze(-1)
+                        student_logits = _simplified_index_scores_block(
+                            q_index,
+                            key[k_start:k_end],
+                            ctx.student_score_scale,
+                            q_start,
+                            k_start,
+                        )
+                        student = (
+                            torch.exp(student_logits - student_max.unsqueeze(-1))
+                            / student_sum.unsqueeze(-1)
+                        )
+                        student_grad_norm = student_grad_norm + (
+                            teacher * student / (student + 1.0e-10)
+                        ).sum(dim=-1)
+
+                    grad_q_index = query_tile.new_zeros(
+                        (q_end - q_start, query.size(1), 1, ctx.index_head_dim),
+                        dtype=torch.float32,
+                    )
+                    for k_start in range(0, key.size(0), ctx.key_chunk_size):
+                        k_end = min(k_start + ctx.key_chunk_size, key.size(0))
+                        teacher = _dense_teacher_mass_block(
+                            query_tile,
+                            key[k_start:k_end],
+                            teacher_max,
+                            teacher_sum,
+                            ctx.teacher_softmax_scale,
+                            q_start,
+                            k_start,
+                            ctx.pg_collection,
+                        )
+                        teacher = teacher / teacher_norm.unsqueeze(-1)
+                        student_logits = _simplified_index_scores_block(
+                            q_index,
+                            key[k_start:k_end],
+                            ctx.student_score_scale,
+                            q_start,
+                            k_start,
+                        )
+                        student = (
+                            torch.exp(student_logits - student_max.unsqueeze(-1))
+                            / student_sum.unsqueeze(-1)
+                        )
+                        alpha = teacher * student / (student + 1.0e-10)
+                        grad_scores = (
+                            student * student_grad_norm.unsqueeze(-1) - alpha
+                        ) * loss_scale
+                        key_by_batch = key[k_start:k_end, :, 0, :].permute(1, 0, 2).float()
+                        grad_q_block = torch.bmm(grad_scores, key_by_batch)
+                        grad_q_index[:, :, 0, :].add_(
+                            (grad_q_block * ctx.student_score_scale).permute(1, 0, 2)
+                        )
+
+                with _profile_record(
+                    profile, "dense_indexer_kl_bwd_simplified_q_wgrad", query.device
+                ):
+                    positions = torch.arange(
+                        q_start, q_end, device=query.device, dtype=torch.long
+                    )
+                    grad_q_linear = _backward_indexer_transform(
+                        grad_q_index,
+                        positions,
+                        ctx.index_head_dim,
+                        ctx.index_rotary_dim,
+                        ctx.rotary_pos_emb,
+                        ctx.rotary_interleaved,
+                        ctx.use_indexer_rope,
+                        False,
+                    ).reshape(q_end - q_start, query.size(1), ctx.index_head_dim)
+                    # Match BF16/FP16 linear backward while retaining FP32 WGRAD accumulation.
+                    grad_q_linear = grad_q_linear.to(dtype=hidden_states.dtype)
+                    q_input_tile = _apply_simplified_input_norm_tile(
+                        hidden_states[q_start:q_end], ctx.simplified_input_norm
+                    )
+                    _accumulate_linear_weight_grad(
+                        grad_linear_q_weight,
+                        grad_q_linear,
+                        q_input_tile,
+                    )
+        profile.log("backward")
+        return (
+            None,
+            None,
+            None,
+            grad_linear_q_weight,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+
+
 def dsa_min_memory_gqa_forward_only(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -2958,8 +4010,42 @@ def dsa_min_memory_gqa_forward_only(
     profile_rank: int = 0,
     profile_label: str = "",
     use_triton: bool = True,
+    simplified_input_norm=None,
 ) -> torch.Tensor:
     """Run min-memory DSA-GQA for no-grad validation/eval forward passes."""
+    if getattr(indexer.config, "dsa_indexer_mode", "standard") == "simplified":
+        query_chunk_size = _chunk_size(
+            query_chunk_size, _default_query_chunk_size(query.size(0)), query.size(0)
+        )
+        key_chunk_size = _chunk_size(
+            key_chunk_size, _default_key_chunk_size(key.size(0)), key.size(0)
+        )
+        profile = _DSATimingProfiler(profile_enabled, profile_rank, profile_label, query.device)
+        with torch.no_grad(), _triton_dispatch_enabled(use_triton):
+            with profile.record("forward_total", query.device):
+                output, _ = _simplified_sparse_forward_impl(
+                    query,
+                    key,
+                    value,
+                    hidden_states,
+                    _module_weight(indexer.linear_q),
+                    indexer.index_topk,
+                    indexer.index_head_dim,
+                    indexer.index_rotary_dim,
+                    indexer.rotary_pos_emb,
+                    use_indexer_rope,
+                    softmax_scale,
+                    indexer.softmax_scale,
+                    0.0,
+                    query_chunk_size,
+                    key_chunk_size,
+                    indexer.pg_collection,
+                    getattr(indexer.config, "rotary_interleaved", False),
+                    simplified_input_norm,
+                    profile=profile,
+                )
+        profile.log("forward")
+        return output
     k_norm_bias, has_k_norm_bias = _module_bias(indexer.k_norm, query)
     query_chunk_size = _chunk_size(
         query_chunk_size, _default_query_chunk_size(query.size(0)), query.size(0)
@@ -3040,8 +4126,34 @@ def dsa_dense_indexer_loss(
     profile_rank: int = 0,
     profile_label: str = "",
     use_triton: bool = True,
+    simplified_input_norm=None,
 ) -> torch.Tensor:
     """Run tiled dense DSA indexer KL for dense-attention warmup."""
+    if getattr(indexer.config, "dsa_indexer_mode", "standard") == "simplified":
+        return DSASimplifiedDenseIndexerLossFn.apply(
+            query,
+            key,
+            hidden_states,
+            _module_weight(indexer.linear_q),
+            indexer.index_head_dim,
+            indexer.index_rotary_dim,
+            indexer.rotary_pos_emb,
+            use_indexer_rope,
+            softmax_scale,
+            indexer.softmax_scale,
+            loss_coeff,
+            _chunk_size(
+                query_chunk_size, _default_query_chunk_size(query.size(0)), query.size(0)
+            ),
+            _chunk_size(key_chunk_size, _default_key_chunk_size(key.size(0)), key.size(0)),
+            indexer.pg_collection,
+            getattr(indexer.config, "rotary_interleaved", False),
+            simplified_input_norm,
+            profile_enabled,
+            profile_rank,
+            profile_label,
+            use_triton,
+        )
     k_norm_bias, has_k_norm_bias = _module_bias(indexer.k_norm, query)
     return DSADenseIndexerLossFn.apply(
         query,
@@ -3091,8 +4203,40 @@ def dsa_min_memory_gqa(
     profile_rank: int = 0,
     profile_label: str = "",
     use_triton: bool = True,
+    simplified_input_norm=None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Run the minimum-activation DSA-GQA training backend."""
+    if getattr(indexer.config, "dsa_indexer_mode", "standard") == "simplified":
+        if cache_indexer_k:
+            raise ValueError("Simplified DSA reuses main K and cannot cache a separate indexer K.")
+        return DSASimplifiedMinMemoryGQAFn.apply(
+            query,
+            key,
+            value,
+            hidden_states,
+            _module_weight(indexer.linear_q),
+            indexer.index_topk,
+            indexer.index_head_dim,
+            indexer.index_rotary_dim,
+            indexer.rotary_pos_emb,
+            use_indexer_rope,
+            softmax_scale,
+            indexer.softmax_scale,
+            loss_coeff,
+            _chunk_size(
+                query_chunk_size, _default_query_chunk_size(query.size(0)), query.size(0)
+            ),
+            _chunk_size(key_chunk_size, _default_key_chunk_size(key.size(0)), key.size(0)),
+            indexer.pg_collection,
+            getattr(indexer.config, "rotary_interleaved", False),
+            simplified_input_norm,
+            profile_enabled,
+            profile_rank,
+            profile_label,
+            cache_routing,
+            cache_selected_scores,
+            use_triton,
+        )
     k_norm_bias, has_k_norm_bias = _module_bias(indexer.k_norm, query)
     return DSAMinMemoryGQAFn.apply(
         query,
