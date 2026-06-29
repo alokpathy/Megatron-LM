@@ -1010,20 +1010,84 @@ def _cudnn_indexer_topk_full_k(
                 q_bf, k_bf, w_bf, ratio=1, sm_scale=1.0, stream=None,
             )["scores"]                                            # (B, q_len, k_total) FP32
     # Causal mask: query position q_start+i may attend to key positions <= q_start+i.
-    invalid = _causal_invalid_mask(q_start, q_end, 0, k_total, scores.device)  # (q_len, k_total)
-    scores = scores.masked_fill(invalid.unsqueeze(0), float("-inf"))
-    flat = scores.reshape(b * q_len, k_total).contiguous()
-    seq_lens = torch.full((b * q_len,), k_total, dtype=torch.int32, device=flat.device)
+    # Timed separately because the masked_fill + contiguous reshape of the
+    # (B, q_len, k_total) FP32 score tensor is a material cost the Triton path
+    # (which masks inside its fused kernel) does not pay here.
+    with _profile_record(profile, f"routing_cudnn_mask_{profile_suffix}", q_index.device):
+        with torch.cuda.nvtx.range("dsa_mm_indexer_mask_cudnn"):
+            invalid = _causal_invalid_mask(q_start, q_end, 0, k_total, scores.device)  # (q_len, k_total)
+            scores = scores.masked_fill(invalid.unsqueeze(0), float("-inf"))
+            flat = scores.reshape(b * q_len, k_total).contiguous()
+            seq_lens = torch.full((b * q_len,), k_total, dtype=torch.int32, device=flat.device)
     with _profile_record(profile, f"routing_cudnn_topk_{profile_suffix}", q_index.device):
         with torch.cuda.nvtx.range("dsa_mm_indexer_top_k_cudnn"):
             topk_indices = _DSA.indexer_top_k_wrapper(
                 flat, seq_lens, top_k=topk, return_val=False, stream=None,
             )["indices"].reshape(b, q_len, topk)
-    topk_indices, _ = torch.sort(topk_indices.to(torch.long), dim=-1)
+    with _profile_record(profile, f"routing_cudnn_sort_{profile_suffix}", q_index.device):
+        with torch.cuda.nvtx.range("dsa_mm_indexer_sort_cudnn"):
+            topk_indices, _ = torch.sort(topk_indices.to(torch.long), dim=-1)
     return None, topk_indices
 
 
 def _topk_index_tile(
+    hidden_states: torch.Tensor,
+    q_start: int,
+    q_end: int,
+    linear_q_weight: torch.Tensor,
+    linear_k_weight: torch.Tensor,
+    k_norm_weight: torch.Tensor,
+    k_norm_bias: torch.Tensor,
+    has_k_norm_bias: bool,
+    linear_weights_weight: torch.Tensor,
+    k_norm_eps: float,
+    index_n_heads: int,
+    index_head_dim: int,
+    index_topk: int,
+    index_rotary_dim: int,
+    rotary_pos_emb,
+    rotary_interleaved: bool,
+    use_indexer_rope: bool,
+    use_hadamard: bool,
+    key_chunk_size: int,
+    profile: Optional[_DSATimingProfiler] = None,
+    profile_suffix: str = "fwd",
+    full_k_index: Optional[torch.Tensor] = None,
+    use_cudnn: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    # NVTX range over the whole indexer tile — the point where the Triton and
+    # cuDNN codepaths diverge — so nsys shows one comparable "whole indexer"
+    # range on both sides; the per-op ranges (score/topk/mask/merge/sort) nest
+    # inside it.
+    with torch.cuda.nvtx.range("dsa_mm_topk_index_tile"):
+        return _topk_index_tile_impl(
+            hidden_states,
+            q_start,
+            q_end,
+            linear_q_weight,
+            linear_k_weight,
+            k_norm_weight,
+            k_norm_bias,
+            has_k_norm_bias,
+            linear_weights_weight,
+            k_norm_eps,
+            index_n_heads,
+            index_head_dim,
+            index_topk,
+            index_rotary_dim,
+            rotary_pos_emb,
+            rotary_interleaved,
+            use_indexer_rope,
+            use_hadamard,
+            key_chunk_size,
+            profile=profile,
+            profile_suffix=profile_suffix,
+            full_k_index=full_k_index,
+            use_cudnn=use_cudnn,
+        )
+
+
+def _topk_index_tile_impl(
     hidden_states: torch.Tensor,
     q_start: int,
     q_end: int,
@@ -1150,13 +1214,15 @@ def _topk_index_tile(
             else:
                 block_scores, block_indices = triton_topk
         with _profile_record(profile, f"routing_merge_topk_{profile_suffix}", hidden_states.device):
-            running_scores, running_indices = _merge_topk(
-                running_scores, running_indices, block_scores, block_indices, topk
-            )
+            with torch.cuda.nvtx.range("dsa_mm_indexer_merge"):
+                running_scores, running_indices = _merge_topk(
+                    running_scores, running_indices, block_scores, block_indices, topk
+                )
     with _profile_record(profile, f"routing_final_sort_{profile_suffix}", hidden_states.device):
-        running_scores, running_indices = _sort_topk_support_by_position(
-            running_scores, running_indices
-        )
+        with torch.cuda.nvtx.range("dsa_mm_indexer_sort"):
+            running_scores, running_indices = _sort_topk_support_by_position(
+                running_scores, running_indices
+            )
     return running_scores, running_indices, q_index, weights
 
 
