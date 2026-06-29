@@ -1113,20 +1113,21 @@ def _topk_index_tile_impl(
     use_cudnn: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     with _profile_record(profile, f"routing_q_project_{profile_suffix}", hidden_states.device):
-        q_index, weights = _project_q_index_tile(
-            hidden_states,
-            q_start,
-            q_end,
-            linear_q_weight,
-            linear_weights_weight,
-            index_n_heads,
-            index_head_dim,
-            index_rotary_dim,
-            rotary_pos_emb,
-            rotary_interleaved,
-            use_indexer_rope,
-            use_hadamard,
-        )
+        with torch.cuda.nvtx.range("dsa_mm_indexer_q_project"):
+            q_index, weights = _project_q_index_tile(
+                hidden_states,
+                q_start,
+                q_end,
+                linear_q_weight,
+                linear_weights_weight,
+                index_n_heads,
+                index_head_dim,
+                index_rotary_dim,
+                rotary_pos_emb,
+                rotary_interleaved,
+                use_indexer_rope,
+                use_hadamard,
+            )
     causal_key_limit = min(q_end, hidden_states.size(0))
     topk = min(index_topk, causal_key_limit)
 
@@ -1138,22 +1139,23 @@ def _topk_index_tile_impl(
             with _profile_record(
                 profile, f"routing_k_project_{profile_suffix}", hidden_states.device
             ):
-                k_index_full = _project_k_index_block(
-                    hidden_states,
-                    0,
-                    causal_key_limit,
-                    linear_k_weight,
-                    k_norm_weight,
-                    k_norm_bias,
-                    has_k_norm_bias,
-                    k_norm_eps,
-                    index_head_dim,
-                    index_rotary_dim,
-                    rotary_pos_emb,
-                    rotary_interleaved,
-                    use_indexer_rope,
-                    use_hadamard,
-                )
+                with torch.cuda.nvtx.range("dsa_mm_indexer_k_project"):
+                    k_index_full = _project_k_index_block(
+                        hidden_states,
+                        0,
+                        causal_key_limit,
+                        linear_k_weight,
+                        k_norm_weight,
+                        k_norm_bias,
+                        has_k_norm_bias,
+                        k_norm_eps,
+                        index_head_dim,
+                        index_rotary_dim,
+                        rotary_pos_emb,
+                        rotary_interleaved,
+                        use_indexer_rope,
+                        use_hadamard,
+                    )
         else:
             k_index_full = full_k_index[:causal_key_limit]
         running_scores, running_indices = _cudnn_indexer_topk_full_k(
@@ -1170,27 +1172,29 @@ def _topk_index_tile_impl(
             with _profile_record(
                 profile, f"routing_k_project_{profile_suffix}", hidden_states.device
             ):
-                k_index = _project_k_index_block(
-                    hidden_states,
-                    k_start,
-                    k_end,
-                    linear_k_weight,
-                    k_norm_weight,
-                    k_norm_bias,
-                    has_k_norm_bias,
-                    k_norm_eps,
-                    index_head_dim,
-                    index_rotary_dim,
-                    rotary_pos_emb,
-                    rotary_interleaved,
-                    use_indexer_rope,
-                    use_hadamard,
-                )
+                with torch.cuda.nvtx.range("dsa_mm_indexer_k_project"):
+                    k_index = _project_k_index_block(
+                        hidden_states,
+                        k_start,
+                        k_end,
+                        linear_k_weight,
+                        k_norm_weight,
+                        k_norm_bias,
+                        has_k_norm_bias,
+                        k_norm_eps,
+                        index_head_dim,
+                        index_rotary_dim,
+                        rotary_pos_emb,
+                        rotary_interleaved,
+                        use_indexer_rope,
+                        use_hadamard,
+                    )
         else:
             with _profile_record(
                 profile, f"routing_k_cache_{profile_suffix}", hidden_states.device
             ):
-                k_index = full_k_index[k_start:k_end]
+                with torch.cuda.nvtx.range("dsa_mm_indexer_k_cache"):
+                    k_index = full_k_index[k_start:k_end]
         block_topk = min(topk, k_end - k_start)
         with _profile_record(
             profile, f"routing_block_score_topk_{profile_suffix}", hidden_states.device
