@@ -131,6 +131,7 @@ class _DSATimingProfiler:
 
         synchronized_devices = set()
         totals = {}
+        counts = {}
         order = []
         for name, start, end, device in self.records:
             if device is not None:
@@ -143,11 +144,16 @@ class _DSATimingProfiler:
                 elapsed_ms = start
             if name not in totals:
                 totals[name] = 0.0
+                counts[name] = 0
                 order.append(name)
             totals[name] += elapsed_ms
+            counts[name] += 1
 
         label = f" {self.label}" if self.label else ""
-        parts = " ".join(f"{name}={totals[name]:.3f}ms" for name in order)
+        parts = " ".join(
+            f"{name}={totals[name]:.3f}ms(avg={totals[name]/counts[name]:.3f}ms)"
+            for name in order
+        )
         print(f"[rank{self.rank}] DSA min-memory {phase}{label}: {parts}", flush=True)
 
 
