@@ -147,5 +147,6 @@ torchrun \
     --dsa-indexer-loss-coeff 0.01 \
     --dsa-min-memory-profile \
     --dsa-min-memory-profile-rank 0 \
+    --dsa-kernel-cache-indexer-k \
     $( [ "${USE_CUDNN}" = "1" ] && echo "--dsa-use-cudnn" ) \
     --no-rope-fusion" )
