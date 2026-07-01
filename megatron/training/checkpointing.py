@@ -127,6 +127,7 @@ def check_checkpoint_args(checkpoint_args):
     _compare('add_position_embedding', default=True)
     _compare('experimental_attention_variant', default=None)
     _compare('dsa_indexer_mode', default='standard')
+    _compare('dsa_simplified_use_learned_k', default=False)
     _compare('dsa_indexer_n_heads', default=None)
     _compare('dsa_indexer_head_dim', default=None)
     _compare('dsa_indexer_topk', default=None)
@@ -1480,7 +1481,13 @@ def load_args_from_checkpoint(
     # Do not let that inert default overwrite an explicit GQA-to-simplified-DSA conversion.
     checkpoint_is_dsa = checkpoint_attention_variant == 'dsa'
     if checkpoint_is_dsa:
+        # The learned-K option was added after simplified DSA checkpoints already existed.
+        # Make the historical main-attention-K behavior explicit before force-restoring model
+        # arguments; otherwise an old checkpoint can accidentally retain a runtime True value.
+        if not hasattr(checkpoint_args, 'dsa_simplified_use_learned_k'):
+            setattr(checkpoint_args, 'dsa_simplified_use_learned_k', False)
         _set_arg('dsa_indexer_mode', force=True)
+        _set_arg('dsa_simplified_use_learned_k', force=True)
         _set_arg('dsa_indexer_n_heads', force=True)
         _set_arg('dsa_indexer_head_dim', force=True)
         _set_arg('dsa_indexer_topk', force=True)

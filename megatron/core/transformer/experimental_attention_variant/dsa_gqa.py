@@ -485,6 +485,7 @@ class DSGQAIndexerSubmodules:
 @dataclass
 class SimplifiedDSGQAIndexerSubmodules:
     linear_q: Union[ModuleSpec, type] = None
+    linear_k: Union[ModuleSpec, type] = None
 
 
 @dataclass
@@ -751,7 +752,7 @@ class DSGQAIndexer(MegatronModule):
 
 
 class SimplifiedDSGQAIndexer(MegatronModule):
-    """Q-only token router that scores the detached main-attention K vectors."""
+    """One-head dot-product router over main-attention or separately learned K vectors."""
 
     def __init__(
         self,
@@ -765,8 +766,9 @@ class SimplifiedDSGQAIndexer(MegatronModule):
         # one group per partition; the actual K passed to this indexer remains one replicated
         # local group on every TP rank.
         self.hidden_size = config.hidden_size
+        self.use_learned_k = getattr(config, "dsa_simplified_use_learned_k", False)
         self.index_n_heads = 1
-        self.index_head_dim = config.kv_channels
+        self.index_head_dim = config.dsa_indexer_head_dim
         self.index_topk = config.dsa_indexer_topk
         self.softmax_scale = self.index_head_dim**-0.5
         self.index_rotary_dim = int(self.index_head_dim * config.rotary_percent)
@@ -817,6 +819,19 @@ class SimplifiedDSGQAIndexer(MegatronModule):
             skip_weight_param_allocation=False,
             parallel_mode="duplicated",
         )
+        self.linear_k = None
+        if self.use_learned_k:
+            self.linear_k = build_module(
+                submodules.linear_k,
+                self.hidden_size,
+                self.index_head_dim,
+                config=config,
+                init_method=config.init_method,
+                bias=False,
+                skip_bias_add=False,
+                skip_weight_param_allocation=False,
+                parallel_mode="duplicated",
+            )
         if self.pg_collection.tp.size() > 1:
             for param in self.parameters():
                 setattr(param, "average_gradients_across_tp_domain", True)
@@ -877,6 +892,55 @@ class SimplifiedDSGQAIndexer(MegatronModule):
             q[n:] = 0
         return q
 
+    def _apply_rope_dynamic_qk(
+        self, q: torch.Tensor, k: torch.Tensor, inference_context
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if self.rotary_pos_emb is None or self.index_rotary_dim == 0:
+            return q, k
+        n = inference_context.active_token_count
+        rotary_seq_len = (
+            1
+            if n == 0
+            else int(inference_context.token_to_position_in_request[:n].max().item()) + 1
+        )
+        if self.config.rope_type == "rope":
+            rotary_pos_emb, mscale = self.rotary_pos_emb(rotary_seq_len, packed_seq=False), 1.0
+        else:
+            rotary_pos_emb, mscale = self.rotary_pos_emb(rotary_seq_len, packed_seq=False)
+        q_nope, q_pe = torch.split(
+            q, [self.index_head_dim - self.index_rotary_dim, self.index_rotary_dim], dim=-1
+        )
+        k_nope, k_pe = torch.split(
+            k, [self.index_head_dim - self.index_rotary_dim, self.index_rotary_dim], dim=-1
+        )
+        q_pe = q_pe.clone()
+        k_pe = k_pe.clone()
+        if n > 0:
+            q_positions = inference_context.token_to_pos_ids[:n]
+            k_positions = inference_context.token_to_position_in_request[:n]
+            q_pe[:n] = apply_rotary_pos_emb(
+                q_pe[:n],
+                rotary_pos_emb[q_positions],
+                config=self.config,
+                cu_seqlens=None,
+                mscale=mscale,
+                cp_group=self.pg_collection.cp,
+            )
+            k_pe[:n] = apply_rotary_pos_emb(
+                k_pe[:n],
+                rotary_pos_emb[k_positions],
+                config=self.config,
+                cu_seqlens=None,
+                mscale=mscale,
+                cp_group=self.pg_collection.cp,
+            )
+        q = torch.cat([q_nope, q_pe], dim=-1)
+        k = torch.cat([k_nope, k_pe], dim=-1)
+        if n < q.size(0):
+            q[n:] = 0
+            k[n:] = 0
+        return q, k
+
     def forward_q(
         self,
         hidden_states: torch.Tensor,
@@ -895,6 +959,42 @@ class SimplifiedDSGQAIndexer(MegatronModule):
     def forward_q_dynamic(self, hidden_states: torch.Tensor, use_rope: bool, inference_context):
         q = self.forward_q(hidden_states, use_rope=False)
         return self._apply_rope_dynamic(q, inference_context) if use_rope else q
+
+    def forward_qk(
+        self,
+        hidden_states: torch.Tensor,
+        use_rope: bool,
+        packed_seq_params: Optional[PackedSeqParams] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if not self.use_learned_k or self.linear_k is None:
+            raise RuntimeError("Simplified DSA learned-K projection is not enabled.")
+        if self.config.sequence_parallel and self.pg_collection.tp.size() > 1:
+            hidden_states = gather_from_sequence_parallel_region(
+                hidden_states, group=self.pg_collection.tp
+            )
+        seqlen, batch_size, _ = hidden_states.shape
+        q, _ = self.linear_q(hidden_states)
+        k, _ = self.linear_k(hidden_states)
+        q = q.reshape(seqlen, batch_size, 1, self.index_head_dim)
+        k = k.reshape(seqlen, batch_size, 1, self.index_head_dim)
+        return (
+            self._apply_rope(q, use_rope=use_rope, packed_seq_params=packed_seq_params),
+            self._apply_rope(k, use_rope=use_rope, packed_seq_params=packed_seq_params),
+        )
+
+    def forward_qk_dynamic(self, hidden_states: torch.Tensor, use_rope: bool, inference_context):
+        if not self.use_learned_k or self.linear_k is None:
+            raise RuntimeError("Simplified DSA learned-K projection is not enabled.")
+        if self.config.sequence_parallel and self.pg_collection.tp.size() > 1:
+            hidden_states = gather_from_sequence_parallel_region(
+                hidden_states, group=self.pg_collection.tp
+            )
+        seqlen, batch_size, _ = hidden_states.shape
+        q, _ = self.linear_q(hidden_states)
+        k, _ = self.linear_k(hidden_states)
+        q = q.reshape(seqlen, batch_size, 1, self.index_head_dim)
+        k = k.reshape(seqlen, batch_size, 1, self.index_head_dim)
+        return self._apply_rope_dynamic_qk(q, k, inference_context) if use_rope else (q, k)
 
 
 class _DSAZeroParamDependency(torch.autograd.Function):
@@ -1062,6 +1162,9 @@ class DSGQACoreAttention(MegatronModule):
 
         sparse_attention_use_gather = getattr(self.config, "dsa_sparse_attention_use_gather", False)
         simplified_indexer = getattr(self.config, "dsa_indexer_mode", "standard") == "simplified"
+        simplified_learned_k = simplified_indexer and getattr(
+            self.config, "dsa_simplified_use_learned_k", False
+        )
 
         hidden_states = hidden_states.detach()
         if simplified_indexer:
@@ -1091,10 +1194,19 @@ class DSGQACoreAttention(MegatronModule):
             )
             recompute_indexer_loss = getattr(self.config, "dsa_indexer_loss_recompute", False)
             if simplified_indexer:
-                q_index = self.indexer.forward_q(
-                    hidden_states, use_rope=use_indexer_rope, packed_seq_params=packed_seq_params
-                )
-                k_index = key.detach()
+                if simplified_learned_k:
+                    q_index, k_index = self.indexer.forward_qk(
+                        hidden_states,
+                        use_rope=use_indexer_rope,
+                        packed_seq_params=packed_seq_params,
+                    )
+                else:
+                    q_index = self.indexer.forward_q(
+                        hidden_states,
+                        use_rope=use_indexer_rope,
+                        packed_seq_params=packed_seq_params,
+                    )
+                    k_index = key.detach()
                 weights = None
             else:
                 q_index, k_index, weights = self.indexer.forward_before_topk(
@@ -1130,9 +1242,8 @@ class DSGQACoreAttention(MegatronModule):
                         self.indexer.index_topk, routing_mask, key_chunk_size,
                     )
 
-                routing_inputs_require_grad = q_index.requires_grad or (
-                    not simplified_indexer
-                    and (k_index.requires_grad or weights.requires_grad)
+                routing_inputs_require_grad = q_index.requires_grad or k_index.requires_grad or (
+                    weights is not None and weights.requires_grad
                 )
                 if recompute_topk and routing_inputs_require_grad:
                     topk_scores, topk_indices = torch_checkpoint.checkpoint(
@@ -1274,12 +1385,22 @@ class DSGQACoreAttention(MegatronModule):
             return output
 
         if simplified_indexer:
-            q_index = self.indexer.forward_q(
-                hidden_states, use_rope=use_indexer_rope, packed_seq_params=packed_seq_params
-            )
+            if simplified_learned_k:
+                q_index, k_index = self.indexer.forward_qk(
+                    hidden_states,
+                    use_rope=use_indexer_rope,
+                    packed_seq_params=packed_seq_params,
+                )
+            else:
+                q_index = self.indexer.forward_q(
+                    hidden_states,
+                    use_rope=use_indexer_rope,
+                    packed_seq_params=packed_seq_params,
+                )
+                k_index = key.detach()
             _, topk_indices = _simplified_qk_topk_naive(
                 q_index,
-                key.detach(),
+                k_index,
                 self.indexer.index_topk,
                 self.indexer.softmax_scale,
                 routing_mask,
@@ -1559,15 +1680,30 @@ class DSGQACoreAttention(MegatronModule):
             raise NotImplementedError("dsa_fwd_skip_dsa is not supported by dynamic inference.")
 
         simplified_indexer = getattr(self.config, "dsa_indexer_mode", "standard") == "simplified"
+        simplified_learned_k = simplified_indexer and getattr(
+            self.config, "dsa_simplified_use_learned_k", False
+        )
         if simplified_indexer:
             hidden_states = _simplified_indexer_input(hidden_states, indexer_input_norm)
-            q_index = self.indexer.forward_q_dynamic(
-                hidden_states,
-                use_rope=use_indexer_rope,
-                inference_context=inference_context,
-            )
+            if simplified_learned_k:
+                q_index, k_index_current = self.indexer.forward_qk_dynamic(
+                    hidden_states,
+                    use_rope=use_indexer_rope,
+                    inference_context=inference_context,
+                )
+                inference_context.append_dsa_key_cache(provider_layer_number, k_index_current)
+                dsa_key_cache, dsa_block_table = inference_context.dsa_key_cache(
+                    provider_layer_number
+                )
+                block_table = dsa_block_table
+            else:
+                q_index = self.indexer.forward_q_dynamic(
+                    hidden_states,
+                    use_rope=use_indexer_rope,
+                    inference_context=inference_context,
+                )
+                dsa_key_cache = None
             weights = None
-            dsa_key_cache = None
         else:
             q_index, k_index_current, weights = self.indexer.forward_before_topk_dynamic(
                 hidden_states,
@@ -1614,13 +1750,17 @@ class DSGQACoreAttention(MegatronModule):
             request_value = _gather_block_cache_sequence(
                 value_cache, block_table_row, key_length, block_size_tokens
             ).unsqueeze(1)
-            request_index_key = (
-                request_key
-                if simplified_indexer
-                else _gather_block_cache_sequence(
+            if simplified_indexer:
+                if simplified_learned_k:
+                    request_index_key = _gather_block_cache_sequence(
+                        dsa_key_cache, block_table_row, key_length, block_size_tokens
+                    ).unsqueeze(1).unsqueeze(2)
+                else:
+                    request_index_key = request_key
+            else:
+                request_index_key = _gather_block_cache_sequence(
                     dsa_key_cache, block_table_row, key_length, block_size_tokens
                 ).unsqueeze(1)
-            )
 
             request_query = query[query_start:query_end]
             request_q_index = q_index[query_start:query_end]
@@ -1736,6 +1876,7 @@ class DSGroupedSelfAttention(SelfAttention):
                     module=SimplifiedDSGQAIndexer,
                     submodules=SimplifiedDSGQAIndexerSubmodules(
                         linear_q=ModuleSpec(module=TELinear),
+                        linear_k=ModuleSpec(module=TELinear),
                     ),
                 )
             else:

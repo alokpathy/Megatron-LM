@@ -862,6 +862,27 @@ def _reset_simplified_dsa_indexers_from_main_q(model, rescale: bool = False) -> 
             mean_q_weight = mean_q_weight.to(dtype=indexer_weight.dtype)
             with torch.no_grad():
                 indexer_weight.copy_(mean_q_weight)
+                indexer_linear_k = getattr(indexer, "linear_k", None)
+                indexer_k_weight = getattr(indexer_linear_k, "weight", None)
+                if indexer_k_weight is not None:
+                    k_row_start = query_rows * (
+                        2 if getattr(indexer_config, "attention_output_gate", False) else 1
+                    )
+                    k_row_end = k_row_start + head_dim
+                    if full_qkv_weight.size(0) < k_row_end:
+                        raise RuntimeError(
+                            "Unable to extract main K projection from linear_qkv weight with "
+                            f"shape {tuple(full_qkv_weight.shape)}; expected at least "
+                            f"{k_row_end} output rows."
+                        )
+                    main_k_weight = full_qkv_weight[k_row_start:k_row_end]
+                    if indexer_k_weight.shape != main_k_weight.shape:
+                        raise RuntimeError(
+                            "Simplified learned-K weight shape does not match main attention K: "
+                            f"indexer={tuple(indexer_k_weight.shape)}, "
+                            f"main={tuple(main_k_weight.shape)}."
+                        )
+                    indexer_k_weight.copy_(main_k_weight.to(dtype=indexer_k_weight.dtype))
             reset_count += 1
 
     return reset_count

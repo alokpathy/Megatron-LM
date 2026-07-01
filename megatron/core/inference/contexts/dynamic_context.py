@@ -247,7 +247,10 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
         self.cache_dsa_indexer_keys = (
             getattr(model_config, "experimental_attention_variant", None) == "dsa"
-            and getattr(model_config, "dsa_indexer_mode", "standard") != "simplified"
+            and (
+                getattr(model_config, "dsa_indexer_mode", "standard") != "simplified"
+                or getattr(model_config, "dsa_simplified_use_learned_k", False)
+            )
         )
         self.dsa_indexer_head_dim = (
             getattr(model_config, "dsa_indexer_head_dim", 0) if self.cache_dsa_indexer_keys else 0

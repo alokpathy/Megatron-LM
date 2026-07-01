@@ -287,7 +287,10 @@ class TransformerConfig(ModelParallelConfig):
     # DSA
     ####################
     dsa_indexer_mode: Literal['standard', 'simplified'] = 'standard'
-    """DSA indexer formulation. Simplified uses one Q head and the main attention K."""
+    """DSA indexer formulation. Simplified uses one Q head and a plain Q/K dot product."""
+
+    dsa_simplified_use_learned_k: bool = False
+    """Whether simplified DSA uses a learned indexer K instead of main-attention K."""
 
     dsa_indexer_n_heads: Optional[int] = None
     """Number of DSA indexer heads."""
@@ -2237,6 +2240,13 @@ class TransformerConfig(ModelParallelConfig):
             self.dsa_indexer_mode == "standard"
             or self.experimental_attention_variant == "dsa"
         ), "dsa_indexer_mode='simplified' requires experimental_attention_variant='dsa'."
+        assert not self.dsa_simplified_use_learned_k or (
+            self.experimental_attention_variant == "dsa"
+            and self.dsa_indexer_mode == "simplified"
+        ), (
+            "dsa_simplified_use_learned_k requires experimental_attention_variant='dsa' "
+            "and dsa_indexer_mode='simplified'."
+        )
         assert (
             not self.dsa_fwd_skip_dsa or self.experimental_attention_variant == "dsa"
         ), "dsa_fwd_skip_dsa requires experimental_attention_variant='dsa'."
@@ -2276,21 +2286,34 @@ class TransformerConfig(ModelParallelConfig):
                     "Simplified DSA derives one indexer Q head from the single KV group; "
                     "leave dsa_indexer_n_heads unset or set it to 1."
                 )
-                assert self.dsa_indexer_head_dim in (None, self.kv_channels), (
-                    "Simplified DSA uses the main attention head dimension; leave "
-                    "dsa_indexer_head_dim unset or set it equal to kv_channels."
-                )
+                if self.dsa_simplified_use_learned_k:
+                    assert self.dsa_indexer_head_dim is None or self.dsa_indexer_head_dim > 0, (
+                        "Simplified DSA with a learned K requires a positive "
+                        "dsa_indexer_head_dim when explicitly set."
+                    )
+                else:
+                    assert self.dsa_indexer_head_dim in (None, self.kv_channels), (
+                        "Simplified DSA using main-attention K requires the indexer head "
+                        "dimension to equal the main attention head dimension; leave "
+                        "dsa_indexer_head_dim unset or set it equal to kv_channels."
+                    )
                 self.dsa_indexer_n_heads = 1
-                self.dsa_indexer_head_dim = self.kv_channels
+                if self.dsa_indexer_head_dim is None:
+                    self.dsa_indexer_head_dim = self.kv_channels
                 assert not self.dsa_indexer_use_hadamard, (
                     "Simplified DSA uses a plain Q/K dot product and does not support Hadamard."
                 )
-                assert not self.dsa_kernel_cache_indexer_k, (
-                    "Simplified DSA reuses the main attention K and has no separate indexer K cache."
+                assert self.dsa_simplified_use_learned_k or not self.dsa_kernel_cache_indexer_k, (
+                    "Simplified DSA using main-attention K has no separate indexer K cache."
                 )
                 main_q_reset = self.dsa_indexer_reset_method in (
                     'main-q-mean',
                     'main-q-mean-rescaled',
+                )
+                assert not (
+                    main_q_reset and self.dsa_indexer_head_dim != self.kv_channels
+                ), (
+                    "Main-Q initialization requires dsa_indexer_head_dim == kv_channels."
                 )
                 assert not (main_q_reset and self.qk_layernorm), (
                     "Main-Q initialization is not defined when qk_layernorm is enabled."

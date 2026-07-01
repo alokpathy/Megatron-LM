@@ -1111,6 +1111,166 @@ def _dsa_gathered_linear_wgrad_kernel(
     )
 
 
+@triton.jit
+def _dsa_simplified_input_norm_stats_kernel(
+    hidden_ptr,
+    rstd_ptr,
+    total_rows: tl.constexpr,
+    batch_size: tl.constexpr,
+    hidden_size: tl.constexpr,
+    hidden_stride_s: tl.constexpr,
+    hidden_stride_b: tl.constexpr,
+    hidden_stride_h: tl.constexpr,
+    stats_stride_s: tl.constexpr,
+    stats_stride_b: tl.constexpr,
+    eps: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+):
+    row = tl.program_id(0)
+    sequence_idx = row // batch_size
+    batch_idx = row - sequence_idx * batch_size
+    offs_h = tl.arange(0, BLOCK_H)
+    mask = (row < total_rows) & (offs_h < hidden_size)
+    hidden = tl.load(
+        hidden_ptr
+        + sequence_idx * hidden_stride_s
+        + batch_idx * hidden_stride_b
+        + offs_h * hidden_stride_h,
+        mask=mask,
+        other=0.0,
+    ).to(tl.float32)
+    inv_hidden = 1.0 / hidden_size
+    variance = tl.sum(hidden * hidden, axis=0) * inv_hidden
+    rstd = tl.rsqrt(variance + eps)
+    stats_offset = sequence_idx * stats_stride_s + batch_idx * stats_stride_b
+    tl.store(rstd_ptr + stats_offset, rstd, mask=row < total_rows)
+
+
+@triton.autotune(
+    configs=_gathered_linear_wgrad_autotune_configs(),
+    key=[
+        "total_rows",
+        "out_features",
+        "hidden_size",
+        "query_len",
+        "topk",
+        "USE_BF16_OPERANDS",
+        "USE_FP16_OPERANDS",
+        "ZERO_CENTERED_GAMMA",
+    ],
+)
+@triton.jit
+def _dsa_simplified_gathered_linear_wgrad_kernel(
+    grad_output_ptr,
+    hidden_ptr,
+    topk_indices_ptr,
+    norm_weight_ptr,
+    rstd_ptr,
+    out_delta_ptr,
+    total_rows: tl.constexpr,
+    query_len: tl.constexpr,
+    topk: tl.constexpr,
+    out_features: tl.constexpr,
+    hidden_size: tl.constexpr,
+    go_stride_b: tl.constexpr,
+    go_stride_m: tl.constexpr,
+    go_stride_k: tl.constexpr,
+    go_stride_o: tl.constexpr,
+    hidden_stride_s: tl.constexpr,
+    hidden_stride_b: tl.constexpr,
+    hidden_stride_h: tl.constexpr,
+    ti_stride_b: tl.constexpr,
+    ti_stride_m: tl.constexpr,
+    ti_stride_k: tl.constexpr,
+    nw_stride_h: tl.constexpr,
+    stats_stride_s: tl.constexpr,
+    stats_stride_b: tl.constexpr,
+    out_stride_o: tl.constexpr,
+    out_stride_i: tl.constexpr,
+    USE_BF16_OPERANDS: tl.constexpr,
+    USE_FP16_OPERANDS: tl.constexpr,
+    ZERO_CENTERED_GAMMA: tl.constexpr,
+    BLOCK_O: tl.constexpr,
+    BLOCK_I: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    out_block = tl.program_id(0)
+    in_block = tl.program_id(1)
+    offs_o = out_block * BLOCK_O + tl.arange(0, BLOCK_O)
+    offs_i = in_block * BLOCK_I + tl.arange(0, BLOCK_I)
+    offs_n = tl.arange(0, BLOCK_N)
+    rows_per_batch = query_len * topk
+
+    acc = tl.zeros((BLOCK_O, BLOCK_I), dtype=tl.float32)
+    for row_start in tl.range(0, total_rows, BLOCK_N):
+        rows = row_start + offs_n
+        row_mask = rows < total_rows
+        batch_idx = rows // rows_per_batch
+        rem = rows - batch_idx * rows_per_batch
+        query_idx = rem // topk
+        support_idx = rem - query_idx * topk
+        selected = tl.load(
+            topk_indices_ptr
+            + batch_idx * ti_stride_b
+            + query_idx * ti_stride_m
+            + support_idx * ti_stride_k,
+            mask=row_mask,
+            other=0,
+        )
+        grad_output = tl.load(
+            grad_output_ptr
+            + batch_idx[:, None] * go_stride_b
+            + query_idx[:, None] * go_stride_m
+            + support_idx[:, None] * go_stride_k
+            + offs_o[None, :] * go_stride_o,
+            mask=row_mask[:, None] & (offs_o[None, :] < out_features),
+            other=0.0,
+        )
+        hidden = tl.load(
+            hidden_ptr
+            + selected[:, None] * hidden_stride_s
+            + batch_idx[:, None] * hidden_stride_b
+            + offs_i[None, :] * hidden_stride_h,
+            mask=row_mask[:, None] & (offs_i[None, :] < hidden_size),
+            other=0.0,
+        ).to(tl.float32)
+        stats_offset = selected * stats_stride_s + batch_idx * stats_stride_b
+        rstd = tl.load(rstd_ptr + stats_offset, mask=row_mask, other=0.0).to(tl.float32)
+        norm_weight = tl.load(
+            norm_weight_ptr + offs_i * nw_stride_h,
+            mask=offs_i < hidden_size,
+            other=0.0,
+        ).to(tl.float32)
+        if ZERO_CENTERED_GAMMA:
+            norm_weight += 1.0
+            if USE_BF16_OPERANDS:
+                norm_weight = norm_weight.to(tl.bfloat16).to(tl.float32)
+            elif USE_FP16_OPERANDS:
+                norm_weight = norm_weight.to(tl.float16).to(tl.float32)
+        hidden = hidden * rstd[:, None] * norm_weight[None, :]
+        if USE_BF16_OPERANDS:
+            grad_output = grad_output.to(tl.bfloat16)
+            hidden = hidden.to(tl.bfloat16)
+        elif USE_FP16_OPERANDS:
+            grad_output = grad_output.to(tl.float16)
+            hidden = hidden.to(tl.float16)
+        else:
+            grad_output = grad_output.to(tl.float32)
+            hidden = hidden.to(tl.float32)
+        acc += tl.dot(
+            tl.trans(grad_output),
+            hidden,
+            input_precision="tf32",
+            out_dtype=tl.float32,
+        )
+
+    tl.store(
+        out_delta_ptr + offs_o[:, None] * out_stride_o + offs_i[None, :] * out_stride_i,
+        acc,
+        mask=(offs_o[:, None] < out_features) & (offs_i[None, :] < hidden_size),
+    )
+
+
 @triton.autotune(
     configs=_scatter_selected_grad_autotune_configs(),
     key=["total_rows", "sequence_length", "query_len", "topk", "out_features"],
@@ -1476,6 +1636,111 @@ def _dsa_simplified_selected_scores_backward_kernel(
         + offs_d * gq_stride_d,
         grad_q * SCORE_SCALE,
         mask=offs_d < HEAD_DIM,
+    )
+
+
+@triton.autotune(
+    configs=_simplified_selected_scores_autotune_configs(),
+    key=["query_len", "topk", "HEAD_DIM"],
+    reset_to_zero=["grad_q_ptr"],
+)
+@triton.jit
+def _dsa_simplified_selected_scores_backward_qk_kernel(
+    q_ptr,
+    selected_k_ptr,
+    topk_indices_ptr,
+    grad_scores_ptr,
+    grad_q_ptr,
+    grad_selected_k_ptr,
+    q_start,
+    query_len: tl.constexpr,
+    topk: tl.constexpr,
+    q_stride_m: tl.constexpr,
+    q_stride_b: tl.constexpr,
+    q_stride_h: tl.constexpr,
+    q_stride_d: tl.constexpr,
+    sk_stride_b: tl.constexpr,
+    sk_stride_m: tl.constexpr,
+    sk_stride_k: tl.constexpr,
+    sk_stride_d: tl.constexpr,
+    ti_stride_b: tl.constexpr,
+    ti_stride_m: tl.constexpr,
+    ti_stride_k: tl.constexpr,
+    gs_stride_b: tl.constexpr,
+    gs_stride_m: tl.constexpr,
+    gs_stride_k: tl.constexpr,
+    gq_stride_m: tl.constexpr,
+    gq_stride_b: tl.constexpr,
+    gq_stride_h: tl.constexpr,
+    gq_stride_d: tl.constexpr,
+    gsk_stride_b: tl.constexpr,
+    gsk_stride_m: tl.constexpr,
+    gsk_stride_k: tl.constexpr,
+    gsk_stride_d: tl.constexpr,
+    SCORE_SCALE: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    batch_idx = tl.program_id(0)
+    query_idx = tl.program_id(1)
+    support_block = tl.program_id(2)
+    offs_k = support_block * BLOCK_K + tl.arange(0, BLOCK_K)
+    offs_d = tl.arange(0, BLOCK_D)
+    support_mask = offs_k < topk
+    selected_positions = tl.load(
+        topk_indices_ptr
+        + batch_idx * ti_stride_b
+        + query_idx * ti_stride_m
+        + offs_k * ti_stride_k,
+        mask=support_mask,
+        other=0,
+    )
+    valid = support_mask & (selected_positions <= q_start + query_idx)
+    grad_scores = tl.load(
+        grad_scores_ptr
+        + batch_idx * gs_stride_b
+        + query_idx * gs_stride_m
+        + offs_k * gs_stride_k,
+        mask=valid,
+        other=0.0,
+    ).to(tl.float32)
+    q = tl.load(
+        q_ptr
+        + query_idx * q_stride_m
+        + batch_idx * q_stride_b
+        + offs_d * q_stride_d,
+        mask=offs_d < HEAD_DIM,
+        other=0.0,
+    ).to(tl.float32)
+    selected_k = tl.load(
+        selected_k_ptr
+        + batch_idx * sk_stride_b
+        + query_idx * sk_stride_m
+        + offs_k[:, None] * sk_stride_k
+        + offs_d[None, :] * sk_stride_d,
+        mask=valid[:, None] & (offs_d[None, :] < HEAD_DIM),
+        other=0.0,
+    ).to(tl.float32)
+    scaled_grad = grad_scores * SCORE_SCALE
+    grad_q = tl.sum(selected_k * scaled_grad[:, None], axis=0)
+    tl.atomic_add(
+        grad_q_ptr
+        + query_idx * gq_stride_m
+        + batch_idx * gq_stride_b
+        + offs_d * gq_stride_d,
+        grad_q,
+        sem="relaxed",
+        mask=offs_d < HEAD_DIM,
+    )
+    tl.store(
+        grad_selected_k_ptr
+        + batch_idx * gsk_stride_b
+        + query_idx * gsk_stride_m
+        + offs_k[:, None] * gsk_stride_k
+        + offs_d[None, :] * gsk_stride_d,
+        scaled_grad[:, None] * q[None, :],
+        mask=support_mask[:, None] & (offs_d[None, :] < HEAD_DIM),
     )
 
 
@@ -3495,6 +3760,129 @@ def triton_gathered_linear_wgrad(
     return True
 
 
+def triton_simplified_input_norm_stats(
+    hidden_states: torch.Tensor,
+    eps: float,
+    normalization: str,
+) -> Optional[torch.Tensor]:
+    """Return FP32 RMSNorm statistics for the simplified learned-K WGRAD fast path."""
+    if _triton_disabled() or not _supported_tensor(hidden_states) or hidden_states.dim() != 3:
+        return None
+    # Native LayerNorm and this explicit Triton reduction need not produce the
+    # same model-dtype activation. Let LayerNorm use the exact forward
+    # recomputation path before its WGRAD GEMM instead.
+    if normalization != "RMSNorm":
+        return None
+    sequence_length, batch_size, hidden_size = hidden_states.shape
+    if hidden_size < 1 or hidden_size > 65536:
+        return None
+    rstd = torch.empty(
+        (sequence_length, batch_size), device=hidden_states.device, dtype=torch.float32
+    )
+    total_rows = sequence_length * batch_size
+    if total_rows == 0:
+        return rstd
+    block_h = _next_power_of_2(hidden_size)
+    try:
+        _dsa_simplified_input_norm_stats_kernel[(total_rows,)](
+            hidden_states,
+            rstd,
+            total_rows,
+            batch_size,
+            hidden_size,
+            *hidden_states.stride(),
+            *rstd.stride(),
+            eps=float(eps),
+            BLOCK_H=block_h,
+            num_warps=8 if block_h >= 2048 else 4,
+        )
+    except _TRITON_RESOURCE_ERRORS:
+        return None
+    return rstd
+
+
+def triton_simplified_gathered_linear_wgrad(
+    grad_output: torch.Tensor,
+    hidden_states: torch.Tensor,
+    topk_indices: torch.Tensor,
+    norm_weight: torch.Tensor,
+    norm_bias: Optional[torch.Tensor],
+    norm_stats: torch.Tensor,
+    normalization: str,
+    zero_centered_gamma: bool,
+    grad_weight: torch.Tensor,
+) -> bool:
+    """Accumulate simplified learned-K WGRAD from normalized selected input rows."""
+    if _triton_disabled() or normalization != "RMSNorm":
+        return False
+    del norm_bias
+    rstd = norm_stats
+    if not (
+        _supported_tensor(grad_output)
+        and _supported_tensor(hidden_states)
+        and _supported_index_tensor(topk_indices)
+        and _supported_tensor(norm_weight)
+        and rstd.is_cuda
+        and rstd.dtype == torch.float32
+        and grad_weight.is_cuda
+        and grad_weight.dtype == torch.float32
+    ):
+        return False
+    if grad_output.dim() != 4 or hidden_states.dim() != 3 or topk_indices.dim() != 3:
+        return False
+    if grad_output.shape[:3] != topk_indices.shape:
+        return False
+    if hidden_states.size(1) != topk_indices.size(0):
+        return False
+    if rstd.shape != hidden_states.shape[:2]:
+        return False
+
+    batch_size, query_len, topk, out_features = grad_output.shape
+    hidden_size = hidden_states.size(2)
+    if tuple(grad_weight.shape) != (out_features, hidden_size):
+        return False
+    if norm_weight.numel() != hidden_size or norm_weight.device != hidden_states.device:
+        return False
+    if out_features > 256 or out_features < 16 or hidden_size < 16:
+        return False
+    total_rows = batch_size * query_len * topk
+    if total_rows == 0:
+        return True
+
+    out_delta = torch.empty_like(grad_weight, dtype=torch.float32)
+    wgrad_grid = lambda meta: (
+        triton.cdiv(out_features, meta["BLOCK_O"]),
+        triton.cdiv(hidden_size, meta["BLOCK_I"]),
+    )
+    try:
+        _dsa_simplified_gathered_linear_wgrad_kernel[wgrad_grid](
+            grad_output,
+            hidden_states,
+            topk_indices,
+            norm_weight,
+            rstd,
+            out_delta,
+            total_rows,
+            query_len,
+            topk,
+            out_features,
+            hidden_size,
+            *grad_output.stride(),
+            *hidden_states.stride(),
+            *topk_indices.stride(),
+            norm_weight.stride(0),
+            *rstd.stride(),
+            *out_delta.stride(),
+            USE_BF16_OPERANDS=hidden_states.dtype == torch.bfloat16,
+            USE_FP16_OPERANDS=hidden_states.dtype == torch.float16,
+            ZERO_CENTERED_GAMMA=bool(zero_centered_gamma),
+        )
+    except _TRITON_RESOURCE_ERRORS:
+        return False
+    grad_weight.add_(out_delta)
+    return True
+
+
 def triton_scatter_selected_grad_to_sequence(
     grad_output: torch.Tensor,
     topk_indices: torch.Tensor,
@@ -3839,6 +4227,64 @@ def triton_simplified_selected_index_scores_backward(
     except _TRITON_RESOURCE_ERRORS:
         return None
     return grad_q
+
+
+def triton_simplified_selected_index_scores_backward_qk(
+    q_index: torch.Tensor,
+    selected_k_index: torch.Tensor,
+    topk_indices: torch.Tensor,
+    grad_scores: torch.Tensor,
+    score_scale: float,
+    q_start: int,
+) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+    if _triton_disabled() or not (
+        _supported_tensor(q_index)
+        and _supported_tensor(selected_k_index)
+        and _supported_tensor(grad_scores)
+        and _supported_index_tensor(topk_indices)
+    ):
+        return None
+    if q_index.dim() != 4 or selected_k_index.dim() != 4 or topk_indices.dim() != 3:
+        return None
+    query_len, batch_size, index_heads, head_dim = q_index.shape
+    if index_heads != 1 or head_dim > 256:
+        return None
+    if selected_k_index.shape != (*topk_indices.shape, head_dim):
+        return None
+    if grad_scores.shape != topk_indices.shape or topk_indices.size(-1) > _MAX_TRITON_SUPPORT_TOPK:
+        return None
+    if q_index.dtype != selected_k_index.dtype or q_index.device != selected_k_index.device:
+        return None
+    topk = topk_indices.size(-1)
+    grad_q = torch.zeros_like(q_index, dtype=torch.float32)
+    grad_selected_k = torch.empty_like(selected_k_index, dtype=torch.float32)
+    grad_scores = grad_scores.contiguous()
+    block_d = max(16, _next_power_of_2(head_dim))
+    grid = lambda meta: (batch_size, query_len, triton.cdiv(topk, meta["BLOCK_K"]))
+    try:
+        _dsa_simplified_selected_scores_backward_qk_kernel[grid](
+            q_index,
+            selected_k_index,
+            topk_indices,
+            grad_scores,
+            grad_q,
+            grad_selected_k,
+            q_start,
+            query_len,
+            topk,
+            *q_index.stride(),
+            *selected_k_index.stride(),
+            *topk_indices.stride(),
+            *grad_scores.stride(),
+            *grad_q.stride(),
+            *grad_selected_k.stride(),
+            SCORE_SCALE=float(score_scale),
+            HEAD_DIM=head_dim,
+            BLOCK_D=block_d,
+        )
+    except _TRITON_RESOURCE_ERRORS:
+        return None
+    return grad_q, grad_selected_k
 
 
 def triton_simplified_index_scores_block(

@@ -865,6 +865,10 @@ def validate_args(args, defaults={}):
     if getattr(args, 'dsa_indexer_mode', 'standard') == 'simplified':
         assert args.experimental_attention_variant == 'dsa', \
             '--dsa-indexer-mode simplified requires --experimental-attention-variant dsa'
+    elif getattr(args, 'dsa_simplified_use_learned_k', False):
+        raise AssertionError(
+            '--dsa-simplified-use-learned-k requires --dsa-indexer-mode simplified'
+        )
     if getattr(args, 'dsa_indexer_reset_method', 'random') != 'random':
         assert getattr(args, 'dsa_reset_indexer_on_load', False), \
             '--dsa-indexer-reset-method requires --dsa-reset-indexer-on-load'
@@ -1111,12 +1115,18 @@ def validate_args(args, defaults={}):
         assert getattr(args, 'dsa_indexer_n_heads', None) in (None, 1), (
             'simplified DSA requires --dsa-indexer-n-heads 1 when explicitly set'
         )
-        assert getattr(args, 'dsa_indexer_head_dim', None) in (None, args.kv_channels), (
-            'simplified DSA requires --dsa-indexer-head-dim to equal --kv-channels '
-            'when explicitly set'
-        )
+        if getattr(args, 'dsa_simplified_use_learned_k', False):
+            assert getattr(args, 'dsa_indexer_head_dim', None) is None or (
+                args.dsa_indexer_head_dim > 0
+            ), '--dsa-indexer-head-dim must be positive when explicitly set'
+        else:
+            assert getattr(args, 'dsa_indexer_head_dim', None) in (None, args.kv_channels), (
+                'simplified DSA using main-attention K requires --dsa-indexer-head-dim to '
+                'equal --kv-channels when explicitly set'
+            )
         args.dsa_indexer_n_heads = 1
-        args.dsa_indexer_head_dim = args.kv_channels
+        if args.dsa_indexer_head_dim is None:
+            args.dsa_indexer_head_dim = args.kv_channels
 
     if args.seq_length is not None and args.context_parallel_size > 1:
         assert args.seq_length % (args.context_parallel_size * 2) == 0, \
@@ -3086,8 +3096,17 @@ def _add_experimental_attention_variant_args(parser):
         default='standard',
         choices=['standard', 'simplified'],
         help=(
-            'DSA indexer formulation. simplified uses one Q index head, the main attention K, '
-            'and a plain scaled dot-product score.'
+            'DSA indexer formulation. simplified uses one Q index head and a plain scaled '
+            'dot-product score, with main-attention K unless '
+            '--dsa-simplified-use-learned-k is set.'
+        ),
+    )
+    _maybe_add_argument(
+        '--dsa-simplified-use-learned-k',
+        action='store_true',
+        help=(
+            'Use a separate learned K projection for simplified DSA instead of reusing the '
+            'main-attention K cache.'
         ),
     )
     _maybe_add_argument(
@@ -3202,7 +3221,8 @@ def _add_experimental_attention_variant_args(parser):
         help=(
             'Indexer reset method. main-q-mean uses the arithmetic mean of the loaded main-Q '
             'projection weights. main-q-mean-rescaled additionally restores the RMS '
-            'per-head Frobenius energy of those weights.'
+            'per-head Frobenius energy of those weights. For simplified learned-K, both '
+            'methods also initialize the indexer K from the loaded main-attention K.'
         ),
     )
     _maybe_add_argument(

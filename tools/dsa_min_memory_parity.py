@@ -512,15 +512,18 @@ def _indexer_from_case(case: Case, args, pg_collection):
 
 
 def _simplified_indexer_from_case(case: Case, args, pg_collection):
-    return type(
+    indexer = type(
         "_SimplifiedIndexer",
         (),
         {
             "linear_q": _WeightOnlyModule(case.linear_q_weight),
+            "linear_k": (
+                _WeightOnlyModule(case.linear_k_weight) if args.simplified_learned_k else None
+            ),
             "index_n_heads": 1,
-            "index_head_dim": args.head_dim,
+            "index_head_dim": args.indexer_head_dim,
             "index_topk": args.topk,
-            "softmax_scale": args.head_dim**-0.5,
+            "softmax_scale": args.indexer_head_dim**-0.5,
             "index_rotary_dim": args.indexer_rotary_dim,
             "rotary_pos_emb": (
                 _SimpleRotary(
@@ -537,11 +540,13 @@ def _simplified_indexer_from_case(case: Case, args, pg_collection):
                 (),
                 {
                     "dsa_indexer_mode": "simplified",
+                    "dsa_simplified_use_learned_k": args.simplified_learned_k,
                     "rotary_interleaved": args.rotary_interleaved,
                 },
             )(),
         },
     )()
+    return indexer
 
 
 def _apply_rope_oracle(
@@ -1587,13 +1592,15 @@ def _simplified_input_oracle(hidden_states: torch.Tensor, norm_spec) -> torch.Te
 def _simplified_q_index_oracle(case: Case, args, norm_spec) -> torch.Tensor:
     hidden = _simplified_input_oracle(case.hidden_states, norm_spec)
     q_index = F.linear(hidden, case.linear_q_weight).reshape(
-        args.seq_len, args.batch_size, 1, args.head_dim
+        args.seq_len, args.batch_size, 1, args.indexer_head_dim
     )
     rotary_dim = args.indexer_rotary_dim
     if rotary_dim == 0:
         return q_index
 
-    q_nope, q_pe = torch.split(q_index, [args.head_dim - rotary_dim, rotary_dim], dim=-1)
+    q_nope, q_pe = torch.split(
+        q_index, [args.indexer_head_dim - rotary_dim, rotary_dim], dim=-1
+    )
     positions = torch.arange(args.seq_len, device=q_index.device, dtype=torch.float32)
     inv_freq = 1.0 / (
         10000
@@ -1611,6 +1618,31 @@ def _simplified_q_index_oracle(case: Case, args, norm_spec) -> torch.Tensor:
     sin = torch.sin(freqs).to(q_pe.dtype)[:, None, None, :]
     q_pe = q_pe * cos + _rotate_half_oracle(q_pe, args.rotary_interleaved) * sin
     return torch.cat((q_nope, q_pe), dim=-1)
+
+
+def _simplified_k_index_oracle(case: Case, args, norm_spec) -> torch.Tensor:
+    if not args.simplified_learned_k:
+        return case.key.detach()
+    hidden = _simplified_input_oracle(case.hidden_states, norm_spec)
+    k_index = F.linear(hidden, case.linear_k_weight).reshape(
+        args.seq_len, args.batch_size, 1, args.indexer_head_dim
+    )
+    rotary = (
+        _SimpleRotary(
+            args.indexer_rotary_dim,
+            case.hidden_states.device,
+            args.rotary_interleaved,
+        )
+        if args.indexer_rotary_dim > 0
+        else None
+    )
+    return _apply_rope_oracle(
+        k_index,
+        args.indexer_head_dim,
+        args.indexer_rotary_dim,
+        rotary,
+        args.rotary_interleaved,
+    )
 
 
 def _simplified_scores_oracle(
@@ -1749,7 +1781,10 @@ def _simplified_reference_sparse_run(
         else args.head_dim**-0.5
     )
     q_index = _simplified_q_index_oracle(case, args, simplified_input_norm)
-    scores = _simplified_scores_oracle(q_index, case.key.detach(), args.head_dim**-0.5)
+    k_index = _simplified_k_index_oracle(case, args, simplified_input_norm)
+    scores = _simplified_scores_oracle(
+        q_index, k_index, args.indexer_head_dim**-0.5
+    )
     natural_topk_indices = scores.topk(min(args.topk, args.seq_len), dim=-1).indices
     topk_indices = natural_topk_indices if topk_override is None else topk_override
     output = _simplified_sparse_attention_oracle(
@@ -1768,10 +1803,12 @@ def _simplified_reference_sparse_run(
         args.loss_coeff,
         pg_collection,
     )
-    grads = torch.autograd.grad(
-        output.float().sum() + loss,
-        (case.query, case.key, case.value, case.linear_q_weight),
-    )
+    grad_inputs = [case.query, case.key, case.value, case.linear_q_weight]
+    grad_names = ["query", "key", "value", "linear_q_weight"]
+    if args.simplified_learned_k:
+        grad_inputs.append(case.linear_k_weight)
+        grad_names.append("linear_k_weight")
+    grads = torch.autograd.grad(output.float().sum() + loss, tuple(grad_inputs))
     return {
         "q_index": q_index.detach(),
         "scores": scores.detach(),
@@ -1779,12 +1816,7 @@ def _simplified_reference_sparse_run(
         "topk_indices": topk_indices.detach(),
         "output": output.detach(),
         "loss": loss.detach(),
-        "grads": {
-            "query": grads[0].detach(),
-            "key": grads[1].detach(),
-            "value": grads[2].detach(),
-            "linear_q_weight": grads[3].detach(),
-        },
+        "grads": {name: grad.detach() for name, grad in zip(grad_names, grads)},
     }
 
 
@@ -1809,24 +1841,21 @@ def _simplified_min_sparse_run(
         query_chunk_size=args.query_block_size,
         key_chunk_size=args.key_block_size,
         cache_routing=args.cache_routing,
-        cache_indexer_k=False,
+        cache_indexer_k=args.cache_indexer_k,
         cache_selected_scores=args.cache_selected_scores,
         use_triton=use_triton,
         simplified_input_norm=simplified_input_norm,
     )
-    grads = torch.autograd.grad(
-        output.float().sum() + loss,
-        (case.query, case.key, case.value, case.linear_q_weight),
-    )
+    grad_inputs = [case.query, case.key, case.value, case.linear_q_weight]
+    grad_names = ["query", "key", "value", "linear_q_weight"]
+    if args.simplified_learned_k:
+        grad_inputs.append(case.linear_k_weight)
+        grad_names.append("linear_k_weight")
+    grads = torch.autograd.grad(output.float().sum() + loss, tuple(grad_inputs))
     return {
         "output": output.detach(),
         "loss": loss.detach(),
-        "grads": {
-            "query": grads[0].detach(),
-            "key": grads[1].detach(),
-            "value": grads[2].detach(),
-            "linear_q_weight": grads[3].detach(),
-        },
+        "grads": {name: grad.detach() for name, grad in zip(grad_names, grads)},
     }
 
 
@@ -1839,7 +1868,10 @@ def _simplified_dense_runs(
         else args.head_dim**-0.5
     )
     q_index = _simplified_q_index_oracle(case, args, simplified_input_norm)
-    scores = _simplified_scores_oracle(q_index, case.key.detach(), args.head_dim**-0.5)
+    k_index = _simplified_k_index_oracle(case, args, simplified_input_norm)
+    scores = _simplified_scores_oracle(
+        q_index, k_index, args.indexer_head_dim**-0.5
+    )
     reference_loss = _simplified_dense_kl_oracle(
         scores,
         case.query.detach(),
@@ -1848,7 +1880,15 @@ def _simplified_dense_runs(
         args.loss_coeff,
         pg_collection,
     )
-    reference_grad = torch.autograd.grad(reference_loss, case.linear_q_weight)[0]
+    reference_params = [case.linear_q_weight]
+    grad_names = ["linear_q_weight"]
+    if args.simplified_learned_k:
+        reference_params.append(case.linear_k_weight)
+        grad_names.append("linear_k_weight")
+    reference_grad_values = torch.autograd.grad(reference_loss, tuple(reference_params))
+    reference_grads = {
+        name: grad.detach() for name, grad in zip(grad_names, reference_grad_values)
+    }
 
     min_case = _clone_case(case)
     indexer = _simplified_indexer_from_case(min_case, args, pg_collection)
@@ -1865,8 +1905,12 @@ def _simplified_dense_runs(
         use_triton=use_triton,
         simplified_input_norm=simplified_input_norm,
     )
-    min_grad = torch.autograd.grad(min_loss, min_case.linear_q_weight)[0]
-    return reference_loss.detach(), reference_grad.detach(), min_loss.detach(), min_grad.detach()
+    min_params = [min_case.linear_q_weight]
+    if args.simplified_learned_k:
+        min_params.append(min_case.linear_k_weight)
+    min_grad_values = torch.autograd.grad(min_loss, tuple(min_params))
+    min_grads = {name: grad.detach() for name, grad in zip(grad_names, min_grad_values)}
+    return reference_loss.detach(), reference_grads, min_loss.detach(), min_grads
 
 
 def _simplified_sparse_fwd_dense_loss_runs(
@@ -1884,8 +1928,9 @@ def _simplified_sparse_fwd_dense_loss_runs(
     )
     reference_case = _clone_case(case)
     q_index = _simplified_q_index_oracle(reference_case, args, simplified_input_norm)
+    k_index = _simplified_k_index_oracle(reference_case, args, simplified_input_norm)
     scores = _simplified_scores_oracle(
-        q_index, reference_case.key.detach(), args.head_dim**-0.5
+        q_index, k_index, args.indexer_head_dim**-0.5
     )
     reference_output = _simplified_sparse_attention_oracle(
         reference_case.query,
@@ -1902,14 +1947,19 @@ def _simplified_sparse_fwd_dense_loss_runs(
         args.loss_coeff,
         pg_collection,
     )
+    reference_inputs = [
+        reference_case.query,
+        reference_case.key,
+        reference_case.value,
+        reference_case.linear_q_weight,
+    ]
+    names = ["query", "key", "value", "linear_q_weight"]
+    if args.simplified_learned_k:
+        reference_inputs.append(reference_case.linear_k_weight)
+        names.append("linear_k_weight")
     reference_grads = torch.autograd.grad(
         reference_output.float().sum() + reference_loss,
-        (
-            reference_case.query,
-            reference_case.key,
-            reference_case.value,
-            reference_case.linear_q_weight,
-        ),
+        tuple(reference_inputs),
     )
 
     min_case = _clone_case(case)
@@ -1926,7 +1976,7 @@ def _simplified_sparse_fwd_dense_loss_runs(
         query_chunk_size=args.query_block_size,
         key_chunk_size=args.key_block_size,
         cache_routing=args.cache_routing,
-        cache_indexer_k=False,
+        cache_indexer_k=args.cache_indexer_k,
         cache_selected_scores=False,
         use_triton=use_triton,
         simplified_input_norm=simplified_input_norm,
@@ -1944,11 +1994,18 @@ def _simplified_sparse_fwd_dense_loss_runs(
         use_triton=use_triton,
         simplified_input_norm=simplified_input_norm,
     )
+    min_inputs = [
+        min_case.query,
+        min_case.key,
+        min_case.value,
+        min_case.linear_q_weight,
+    ]
+    if args.simplified_learned_k:
+        min_inputs.append(min_case.linear_k_weight)
     min_grads = torch.autograd.grad(
         min_output.float().sum() + min_loss,
-        (min_case.query, min_case.key, min_case.value, min_case.linear_q_weight),
+        tuple(min_inputs),
     )
-    names = ("query", "key", "value", "linear_q_weight")
     return {
         "reference_output": reference_output.detach(),
         "reference_loss": reference_loss.detach(),
@@ -1965,13 +2022,16 @@ def _simplified_sparse_fwd_dense_loss_runs(
 def _run_simplified_parity(args, device: torch.device, dtype: torch.dtype) -> int:
     if args.num_query_groups != 1:
         raise SystemExit("Simplified DSA parity requires --num-query-groups 1.")
-    if args.indexer_heads != 1 or args.indexer_head_dim != args.head_dim:
+    if args.indexer_heads != 1:
+        raise SystemExit("Simplified DSA parity requires --indexer-heads 1.")
+    if not args.simplified_learned_k and args.indexer_head_dim != args.head_dim:
         raise SystemExit(
-            "Simplified DSA parity requires --indexer-heads 1 and "
-            "--indexer-head-dim equal to --head-dim."
+            "Main-K simplified DSA requires --indexer-head-dim equal to --head-dim."
         )
-    if args.hadamard or args.cache_indexer_k:
-        raise SystemExit("Simplified DSA does not use Hadamard or a separate indexer-K cache.")
+    if args.hadamard:
+        raise SystemExit("Simplified DSA does not use Hadamard.")
+    if args.cache_indexer_k and not args.simplified_learned_k:
+        raise SystemExit("Only learned-K simplified DSA has a separate indexer-K cache.")
 
     use_triton = args.backend == "triton-min-memory"
     device, rank, world_size, pg_collection = _configure_distributed_for_dense_mode(
@@ -1982,7 +2042,8 @@ def _run_simplified_parity(args, device: torch.device, dtype: torch.dtype) -> in
     print(
         f"Simplified DSA parity backend={args.backend} rank={rank}/{world_size} "
         f"device={device} dtype={dtype} local_Hq={args.num_query_heads} G=1 "
-        f"S={args.seq_len} topk={args.topk} D={args.head_dim} "
+        f"S={args.seq_len} topk={args.topk} Dattn={args.head_dim} "
+        f"Dindex={args.indexer_head_dim} learned_k={args.simplified_learned_k} "
         f"QBLOCK={args.query_block_size} KBLOCK={args.key_block_size} "
         f"rotary_dim={args.indexer_rotary_dim} "
         f"input_norm={args.simplified_input_norm} "
@@ -2039,14 +2100,17 @@ def _run_simplified_parity(args, device: torch.device, dtype: torch.dtype) -> in
                 q_end,
                 component_case.linear_q_weight,
                 args.topk,
-                args.head_dim,
+                args.indexer_head_dim,
                 args.indexer_rotary_dim,
                 component_rotary,
                 args.rotary_interleaved,
                 args.indexer_rotary_dim > 0,
-                args.head_dim**-0.5,
-                args.key_block_size,
+                args.indexer_head_dim**-0.5,
+                args.key_block_size if use_triton else args.seq_len,
                 simplified_input_norm,
+                linear_k_weight=(
+                    component_case.linear_k_weight if args.simplified_learned_k else None
+                ),
             )
             if topk_indices.size(-1) < min(args.topk, args.seq_len):
                 assert q_end < args.seq_len
@@ -2097,10 +2161,11 @@ def _run_simplified_parity(args, device: torch.device, dtype: torch.dtype) -> in
             use_indexer_rope=args.indexer_rotary_dim > 0,
             query_chunk_size=args.query_block_size,
             key_chunk_size=args.key_block_size,
+            cache_indexer_k=args.cache_indexer_k,
             use_triton=use_triton,
             simplified_input_norm=simplified_input_norm,
         )
-    ref_dense_loss, ref_dense_grad, min_dense_loss, min_dense_grad = (
+    ref_dense_loss, ref_dense_grads, min_dense_loss, min_dense_grads = (
         _simplified_dense_runs(
             _clone_case(base), args, pg_collection, use_triton, simplified_input_norm
         )
@@ -2183,14 +2248,15 @@ def _run_simplified_parity(args, device: torch.device, dtype: torch.dtype) -> in
         rtol,
         args.fail_fast,
     )
-    failures += not _check_tensor(
-        "simplified_dense_grad_linear_q_weight",
-        min_dense_grad,
-        ref_dense_grad,
-        atol,
-        rtol,
-        args.fail_fast,
-    )
+    for name, expected in ref_dense_grads.items():
+        failures += not _check_tensor(
+            f"simplified_dense_grad_{name}",
+            min_dense_grads[name],
+            expected,
+            atol,
+            rtol,
+            args.fail_fast,
+        )
     failures += not _check_tensor(
         "simplified_sparse_dense_output",
         sparse_dense["min_output"],
@@ -2233,7 +2299,10 @@ def _run_simplified_parity(args, device: torch.device, dtype: torch.dtype) -> in
                 min_memory["grads"]["linear_q_weight"],
             ),
             ("simplified_tp_replicated_dense_loss", min_dense_loss),
-            ("simplified_tp_replicated_dense_q_wgrad", min_dense_grad),
+            (
+                "simplified_tp_replicated_dense_q_wgrad",
+                min_dense_grads["linear_q_weight"],
+            ),
         ):
             gathered = [torch.empty_like(tensor) for _ in range(world_size)]
             torch.distributed.all_gather(gathered, tensor.contiguous())
@@ -2246,6 +2315,28 @@ def _run_simplified_parity(args, device: torch.device, dtype: torch.dtype) -> in
                     rtol,
                     args.fail_fast,
                 )
+        if args.simplified_learned_k:
+            for name, tensor in (
+                (
+                    "simplified_tp_replicated_sparse_k_wgrad",
+                    min_memory["grads"]["linear_k_weight"],
+                ),
+                (
+                    "simplified_tp_replicated_dense_k_wgrad",
+                    min_dense_grads["linear_k_weight"],
+                ),
+            ):
+                gathered = [torch.empty_like(tensor) for _ in range(world_size)]
+                torch.distributed.all_gather(gathered, tensor.contiguous())
+                for peer_rank, peer_tensor in enumerate(gathered[1:], start=1):
+                    failures += not _check_tensor(
+                        f"{name}_rank{peer_rank}",
+                        peer_tensor,
+                        gathered[0],
+                        atol,
+                        rtol,
+                        args.fail_fast,
+                    )
 
     if torch.distributed.is_available() and torch.distributed.is_initialized():
         fail_tensor = torch.tensor([failures], device=device, dtype=torch.int32)
@@ -2465,6 +2556,11 @@ def _parse_args():
     parser.add_argument("--topk", type=int, default=32)
     parser.add_argument("--indexer-rotary-dim", type=int, default=0)
     parser.add_argument("--rotary-interleaved", action="store_true")
+    parser.add_argument(
+        "--simplified-learned-k",
+        action="store_true",
+        help="Use a separate learned simplified-DSA K projection in simplified mode.",
+    )
     parser.add_argument(
         "--simplified-input-norm",
         choices=("none", "rmsnorm", "layernorm"),
