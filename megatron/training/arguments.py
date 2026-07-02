@@ -835,6 +835,58 @@ def validate_args(args, defaults={}):
         assert not getattr(args, 'dsa_train_indexer_only', False), \
             '--dsa-train-indexer-only is not compatible with --overlap-param-gather'
 
+    if getattr(args, 'dsa_fwd_skip_dsa', False):
+        assert args.experimental_attention_variant == 'dsa', \
+            '--dsa-fwd-skip-dsa requires --experimental-attention-variant dsa'
+        assert not getattr(args, 'dsa_train_indexer_only', False), \
+            '--dsa-fwd-skip-dsa is incompatible with --dsa-train-indexer-only'
+
+    if getattr(args, 'dsa_separate_indexer_grad_clip', False):
+        assert args.experimental_attention_variant == 'dsa', \
+            '--dsa-separate-indexer-grad-clip requires --experimental-attention-variant dsa'
+    if getattr(args, 'dsa_indexer_clip_grad', None) is not None:
+        assert args.dsa_indexer_clip_grad >= 0.0, \
+            '--dsa-indexer-clip-grad must be non-negative'
+        assert getattr(args, 'dsa_separate_indexer_grad_clip', False), \
+            '--dsa-indexer-clip-grad requires --dsa-separate-indexer-grad-clip'
+
+    if getattr(args, 'dsa_reset_indexer_on_load', False):
+        assert args.experimental_attention_variant == 'dsa', \
+            '--dsa-reset-indexer-on-load requires --experimental-attention-variant dsa'
+        assert args.load is not None or args.pretrained_checkpoint is not None, \
+            '--dsa-reset-indexer-on-load requires --load or --pretrained-checkpoint'
+        assert not getattr(args, 'use_precision_aware_optimizer', False), \
+            '--dsa-reset-indexer-on-load does not support --use-precision-aware-optimizer'
+        assert not getattr(args, 'use_torch_fsdp2', False) and not getattr(
+            args, 'use_megatron_fsdp', False
+        ), '--dsa-reset-indexer-on-load currently supports DDP/distributed-optimizer models only'
+        assert not getattr(args, 'dsa_fwd_skip_dsa', False), \
+            '--dsa-fwd-skip-dsa must be disabled when resetting the indexer for activation'
+    if getattr(args, 'dsa_indexer_mode', 'standard') == 'simplified':
+        assert args.experimental_attention_variant == 'dsa', \
+            '--dsa-indexer-mode simplified requires --experimental-attention-variant dsa'
+    elif getattr(args, 'dsa_simplified_use_learned_k', False):
+        raise AssertionError(
+            '--dsa-simplified-use-learned-k requires --dsa-indexer-mode simplified'
+        )
+    if getattr(args, 'dsa_indexer_reset_method', 'random') != 'random':
+        assert getattr(args, 'dsa_reset_indexer_on_load', False), \
+            '--dsa-indexer-reset-method requires --dsa-reset-indexer-on-load'
+        assert getattr(args, 'dsa_indexer_mode', 'standard') == 'simplified', \
+            '--dsa-indexer-reset-method main-Q methods require simplified DSA'
+        assert getattr(args, 'dsa_indexer_reset_seed', None) is None, \
+            '--dsa-indexer-reset-seed is only used by random indexer reset'
+
+    if getattr(args, 'dsa_indexer_reset_seed', None) is not None:
+        assert args.dsa_indexer_reset_seed >= 0, '--dsa-indexer-reset-seed must be non-negative'
+    if getattr(args, 'dsa_indexer_activation_start_samples', None) is not None:
+        assert args.dsa_indexer_activation_start_samples >= 0, (
+            '--dsa-indexer-activation-start-samples must be non-negative'
+        )
+    assert getattr(args, 'dsa_indexer_activation_warmup_samples', 0) >= 0, (
+        '--dsa-indexer-activation-warmup-samples must be non-negative'
+    )
+
     if args.use_torch_fsdp2:
         assert is_torch_min_version("2.4.0"), \
             'FSDP2 requires PyTorch >= 2.4.0 with FSDP 2 support.'
@@ -1058,6 +1110,23 @@ def validate_args(args, defaults={}):
     if args.kv_channels is None:
         assert args.hidden_size % args.num_attention_heads == 0
         args.kv_channels = args.hidden_size // args.num_attention_heads
+
+    if getattr(args, 'dsa_indexer_mode', 'standard') == 'simplified':
+        assert getattr(args, 'dsa_indexer_n_heads', None) in (None, 1), (
+            'simplified DSA requires --dsa-indexer-n-heads 1 when explicitly set'
+        )
+        if getattr(args, 'dsa_simplified_use_learned_k', False):
+            assert getattr(args, 'dsa_indexer_head_dim', None) is None or (
+                args.dsa_indexer_head_dim > 0
+            ), '--dsa-indexer-head-dim must be positive when explicitly set'
+        else:
+            assert getattr(args, 'dsa_indexer_head_dim', None) in (None, args.kv_channels), (
+                'simplified DSA using main-attention K requires --dsa-indexer-head-dim to '
+                'equal --kv-channels when explicitly set'
+            )
+        args.dsa_indexer_n_heads = 1
+        if args.dsa_indexer_head_dim is None:
+            args.dsa_indexer_head_dim = args.kv_channels
 
     if args.seq_length is not None and args.context_parallel_size > 1:
         assert args.seq_length % (args.context_parallel_size * 2) == 0, \
@@ -1902,6 +1971,9 @@ def _add_network_size_args(parser):
         "rope_type",
         "rotary_base",
         "rotary_percent",
+        "rotary_seq_len_interpolation_factor",
+        "use_rope_scaling",
+        "rope_scaling_factor",
         # args uses same var with a different name
         "num_moe_experts",
         "fp8_param",
@@ -2120,6 +2192,12 @@ def _add_regularization_args(parser):
                        help='Apply weight decay to qk layernorm as a special case.')
     group.add_argument('--clip-grad', type=float, default=1.0,
                        help='Gradient clipping based on global L2 norm.')
+    group.add_argument('--dsa-separate-indexer-grad-clip', action='store_true',
+                       help='Clip DSA indexer gradients and non-indexer gradients using '
+                       'separate L2 norms. The non-indexer threshold is --clip-grad.')
+    group.add_argument('--dsa-indexer-clip-grad', type=float, default=None,
+                       help='DSA indexer gradient clipping threshold when '
+                       '--dsa-separate-indexer-grad-clip is set. Defaults to --clip-grad.')
     group.add_argument('--adam-beta1', type=float, default=0.9,
                        help='First coefficient for computing running averages '
                        'of gradient and its square')
@@ -3013,6 +3091,25 @@ def _add_experimental_attention_variant_args(parser):
         help='Select an experimental attention variant.',
     )
     _maybe_add_argument(
+        '--dsa-indexer-mode',
+        type=str,
+        default='standard',
+        choices=['standard', 'simplified'],
+        help=(
+            'DSA indexer formulation. simplified uses one Q index head and a plain scaled '
+            'dot-product score, with main-attention K unless '
+            '--dsa-simplified-use-learned-k is set.'
+        ),
+    )
+    _maybe_add_argument(
+        '--dsa-simplified-use-learned-k',
+        action='store_true',
+        help=(
+            'Use a separate learned K projection for simplified DSA instead of reusing the '
+            'main-attention K cache.'
+        ),
+    )
+    _maybe_add_argument(
         '--dsa-indexer-n-heads',
         type=int,
         default=None,
@@ -3096,12 +3193,55 @@ def _add_experimental_attention_variant_args(parser):
         ),
     )
     _maybe_add_argument(
+        '--dsa-fwd-skip-dsa',
+        action='store_true',
+        help=(
+            'Use dense GQA attention forward and skip DSA routing, top-k, sparse attention, '
+            'and indexer KL loss. Intended for DSA-from-scratch checkpoints before activation.'
+        ),
+    )
+    _maybe_add_argument(
         '--dsa-train-indexer-only',
         action='store_true',
         help=(
             'Freeze non-indexer parameters and train only DSA indexer parameters. '
             'Intended for DSA indexer warmup from a dense GQA checkpoint.'
         ),
+    )
+    _maybe_add_argument(
+        '--dsa-reset-indexer-on-load',
+        action='store_true',
+        help='Reset DSA indexer parameters and clear their optimizer state after checkpoint load.',
+    )
+    _maybe_add_argument(
+        '--dsa-indexer-reset-method',
+        type=str,
+        default='random',
+        choices=['random', 'main-q-mean', 'main-q-mean-rescaled'],
+        help=(
+            'Indexer reset method. main-q-mean uses the arithmetic mean of the loaded main-Q '
+            'projection weights. main-q-mean-rescaled additionally restores the RMS '
+            'per-head Frobenius energy of those weights. For simplified learned-K, both '
+            'methods also initialize the indexer K from the loaded main-attention K.'
+        ),
+    )
+    _maybe_add_argument(
+        '--dsa-indexer-reset-seed',
+        type=int,
+        default=None,
+        help='Optional deterministic seed for --dsa-reset-indexer-on-load.',
+    )
+    _maybe_add_argument(
+        '--dsa-indexer-activation-start-samples',
+        type=int,
+        default=None,
+        help='Sample position where DSA indexer activation/warmup starts.',
+    )
+    _maybe_add_argument(
+        '--dsa-indexer-activation-warmup-samples',
+        type=int,
+        default=0,
+        help='Sample count over which only DSA indexer optimizer groups warm up after activation.',
     )
     _maybe_add_argument(
         '--dsa-indexer-topk-key-chunk-size',

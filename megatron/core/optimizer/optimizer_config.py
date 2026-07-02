@@ -331,6 +331,12 @@ class OptimizerConfig:
     clip_grad: float = 1.0
     """Gradient clipping based on global L2 norm."""
 
+    dsa_separate_indexer_grad_clip: bool = False
+    """If true, clip DSA indexer and non-indexer gradients with separate L2 norms."""
+
+    dsa_indexer_clip_grad: Optional[float] = None
+    """DSA indexer gradient clipping threshold when using separate indexer clipping."""
+
     log_num_zeros_in_grad: bool = False
     """If true, calculate and log the number of zeros in gradient."""
 

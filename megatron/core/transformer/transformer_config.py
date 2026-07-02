@@ -208,6 +208,15 @@ class TransformerConfig(ModelParallelConfig):
     """True is rotate pairs of even and odd dimensions (RoFormer style), False is rotate pairs of
     first half and second half (LLaMa style). Default to False."""
 
+    rotary_seq_len_interpolation_factor: Optional[float] = None
+    """Sequence-length interpolation factor used by the model and DSA indexer RoPE."""
+
+    use_rope_scaling: bool = False
+    """Whether to use Llama-style RoPE frequency scaling."""
+
+    rope_scaling_factor: float = 8.0
+    """Scaling factor used when ``use_rope_scaling`` is enabled."""
+
     window_size: Optional[Tuple[int, int]] = None
     """If not None, then will use sliding window attention. The size of the window is specified by
     the numbers inside the tuple; -1 is special value meaning "infinite window size"."""
@@ -277,6 +286,12 @@ class TransformerConfig(ModelParallelConfig):
     ####################
     # DSA
     ####################
+    dsa_indexer_mode: Literal['standard', 'simplified'] = 'standard'
+    """DSA indexer formulation. Simplified uses one Q head and a plain Q/K dot product."""
+
+    dsa_simplified_use_learned_k: bool = False
+    """Whether simplified DSA uses a learned indexer K instead of main-attention K."""
+
     dsa_indexer_n_heads: Optional[int] = None
     """Number of DSA indexer heads."""
 
@@ -313,8 +328,28 @@ class TransformerConfig(ModelParallelConfig):
     dsa_fwd_use_dense_attn: bool = False
     """Whether DSA min-memory backends use dense GQA attention forward for indexer warmup."""
 
+    dsa_fwd_skip_dsa: bool = False
+    """Whether DSA forward skips all DSA routing/loss and uses dense GQA forward."""
+
     dsa_train_indexer_only: bool = False
     """Whether to freeze non-indexer parameters and train only DSA indexer parameters."""
+
+    dsa_reset_indexer_on_load: bool = False
+    """Whether to reset DSA indexer parameters and optimizer state after checkpoint load."""
+
+    dsa_indexer_reset_method: Literal[
+        'random', 'main-q-mean', 'main-q-mean-rescaled'
+    ] = 'random'
+    """How to initialize DSA indexer parameters when resetting after checkpoint load."""
+
+    dsa_indexer_reset_seed: Optional[int] = None
+    """Optional seed used when resetting DSA indexer parameters after checkpoint load."""
+
+    dsa_indexer_activation_start_samples: Optional[int] = None
+    """Sample position where DSA indexer activation/warmup starts."""
+
+    dsa_indexer_activation_warmup_samples: int = 0
+    """Number of samples over which to warm up only DSA indexer optimizer groups."""
 
     dsa_indexer_topk_key_chunk_size: Optional[int] = None
     """Optional key chunk size for exact streamed DSA top-k routing. If unset, use dense routing."""
@@ -2205,15 +2240,102 @@ class TransformerConfig(ModelParallelConfig):
             not self.dsa_fwd_use_dense_attn or self.experimental_attention_variant == "dsa"
         ), "dsa_fwd_use_dense_attn requires experimental_attention_variant='dsa'."
         assert (
+            self.dsa_indexer_mode == "standard"
+            or self.experimental_attention_variant == "dsa"
+        ), "dsa_indexer_mode='simplified' requires experimental_attention_variant='dsa'."
+        assert not self.dsa_simplified_use_learned_k or (
+            self.experimental_attention_variant == "dsa"
+            and self.dsa_indexer_mode == "simplified"
+        ), (
+            "dsa_simplified_use_learned_k requires experimental_attention_variant='dsa' "
+            "and dsa_indexer_mode='simplified'."
+        )
+        assert (
+            not self.dsa_fwd_skip_dsa or self.experimental_attention_variant == "dsa"
+        ), "dsa_fwd_skip_dsa requires experimental_attention_variant='dsa'."
+        assert (
+            not self.dsa_reset_indexer_on_load or self.experimental_attention_variant == "dsa"
+        ), "dsa_reset_indexer_on_load requires experimental_attention_variant='dsa'."
+        assert (
             not self.dsa_train_indexer_only or self.experimental_attention_variant == "dsa"
         ), "dsa_train_indexer_only requires experimental_attention_variant='dsa'."
+        assert not (self.dsa_fwd_skip_dsa and self.dsa_train_indexer_only), (
+            "dsa_fwd_skip_dsa is incompatible with dsa_train_indexer_only."
+        )
+        assert not (self.dsa_fwd_skip_dsa and self.dsa_reset_indexer_on_load), (
+            "dsa_fwd_skip_dsa must be disabled when resetting the indexer for activation."
+        )
+        assert (
+            self.dsa_indexer_reset_seed is None or self.dsa_indexer_reset_seed >= 0
+        ), "dsa_indexer_reset_seed must be non-negative when set."
+        assert (
+            self.dsa_indexer_activation_start_samples is None
+            or self.dsa_indexer_activation_start_samples >= 0
+        ), "dsa_indexer_activation_start_samples must be non-negative when set."
+        assert self.dsa_indexer_activation_warmup_samples >= 0, (
+            "dsa_indexer_activation_warmup_samples must be non-negative."
+        )
 
         if self.experimental_attention_variant == "dsa":
-            assert self.dsa_indexer_n_heads is not None and self.dsa_indexer_n_heads > 0, (
-                "dsa_indexer_n_heads must be set to a positive integer when using DSA."
+            assert self.dsa_indexer_mode in ('standard', 'simplified'), (
+                "dsa_indexer_mode must be 'standard' or 'simplified'."
             )
-            assert self.dsa_indexer_head_dim is not None and self.dsa_indexer_head_dim > 0, (
-                "dsa_indexer_head_dim must be set to a positive integer when using DSA."
+            simplified_indexer = self.dsa_indexer_mode == 'simplified'
+            if simplified_indexer:
+                assert self.num_query_groups == 1, (
+                    "The initial simplified DSA implementation requires num_query_groups == 1."
+                )
+                assert self.dsa_indexer_n_heads in (None, 1), (
+                    "Simplified DSA derives one indexer Q head from the single KV group; "
+                    "leave dsa_indexer_n_heads unset or set it to 1."
+                )
+                if self.dsa_simplified_use_learned_k:
+                    assert self.dsa_indexer_head_dim is None or self.dsa_indexer_head_dim > 0, (
+                        "Simplified DSA with a learned K requires a positive "
+                        "dsa_indexer_head_dim when explicitly set."
+                    )
+                else:
+                    assert self.dsa_indexer_head_dim in (None, self.kv_channels), (
+                        "Simplified DSA using main-attention K requires the indexer head "
+                        "dimension to equal the main attention head dimension; leave "
+                        "dsa_indexer_head_dim unset or set it equal to kv_channels."
+                    )
+                self.dsa_indexer_n_heads = 1
+                if self.dsa_indexer_head_dim is None:
+                    self.dsa_indexer_head_dim = self.kv_channels
+                assert not self.dsa_indexer_use_hadamard, (
+                    "Simplified DSA uses a plain Q/K dot product and does not support Hadamard."
+                )
+                assert self.dsa_simplified_use_learned_k or not self.dsa_kernel_cache_indexer_k, (
+                    "Simplified DSA using main-attention K has no separate indexer K cache."
+                )
+                main_q_reset = self.dsa_indexer_reset_method in (
+                    'main-q-mean',
+                    'main-q-mean-rescaled',
+                )
+                assert not (
+                    main_q_reset and self.dsa_indexer_head_dim != self.kv_channels
+                ), (
+                    "Main-Q initialization requires dsa_indexer_head_dim == kv_channels."
+                )
+                assert not (main_q_reset and self.qk_layernorm), (
+                    "Main-Q initialization is not defined when qk_layernorm is enabled."
+                )
+                assert not (main_q_reset and self.dsa_indexer_reset_seed is not None), (
+                    "dsa_indexer_reset_seed is only used by random indexer reset."
+                )
+            else:
+                assert self.dsa_indexer_n_heads is not None and self.dsa_indexer_n_heads > 0, (
+                    "dsa_indexer_n_heads must be set to a positive integer when using DSA."
+                )
+                assert self.dsa_indexer_head_dim is not None and self.dsa_indexer_head_dim > 0, (
+                    "dsa_indexer_head_dim must be set to a positive integer when using DSA."
+                )
+                assert self.dsa_indexer_reset_method == 'random', (
+                    "Main-Q reset methods are only supported by simplified DSA."
+                )
+            assert self.dsa_reset_indexer_on_load or self.dsa_indexer_reset_method == 'random', (
+                "A non-random dsa_indexer_reset_method requires dsa_reset_indexer_on_load."
             )
             assert self.dsa_indexer_topk is not None and self.dsa_indexer_topk > 0, (
                 "dsa_indexer_topk must be set to a positive integer when using DSA."
@@ -2229,9 +2351,11 @@ class TransformerConfig(ModelParallelConfig):
                 'triton-min-memory',
                 'torch-min-memory',
             )
+            skip_dsa = self.dsa_fwd_skip_dsa
             dense_dsa_warmup = self.dsa_fwd_use_dense_attn
             sparse_fwd_dense_loss = (
                 min_memory_dsa_backend
+                and not skip_dsa
                 and not dense_dsa_warmup
                 and not self.dsa_indexer_use_sparse_loss
             )
@@ -2344,7 +2468,9 @@ class TransformerConfig(ModelParallelConfig):
                     "min-memory dsa_kernel_backend bypasses the reference gather backend; "
                     "leave dsa_sparse_attention_use_gather for legacy/reference paths."
                 )
-                if dense_dsa_warmup:
+                if skip_dsa:
+                    pass
+                elif dense_dsa_warmup:
                     assert not self.dsa_indexer_use_sparse_loss, (
                         "dsa_fwd_use_dense_attn uses dense indexer loss; do not set "
                         "dsa_indexer_use_sparse_loss."
@@ -2373,9 +2499,9 @@ class TransformerConfig(ModelParallelConfig):
                             "Sparse-forward dense-loss mode has no selected scores; do not set "
                             "dsa_kernel_cache_selected_scores."
                         )
-                assert self.dsa_indexer_use_hadamard, (
+                assert skip_dsa or simplified_indexer or self.dsa_indexer_use_hadamard, (
                     "min-memory dsa_kernel_backend requires "
-                    "dsa_indexer_use_hadamard to match the DeepSeek indexer."
+                    "dsa_indexer_use_hadamard for the standard DeepSeek indexer."
                 )
 
         if self.inference_fuse_tp_communication:
