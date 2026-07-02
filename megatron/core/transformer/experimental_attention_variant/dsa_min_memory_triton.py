@@ -530,6 +530,26 @@ def _dsa_selected_k_linear_kernel(
     rem = rows - batch_idx * rows_per_batch
     query_idx = rem // topk
     support_idx = rem - query_idx * topk
+    batch_idx_hidden = tl.broadcast_to(
+        tl.expand_dims(batch_idx, 1), (BLOCK_N, BLOCK_H)
+    )
+    row_mask_hidden = tl.broadcast_to(
+        tl.expand_dims(row_mask, 1), (BLOCK_N, BLOCK_H)
+    )
+    offs_d_weight = tl.broadcast_to(
+        tl.expand_dims(offs_d, 0), (BLOCK_H, BLOCK_D)
+    )
+    batch_idx_feature = tl.broadcast_to(
+        tl.expand_dims(batch_idx, 1), (BLOCK_N, BLOCK_D)
+    )
+    row_mask_feature = tl.broadcast_to(
+        tl.expand_dims(row_mask, 1), (BLOCK_N, BLOCK_D)
+    )
+    offs_d_feature = tl.broadcast_to(
+        tl.expand_dims(offs_d, 0), (BLOCK_N, BLOCK_D)
+    )
+    feature_mask = offs_d < out_features
+    feature_mask_block = offs_d_feature < out_features
     selected = tl.load(
         topk_indices_ptr
         + batch_idx * ti_stride_b
@@ -684,16 +704,17 @@ def _dsa_selected_k_project_score_kernel(
         hidden = tl.load(
             hidden_ptr
             + selected[:, None] * hidden_stride_s
-            + batch_idx[:, None] * hidden_stride_b
+            + batch_idx_hidden * hidden_stride_b
             + hidden_offsets[None, :] * hidden_stride_h,
-            mask=row_mask[:, None] & (hidden_offsets[None, :] < hidden_size),
+            mask=row_mask_hidden & (hidden_offsets[None, :] < hidden_size),
             other=0.0,
         )
         linear_k_weight = tl.load(
             linear_k_weight_ptr
-            + offs_d[None, :] * lkw_stride_o
+            + offs_d_weight * lkw_stride_o
             + hidden_offsets[:, None] * lkw_stride_i,
-            mask=(hidden_offsets[:, None] < hidden_size) & (offs_d[None, :] < out_features),
+            mask=(hidden_offsets[:, None] < hidden_size)
+            & (offs_d_weight < out_features),
             other=0.0,
         )
         if USE_BF16_OPERANDS:
@@ -712,21 +733,20 @@ def _dsa_selected_k_project_score_kernel(
     elif USE_FP16_OPERANDS:
         k_linear = k_linear.to(tl.float16).to(tl.float32)
 
-    feature_mask = offs_d < out_features
     if STORE_K_LINEAR:
         tl.store(
             out_k_linear_ptr
-            + batch_idx[:, None] * okl_stride_b
+            + batch_idx_feature * okl_stride_b
             + query_idx[:, None] * okl_stride_m
             + support_idx[:, None] * okl_stride_k
-            + offs_d[None, :] * okl_stride_d,
+            + offs_d_feature * okl_stride_d,
             k_linear,
-            mask=row_mask[:, None] & feature_mask[None, :],
+            mask=row_mask_feature & feature_mask_block,
         )
 
     inv_features = 1.0 / out_features
-    mean = tl.sum(tl.where(feature_mask[None, :], k_linear, 0.0), axis=1) * inv_features
-    centered = tl.where(feature_mask[None, :], k_linear - mean[:, None], 0.0)
+    mean = tl.sum(tl.where(feature_mask_block, k_linear, 0.0), axis=1) * inv_features
+    centered = tl.where(feature_mask_block, k_linear - mean[:, None], 0.0)
     variance = tl.sum(centered * centered, axis=1) * inv_features
     rstd = tl.rsqrt(variance + eps)
     norm_weight = tl.load(
@@ -763,11 +783,11 @@ def _dsa_selected_k_project_score_kernel(
         partner_d = nope + partner_pos
         partner_linear = tl.load(
             out_k_linear_ptr
-            + batch_idx[:, None] * okl_stride_b
+            + batch_idx_feature * okl_stride_b
             + query_idx[:, None] * okl_stride_m
             + support_idx[:, None] * okl_stride_k
             + partner_d[None, :] * okl_stride_d,
-            mask=row_mask[:, None]
+            mask=row_mask_feature
             & is_rotary[None, :]
             & (partner_d[None, :] >= 0)
             & (partner_d[None, :] < out_features),
@@ -823,10 +843,10 @@ def _dsa_selected_k_project_score_kernel(
         q = tl.load(
             q_ptr
             + query_idx[:, None] * q_stride_m
-            + batch_idx[:, None] * q_stride_b
+            + batch_idx_feature * q_stride_b
             + head_idx * q_stride_h
-            + offs_d[None, :] * q_stride_d,
-            mask=row_mask[:, None] & feature_mask[None, :],
+            + offs_d_feature * q_stride_d,
+            mask=row_mask_feature & feature_mask_block,
             other=0.0,
         ).to(tl.float32)
         dot = tl.sum(q * k_index, axis=1)
@@ -2419,6 +2439,10 @@ def _dsa_sparse_attention_forward_kernel(
     group_idx = head_idx // repeat_factor
     offs_d = tl.arange(0, BLOCK_D)
     offs_dv = tl.arange(0, BLOCK_DV)
+    # Materialize loop-invariant broadcasts in the parent region. Some Triton
+    # versions otherwise reuse an op from the first loop in the sibling loop.
+    offs_d_block = tl.broadcast_to(tl.expand_dims(offs_d, 0), (BLOCK_K, BLOCK_D))
+    offs_d_mask = offs_d_block < HEAD_DIM
     q = tl.load(
         query_ptr
         + query_idx * q_stride_m
@@ -2428,6 +2452,7 @@ def _dsa_sparse_attention_forward_kernel(
         mask=offs_d < HEAD_DIM,
         other=0.0,
     ).to(tl.float32)
+    q_block = tl.broadcast_to(tl.expand_dims(q, 0), (BLOCK_K, BLOCK_D))
     running_max = tl.full((), -float("inf"), dtype=tl.float32)
     running_sum = tl.full((), 0.0, dtype=tl.float32)
 
@@ -2448,11 +2473,11 @@ def _dsa_sparse_attention_forward_kernel(
             + selected[:, None] * k_stride_s
             + batch_idx * k_stride_b
             + group_idx * k_stride_g
-            + offs_d[None, :] * k_stride_d,
-            mask=valid[:, None] & (offs_d[None, :] < HEAD_DIM),
+            + offs_d_block * k_stride_d,
+            mask=valid[:, None] & offs_d_mask,
             other=0.0,
         ).to(tl.float32)
-        scores = tl.sum(k * q[None, :], axis=1) * softmax_scale
+        scores = tl.sum(k * q_block, axis=1) * softmax_scale
         scores = tl.where(valid, scores, -float("inf"))
         block_max = tl.max(scores, axis=0)
         new_max = tl.maximum(running_max, block_max)
@@ -2480,11 +2505,11 @@ def _dsa_sparse_attention_forward_kernel(
             + selected[:, None] * k_stride_s
             + batch_idx * k_stride_b
             + group_idx * k_stride_g
-            + offs_d[None, :] * k_stride_d,
-            mask=valid[:, None] & (offs_d[None, :] < HEAD_DIM),
+            + offs_d_block * k_stride_d,
+            mask=valid[:, None] & offs_d_mask,
             other=0.0,
         ).to(tl.float32)
-        scores = tl.sum(k * q[None, :], axis=1) * softmax_scale
+        scores = tl.sum(k * q_block, axis=1) * softmax_scale
         scores = tl.where(valid, scores, -float("inf"))
         probs = tl.exp(scores - running_max) / running_sum
         v = tl.load(
@@ -2586,6 +2611,10 @@ def _dsa_sparse_attention_backward_kernel(
     group_idx = head_idx // repeat_factor
     offs_d = tl.arange(0, BLOCK_D)
     offs_dv = tl.arange(0, BLOCK_DV)
+    offs_d_block = tl.broadcast_to(tl.expand_dims(offs_d, 0), (BLOCK_K, BLOCK_D))
+    offs_d_mask = offs_d_block < HEAD_DIM
+    offs_dv_block = tl.broadcast_to(tl.expand_dims(offs_dv, 0), (BLOCK_K, BLOCK_DV))
+    offs_dv_mask = offs_dv_block < VALUE_DIM
     q = tl.load(
         query_ptr
         + query_idx * q_stride_m
@@ -2595,6 +2624,7 @@ def _dsa_sparse_attention_backward_kernel(
         mask=offs_d < HEAD_DIM,
         other=0.0,
     ).to(tl.float32)
+    q_block = tl.broadcast_to(tl.expand_dims(q, 0), (BLOCK_K, BLOCK_D))
     grad_out = tl.load(
         grad_output_ptr
         + query_idx * go_stride_m
@@ -2610,6 +2640,9 @@ def _dsa_sparse_attention_backward_kernel(
         grad_out_for_value = grad_out.to(tl.bfloat16)
     else:
         grad_out_for_value = grad_out
+    grad_out_block = tl.broadcast_to(
+        tl.expand_dims(grad_out_for_value, 0), (BLOCK_K, BLOCK_DV)
+    )
     running_max = tl.full((), -float("inf"), dtype=tl.float32)
     running_sum = tl.full((), 0.0, dtype=tl.float32)
     dprob_acc = tl.full((), 0.0, dtype=tl.float32)
@@ -2631,11 +2664,11 @@ def _dsa_sparse_attention_backward_kernel(
             + selected[:, None] * k_stride_s
             + batch_idx * k_stride_b
             + group_idx * k_stride_g
-            + offs_d[None, :] * k_stride_d,
-            mask=valid[:, None] & (offs_d[None, :] < HEAD_DIM),
+            + offs_d_block * k_stride_d,
+            mask=valid[:, None] & offs_d_mask,
             other=0.0,
         ).to(tl.float32)
-        scores = tl.sum(k * q[None, :], axis=1) * softmax_scale
+        scores = tl.sum(k * q_block, axis=1) * softmax_scale
         scores = tl.where(valid, scores, -float("inf"))
         block_max = tl.max(scores, axis=0)
         new_max = tl.maximum(running_max, block_max)
@@ -2647,11 +2680,11 @@ def _dsa_sparse_attention_backward_kernel(
             + selected[:, None] * v_stride_s
             + batch_idx * v_stride_b
             + group_idx * v_stride_g
-            + offs_dv[None, :] * v_stride_d,
-            mask=valid[:, None] & (offs_dv[None, :] < VALUE_DIM),
+            + offs_dv_block * v_stride_d,
+            mask=valid[:, None] & offs_dv_mask,
             other=0.0,
         )
-        dprob = tl.sum((v * grad_out_for_value[None, :]).to(tl.float32), axis=1)
+        dprob = tl.sum((v * grad_out_block).to(tl.float32), axis=1)
         block_dprob = tl.sum(dprob * block_probs, axis=0)
         dprob_acc = dprob_acc * old_scale + block_dprob
         running_sum = running_sum * old_scale + block_sum
@@ -2677,11 +2710,11 @@ def _dsa_sparse_attention_backward_kernel(
             + selected[:, None] * k_stride_s
             + batch_idx * k_stride_b
             + group_idx * k_stride_g
-            + offs_d[None, :] * k_stride_d,
-            mask=valid[:, None] & (offs_d[None, :] < HEAD_DIM),
+            + offs_d_block * k_stride_d,
+            mask=valid[:, None] & offs_d_mask,
             other=0.0,
         ).to(tl.float32)
-        scores = tl.sum(k * q[None, :], axis=1) * softmax_scale
+        scores = tl.sum(k * q_block, axis=1) * softmax_scale
         scores = tl.where(valid, scores, -float("inf"))
         probs = tl.exp(scores - running_max) / running_sum
         v = tl.load(
@@ -2689,25 +2722,25 @@ def _dsa_sparse_attention_backward_kernel(
             + selected[:, None] * v_stride_s
             + batch_idx * v_stride_b
             + group_idx * v_stride_g
-            + offs_dv[None, :] * v_stride_d,
-            mask=valid[:, None] & (offs_dv[None, :] < VALUE_DIM),
+            + offs_dv_block * v_stride_d,
+            mask=valid[:, None] & offs_dv_mask,
             other=0.0,
         )
-        dprob = tl.sum((v * grad_out_for_value[None, :]).to(tl.float32), axis=1)
+        dprob = tl.sum((v * grad_out_block).to(tl.float32), axis=1)
         dscores = probs * (dprob - delta)
         dscores = tl.where(valid, dscores, 0.0)
         grad_q += tl.sum(k * dscores[:, None], axis=0) * softmax_scale
 
-        grad_k = dscores[:, None] * q[None, :] * softmax_scale
+        grad_k = dscores[:, None] * q_block * softmax_scale
         tl.atomic_add(
             grad_key_ptr
             + selected[:, None] * gk_stride_s
             + batch_idx * gk_stride_b
             + group_idx * gk_stride_g
-            + offs_d[None, :] * gk_stride_d,
+            + offs_d_block * gk_stride_d,
             grad_k,
             sem="relaxed",
-            mask=valid[:, None] & (offs_d[None, :] < HEAD_DIM),
+            mask=valid[:, None] & offs_d_mask,
         )
 
         if VALUE_DTYPE == 1:
@@ -2716,16 +2749,16 @@ def _dsa_sparse_attention_backward_kernel(
             probs_for_value = probs.to(tl.bfloat16)
         else:
             probs_for_value = probs
-        grad_v = (probs_for_value[:, None] * grad_out_for_value[None, :]).to(tl.float32)
+        grad_v = (probs_for_value[:, None] * grad_out_block).to(tl.float32)
         tl.atomic_add(
             grad_value_ptr
             + selected[:, None] * gv_stride_s
             + batch_idx * gv_stride_b
             + group_idx * gv_stride_g
-            + offs_dv[None, :] * gv_stride_d,
+            + offs_dv_block * gv_stride_d,
             grad_v,
             sem="relaxed",
-            mask=valid[:, None] & (offs_dv[None, :] < VALUE_DIM),
+            mask=valid[:, None] & offs_dv_mask,
         )
 
     tl.store(
@@ -2807,6 +2840,10 @@ def _dsa_sparse_attention_backward_pair_kernel(
     head1 = head0 + 1
     offs_d = tl.arange(0, BLOCK_D)
     offs_dv = tl.arange(0, BLOCK_DV)
+    offs_d_block = tl.broadcast_to(tl.expand_dims(offs_d, 0), (BLOCK_K, BLOCK_D))
+    offs_d_mask = offs_d_block < HEAD_DIM
+    offs_dv_block = tl.broadcast_to(tl.expand_dims(offs_dv, 0), (BLOCK_K, BLOCK_DV))
+    offs_dv_mask = offs_dv_block < VALUE_DIM
 
     q0 = tl.load(
         query_ptr
@@ -2826,6 +2863,8 @@ def _dsa_sparse_attention_backward_pair_kernel(
         mask=offs_d < HEAD_DIM,
         other=0.0,
     ).to(tl.float32)
+    q0_block = tl.broadcast_to(tl.expand_dims(q0, 0), (BLOCK_K, BLOCK_D))
+    q1_block = tl.broadcast_to(tl.expand_dims(q1, 0), (BLOCK_K, BLOCK_D))
     grad_out0 = tl.load(
         grad_output_ptr
         + query_idx * go_stride_m
@@ -2853,6 +2892,12 @@ def _dsa_sparse_attention_backward_pair_kernel(
     else:
         grad_out0_for_value = grad_out0
         grad_out1_for_value = grad_out1
+    grad_out0_block = tl.broadcast_to(
+        tl.expand_dims(grad_out0_for_value, 0), (BLOCK_K, BLOCK_DV)
+    )
+    grad_out1_block = tl.broadcast_to(
+        tl.expand_dims(grad_out1_for_value, 0), (BLOCK_K, BLOCK_DV)
+    )
 
     running_max0 = tl.full((), -float("inf"), dtype=tl.float32)
     running_max1 = tl.full((), -float("inf"), dtype=tl.float32)
@@ -2878,12 +2923,12 @@ def _dsa_sparse_attention_backward_pair_kernel(
             + selected[:, None] * k_stride_s
             + batch_idx * k_stride_b
             + group_idx * k_stride_g
-            + offs_d[None, :] * k_stride_d,
-            mask=valid[:, None] & (offs_d[None, :] < HEAD_DIM),
+            + offs_d_block * k_stride_d,
+            mask=valid[:, None] & offs_d_mask,
             other=0.0,
         ).to(tl.float32)
-        score0 = tl.sum(k * q0[None, :], axis=1) * softmax_scale
-        score1 = tl.sum(k * q1[None, :], axis=1) * softmax_scale
+        score0 = tl.sum(k * q0_block, axis=1) * softmax_scale
+        score1 = tl.sum(k * q1_block, axis=1) * softmax_scale
         score0 = tl.where(valid, score0, -float("inf"))
         score1 = tl.where(valid, score1, -float("inf"))
         block_max0 = tl.max(score0, axis=0)
@@ -2901,12 +2946,12 @@ def _dsa_sparse_attention_backward_pair_kernel(
             + selected[:, None] * v_stride_s
             + batch_idx * v_stride_b
             + group_idx * v_stride_g
-            + offs_dv[None, :] * v_stride_d,
-            mask=valid[:, None] & (offs_dv[None, :] < VALUE_DIM),
+            + offs_dv_block * v_stride_d,
+            mask=valid[:, None] & offs_dv_mask,
             other=0.0,
         )
-        dprob0 = tl.sum((v * grad_out0_for_value[None, :]).to(tl.float32), axis=1)
-        dprob1 = tl.sum((v * grad_out1_for_value[None, :]).to(tl.float32), axis=1)
+        dprob0 = tl.sum((v * grad_out0_block).to(tl.float32), axis=1)
+        dprob1 = tl.sum((v * grad_out1_block).to(tl.float32), axis=1)
         dprob_acc0 = dprob_acc0 * old_scale0 + tl.sum(dprob0 * block_probs0, axis=0)
         dprob_acc1 = dprob_acc1 * old_scale1 + tl.sum(dprob1 * block_probs1, axis=0)
         running_sum0 = running_sum0 * old_scale0 + tl.sum(block_probs0, axis=0)
@@ -2936,12 +2981,12 @@ def _dsa_sparse_attention_backward_pair_kernel(
             + selected[:, None] * k_stride_s
             + batch_idx * k_stride_b
             + group_idx * k_stride_g
-            + offs_d[None, :] * k_stride_d,
-            mask=valid[:, None] & (offs_d[None, :] < HEAD_DIM),
+            + offs_d_block * k_stride_d,
+            mask=valid[:, None] & offs_d_mask,
             other=0.0,
         ).to(tl.float32)
-        score0 = tl.sum(k * q0[None, :], axis=1) * softmax_scale
-        score1 = tl.sum(k * q1[None, :], axis=1) * softmax_scale
+        score0 = tl.sum(k * q0_block, axis=1) * softmax_scale
+        score1 = tl.sum(k * q1_block, axis=1) * softmax_scale
         score0 = tl.where(valid, score0, -float("inf"))
         score1 = tl.where(valid, score1, -float("inf"))
         prob0 = tl.exp(score0 - running_max0) / running_sum0
@@ -2953,28 +2998,28 @@ def _dsa_sparse_attention_backward_pair_kernel(
             + selected[:, None] * v_stride_s
             + batch_idx * v_stride_b
             + group_idx * v_stride_g
-            + offs_dv[None, :] * v_stride_d,
-            mask=valid[:, None] & (offs_dv[None, :] < VALUE_DIM),
+            + offs_dv_block * v_stride_d,
+            mask=valid[:, None] & offs_dv_mask,
             other=0.0,
         )
-        dprob0 = tl.sum((v * grad_out0_for_value[None, :]).to(tl.float32), axis=1)
-        dprob1 = tl.sum((v * grad_out1_for_value[None, :]).to(tl.float32), axis=1)
+        dprob0 = tl.sum((v * grad_out0_block).to(tl.float32), axis=1)
+        dprob1 = tl.sum((v * grad_out1_block).to(tl.float32), axis=1)
         dscores0 = tl.where(valid, prob0 * (dprob0 - delta0), 0.0)
         dscores1 = tl.where(valid, prob1 * (dprob1 - delta1), 0.0)
         grad_q0 += tl.sum(k * dscores0[:, None], axis=0) * softmax_scale
         grad_q1 += tl.sum(k * dscores1[:, None], axis=0) * softmax_scale
 
-        grad_k = (dscores0[:, None] * q0[None, :] + dscores1[:, None] * q1[None, :])
+        grad_k = dscores0[:, None] * q0_block + dscores1[:, None] * q1_block
         grad_k = grad_k * softmax_scale
         tl.atomic_add(
             grad_key_ptr
             + selected[:, None] * gk_stride_s
             + batch_idx * gk_stride_b
             + group_idx * gk_stride_g
-            + offs_d[None, :] * gk_stride_d,
+            + offs_d_block * gk_stride_d,
             grad_k,
             sem="relaxed",
-            mask=valid[:, None] & (offs_d[None, :] < HEAD_DIM),
+            mask=valid[:, None] & offs_d_mask,
         )
 
         if VALUE_DTYPE == 1:
@@ -2987,18 +3032,18 @@ def _dsa_sparse_attention_backward_pair_kernel(
             prob0_for_value = prob0
             prob1_for_value = prob1
         grad_v = (
-            prob0_for_value[:, None] * grad_out0_for_value[None, :]
-            + prob1_for_value[:, None] * grad_out1_for_value[None, :]
+            prob0_for_value[:, None] * grad_out0_block
+            + prob1_for_value[:, None] * grad_out1_block
         ).to(tl.float32)
         tl.atomic_add(
             grad_value_ptr
             + selected[:, None] * gv_stride_s
             + batch_idx * gv_stride_b
             + group_idx * gv_stride_g
-            + offs_dv[None, :] * gv_stride_d,
+            + offs_dv_block * gv_stride_d,
             grad_v,
             sem="relaxed",
-            mask=valid[:, None] & (offs_dv[None, :] < VALUE_DIM),
+            mask=valid[:, None] & offs_dv_mask,
         )
 
     tl.store(
@@ -3058,6 +3103,8 @@ def _dsa_teacher_scores_kernel(
     head_idx = tl.program_id(2)
     group_idx = head_idx // repeat_factor
     offs_d = tl.arange(0, BLOCK_D)
+    offs_d_block = tl.broadcast_to(tl.expand_dims(offs_d, 0), (BLOCK_K, BLOCK_D))
+    offs_d_mask = offs_d_block < HEAD_DIM
     q = tl.load(
         query_ptr
         + query_idx * q_stride_m
@@ -3067,6 +3114,7 @@ def _dsa_teacher_scores_kernel(
         mask=offs_d < HEAD_DIM,
         other=0.0,
     ).to(tl.float32)
+    q_block = tl.broadcast_to(tl.expand_dims(q, 0), (BLOCK_K, BLOCK_D))
     running_max = tl.full((), -float("inf"), dtype=tl.float32)
     running_sum = tl.full((), 0.0, dtype=tl.float32)
 
@@ -3087,11 +3135,11 @@ def _dsa_teacher_scores_kernel(
             + selected[:, None] * k_stride_s
             + batch_idx * k_stride_b
             + group_idx * k_stride_g
-            + offs_d[None, :] * k_stride_d,
-            mask=valid[:, None] & (offs_d[None, :] < HEAD_DIM),
+            + offs_d_block * k_stride_d,
+            mask=valid[:, None] & offs_d_mask,
             other=0.0,
         ).to(tl.float32)
-        scores = tl.sum(k * q[None, :], axis=1) * softmax_scale
+        scores = tl.sum(k * q_block, axis=1) * softmax_scale
         scores = tl.where(valid, scores, -float("inf"))
         block_max = tl.max(scores, axis=0)
         new_max = tl.maximum(running_max, block_max)
@@ -3117,11 +3165,11 @@ def _dsa_teacher_scores_kernel(
             + selected[:, None] * k_stride_s
             + batch_idx * k_stride_b
             + group_idx * k_stride_g
-            + offs_d[None, :] * k_stride_d,
-            mask=valid[:, None] & (offs_d[None, :] < HEAD_DIM),
+            + offs_d_block * k_stride_d,
+            mask=valid[:, None] & offs_d_mask,
             other=0.0,
         ).to(tl.float32)
-        scores = tl.sum(k * q[None, :], axis=1) * softmax_scale
+        scores = tl.sum(k * q_block, axis=1) * softmax_scale
         scores = tl.where(valid, scores, -float("inf"))
         probs = tl.exp(scores - running_max) / running_sum
         tl.atomic_add(
