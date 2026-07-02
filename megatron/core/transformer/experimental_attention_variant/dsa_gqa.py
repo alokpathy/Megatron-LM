@@ -29,6 +29,10 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
     fused_qk_topk_naive,
     rotate_activation,
 )
+from megatron.core.transformer.experimental_attention_variant.dsa_diagnostics import (
+    assert_tp_support_consistent,
+    compute_dsa_attention_diagnostics,
+)
 from megatron.core.transformer.experimental_attention_variant.dsa_min_memory import (
     dsa_dense_indexer_loss,
     dsa_min_memory_gqa,
@@ -1729,6 +1733,15 @@ class DSGQACoreAttention(MegatronModule):
         q_cursor = 0
         block_size_tokens = inference_context.block_size_tokens
         num_requests = inference_context.padded_active_request_count
+        diagnostics = getattr(inference_context, "dsa_diagnostics", None)
+        diagnostics_enabled = diagnostics is not None and diagnostics.enabled
+        active_request_ids = (
+            inference_context.request_ids[
+                inference_context.paused_request_count : inference_context.total_request_count
+            ]
+            if diagnostics_enabled
+            else None
+        )
 
         for request_idx in range(num_requests):
             query_length = int(query_lengths[request_idx].item())
@@ -1769,6 +1782,19 @@ class DSGQACoreAttention(MegatronModule):
             request_mask = _build_shifted_causal_mask(
                 query_length, key_length, request_offset, request_query.device
             )
+            request_id = None
+            diagnostic_queries = []
+            if diagnostics_enabled and diagnostics.layer_enabled(self.layer_number):
+                assert active_request_ids is not None
+                if request_idx >= active_request_ids.numel():
+                    raise RuntimeError("DSA diagnostics encountered an unmapped padded request.")
+                request_id = int(active_request_ids[request_idx].item())
+                diagnostic_queries = diagnostics.selected_queries(
+                    request_id=request_id,
+                    layer_number=self.layer_number,
+                    query_start_position=request_offset,
+                    query_length=query_length,
+                )
 
             key_chunk_size = getattr(self.config, "dsa_indexer_topk_key_chunk_size", None)
             if simplified_indexer and (key_chunk_size is None or key_chunk_size <= 0):
@@ -1818,6 +1844,50 @@ class DSGQACoreAttention(MegatronModule):
                     self.indexer.index_topk,
                     request_mask,
                 )
+
+            diagnostic_topk_indices = None
+            if diagnostic_queries:
+                diagnostic_rows = torch.tensor(
+                    [item["local_index"] for item in diagnostic_queries],
+                    device=request_q_index.device,
+                    dtype=torch.long,
+                )
+                diagnostic_topk = min(max(diagnostics.topk_values), key_length)
+                if diagnostic_topk <= topk_indices.size(-1):
+                    diagnostic_topk_indices = topk_indices.index_select(1, diagnostic_rows)
+                else:
+                    diagnostic_q_index = request_q_index.index_select(0, diagnostic_rows)
+                    diagnostic_mask = request_mask.index_select(0, diagnostic_rows)
+                    diagnostic_key_chunk_size = key_chunk_size
+                    if diagnostic_key_chunk_size is None or diagnostic_key_chunk_size <= 0:
+                        diagnostic_key_chunk_size = getattr(
+                            self.config, "dsa_kernel_key_block_size", None
+                        )
+                    if diagnostic_key_chunk_size is None or diagnostic_key_chunk_size <= 0:
+                        diagnostic_key_chunk_size = 2048
+                    diagnostic_weights = (
+                        None
+                        if request_weights is None
+                        else request_weights.index_select(0, diagnostic_rows)
+                    )
+                    if simplified_indexer:
+                        _, diagnostic_topk_indices = _simplified_qk_topk_chunked(
+                            diagnostic_q_index,
+                            request_index_key,
+                            diagnostic_topk,
+                            self.indexer.softmax_scale,
+                            diagnostic_mask,
+                            diagnostic_key_chunk_size,
+                        )
+                    else:
+                        _, diagnostic_topk_indices = fused_qk_topk_chunked(
+                            diagnostic_q_index,
+                            request_index_key,
+                            diagnostic_weights,
+                            diagnostic_topk,
+                            diagnostic_mask,
+                            diagnostic_key_chunk_size,
+                        )
             sparse_attention_query_chunk_size = getattr(
                 self.config, "dsa_sparse_attention_query_chunk_size", None
             )
@@ -1828,7 +1898,7 @@ class DSGQACoreAttention(MegatronModule):
                 sparse_attention_query_chunk_size = getattr(
                     self.config, "dsa_kernel_query_block_size", None
                 )
-            output[query_start:query_end] = unfused_grouped_dsa_fn(
+            request_output = unfused_grouped_dsa_fn(
                 request_query,
                 request_key,
                 request_value,
@@ -1842,6 +1912,54 @@ class DSGQACoreAttention(MegatronModule):
                     else getattr(self.config, "dsa_sparse_attention_use_gather", False)
                 ),
             )
+            output[query_start:query_end] = request_output
+
+            if diagnostic_queries:
+                tp_group = self.indexer.pg_collection.tp
+                assert_tp_support_consistent(
+                    topk_indices.index_select(1, diagnostic_rows),
+                    tp_group,
+                    "model",
+                )
+                assert_tp_support_consistent(
+                    diagnostic_topk_indices,
+                    tp_group,
+                    "expanded",
+                )
+                for diagnostic_idx, query_metadata in enumerate(diagnostic_queries):
+                    local_idx = query_metadata["local_index"]
+                    metrics = compute_dsa_attention_diagnostics(
+                        query=request_query[local_idx : local_idx + 1],
+                        key=request_key,
+                        value=request_value,
+                        indexer_support=diagnostic_topk_indices[0, diagnostic_idx],
+                        model_support=topk_indices[0, local_idx],
+                        softmax_scale=self.softmax_scale,
+                        topk_values=diagnostics.topk_values,
+                        query_position=query_metadata["position"],
+                        tp_group=tp_group,
+                        model_output=request_output[local_idx],
+                        dump_support_indices=diagnostics.dump_support_indices,
+                    )
+                    diagnostics.record(
+                        {
+                            "request_id": request_id,
+                            "layer": self.layer_number,
+                            "phase": query_metadata["phase"],
+                            "offset": query_metadata["offset"],
+                            "query_position": query_metadata["position"],
+                            "prompt_length": query_metadata["prompt_length"],
+                            "context_length": key_length,
+                            "model_topk": self.indexer.index_topk,
+                            "diagnostic_score_precision": "fp32",
+                            "indexer_mode": (
+                                "simplified_learned_k"
+                                if simplified_learned_k
+                                else "simplified_main_k" if simplified_indexer else "standard"
+                            ),
+                            **metrics,
+                        }
+                    )
 
         if q_cursor != inference_context.active_token_count:
             raise RuntimeError(
