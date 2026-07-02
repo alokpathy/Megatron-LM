@@ -1,5 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
+import argparse
 import json
 from types import SimpleNamespace
 
@@ -13,6 +14,7 @@ from megatron.core.transformer.experimental_attention_variant.dsa_diagnostics im
     expand_integer_ranges,
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.training.arguments import add_megatron_arguments
 from tests.unit_tests.test_utilities import Utils
 from tools.analyze_dsa_diagnostics import _summarize_distribution_width
 
@@ -47,6 +49,27 @@ def test_expand_integer_ranges(tokens, expected):
 def test_expand_integer_ranges_rejects_invalid_values(token):
     with pytest.raises(ValueError):
         expand_integer_ranges([token])
+
+
+def test_megatron_parser_expands_dsa_diagnostic_ranges():
+    parser = add_megatron_arguments(argparse.ArgumentParser(allow_abbrev=False))
+    args, unknown = parser.parse_known_args(
+        [
+            "--dsa-diagnostics-layers",
+            "1...7:3",
+            "--dsa-diagnostics-topk-values",
+            "512...2048:512",
+            "--dsa-diagnostics-prefill-tail-offsets",
+            "0...32",
+            "--dsa-diagnostics-decode-offsets",
+            "0...8",
+        ]
+    )
+    assert not unknown
+    assert args.dsa_diagnostics_layers == [1, 4, 7]
+    assert args.dsa_diagnostics_topk_values == [512, 1024, 1536, 2048]
+    assert args.dsa_diagnostics_prefill_tail_offsets == list(range(33))
+    assert args.dsa_diagnostics_decode_offsets == list(range(9))
 
 
 def test_dsa_diagnostics_selects_prefill_tail_and_decode_offsets_once(tmp_path):

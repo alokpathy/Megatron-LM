@@ -2008,6 +2008,11 @@ def _add_network_size_args(parser):
         "persist_layer_norm",
         "bias_dropout_fusion",
         "apply_rope_fusion",
+        # These list-valued diagnostics flags use a custom action for range syntax.
+        "dsa_diagnostics_layers",
+        "dsa_diagnostics_topk_values",
+        "dsa_diagnostics_prefill_tail_offsets",
+        "dsa_diagnostics_decode_offsets",
     ]
     transformer_factory = ArgumentGroupFactory(TransformerConfig, exclude=exclude)
     transformer_group = transformer_factory.build_group(parser, "transformer configuration")
