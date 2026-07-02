@@ -164,6 +164,9 @@ class _DSATimingProfiler:
             for name in order
         )
         print(f"[rank{self.rank}] DSA min-memory {phase}{label}: {parts}", flush=True)
+        header = "\t".join(["phase", "label"] + [f"{n}_total_ms" for n in order] + [f"{n}_avg_ms" for n in order])
+        values = "\t".join([phase, self.label] + [f"{totals[n]:.3f}" for n in order] + [f"{totals[n]/counts[n]:.3f}" for n in order])
+        print(f"[rank{self.rank}] TSV:\n{header}\n{values}", flush=True)
 
 
 @contextmanager
