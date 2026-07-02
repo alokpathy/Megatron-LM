@@ -530,26 +530,6 @@ def _dsa_selected_k_linear_kernel(
     rem = rows - batch_idx * rows_per_batch
     query_idx = rem // topk
     support_idx = rem - query_idx * topk
-    batch_idx_hidden = tl.broadcast_to(
-        tl.expand_dims(batch_idx, 1), (BLOCK_N, BLOCK_H)
-    )
-    row_mask_hidden = tl.broadcast_to(
-        tl.expand_dims(row_mask, 1), (BLOCK_N, BLOCK_H)
-    )
-    offs_d_weight = tl.broadcast_to(
-        tl.expand_dims(offs_d, 0), (BLOCK_H, BLOCK_D)
-    )
-    batch_idx_feature = tl.broadcast_to(
-        tl.expand_dims(batch_idx, 1), (BLOCK_N, BLOCK_D)
-    )
-    row_mask_feature = tl.broadcast_to(
-        tl.expand_dims(row_mask, 1), (BLOCK_N, BLOCK_D)
-    )
-    offs_d_feature = tl.broadcast_to(
-        tl.expand_dims(offs_d, 0), (BLOCK_N, BLOCK_D)
-    )
-    feature_mask = offs_d < out_features
-    feature_mask_block = offs_d_feature < out_features
     selected = tl.load(
         topk_indices_ptr
         + batch_idx * ti_stride_b
@@ -689,6 +669,26 @@ def _dsa_selected_k_project_score_kernel(
     rem = rows - batch_idx * rows_per_batch
     query_idx = rem // topk
     support_idx = rem - query_idx * topk
+    batch_idx_hidden = tl.broadcast_to(
+        tl.expand_dims(batch_idx, 1), (BLOCK_N, BLOCK_H)
+    )
+    row_mask_hidden = tl.broadcast_to(
+        tl.expand_dims(row_mask, 1), (BLOCK_N, BLOCK_H)
+    )
+    offs_d_weight = tl.broadcast_to(
+        tl.expand_dims(offs_d, 0), (BLOCK_H, BLOCK_D)
+    )
+    batch_idx_feature = tl.broadcast_to(
+        tl.expand_dims(batch_idx, 1), (BLOCK_N, BLOCK_D)
+    )
+    row_mask_feature = tl.broadcast_to(
+        tl.expand_dims(row_mask, 1), (BLOCK_N, BLOCK_D)
+    )
+    offs_d_feature = tl.broadcast_to(
+        tl.expand_dims(offs_d, 0), (BLOCK_N, BLOCK_D)
+    )
+    feature_mask = offs_d < out_features
+    feature_mask_block = offs_d_feature < out_features
     selected = tl.load(
         topk_indices_ptr
         + batch_idx * ti_stride_b
