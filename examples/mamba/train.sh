@@ -1,10 +1,8 @@
 #!/bin/bash
 
-# Use: bash train.sh [run-name] [1=enable-dsa (default 1)] [1=enable-nsys (default 0)] [1=use-cudnn-indexer (default 0)]
-# e.g. bash train.sh my_run 1 1 1
-#   The 4th arg swaps the DSA indexer (scores + top-k) from the Triton
-#   min-memory kernels to cuDNN, for A/B perf comparison. Everything else
-#   (model, data, sparse attention) is identical between the two runs.
+# Use: bash train.sh [run-name] [1=enable-dsa (default 1)] [1=enable-nsys (default 0)] [backend (default triton)]
+# backend: triton = triton-min-memory, torch = torch-min-memory, cudnn = triton-min-memory + cuDNN indexer
+# e.g. bash train.sh my_run 1 0 cudnn
 
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export NVTE_FWD_LAYERNORM_SM_MARGIN=16
@@ -17,9 +15,22 @@ ROOT_DIR="/lustre/fsw/portfolios/nemotron/projects/nemotron_sw_pre/users/atripat
 NAME="${1:-8b_hybrid_dsa}"
 USE_DSA="${2:-1}"
 USE_NSYS="${3:-0}"
-USE_CUDNN="${4:-0}"
+DSA_BACKEND="${4:-triton}"  # triton | torch | cudnn
 
-echo "NAME=${NAME} USE_DSA=${USE_DSA} USE_NSYS=${USE_NSYS} USE_CUDNN=${USE_CUDNN}"
+if [ "${DSA_BACKEND}" = "triton" ]; then
+    DSA_KERNEL_BACKEND="triton-min-memory"
+    DSA_EXTRA=""
+elif [ "${DSA_BACKEND}" = "torch" ]; then
+    DSA_KERNEL_BACKEND="torch-min-memory"
+    DSA_EXTRA=""
+elif [ "${DSA_BACKEND}" = "cudnn" ]; then
+    DSA_KERNEL_BACKEND="triton-min-memory"
+    DSA_EXTRA="--dsa-use-cudnn"
+else
+    echo "Unknown DSA_BACKEND=${DSA_BACKEND}. Use triton, torch, or cudnn." && exit 1
+fi
+
+echo "NAME=${NAME} USE_DSA=${USE_DSA} USE_NSYS=${USE_NSYS} DSA_BACKEND=${DSA_BACKEND}"
 
 TOKENIZER_MODEL="${ROOT_DIR}/tokenizers/multiMixV8.gpt4o_nc_sd.500000.128k.vocab.json"
 BLEND_PATH="${ROOT_DIR}/blend_files/1t_singlephase.json"
@@ -139,7 +150,7 @@ torchrun \
     --profile-ranks 0" ) \
     $( [ "${USE_DSA}" = "1" ] && echo "\
     --experimental-attention-variant dsa \
-    --dsa-kernel-backend triton-min-memory \
+    --dsa-kernel-backend ${DSA_KERNEL_BACKEND} \
     --dsa-indexer-n-heads 32 \
     --dsa-indexer-head-dim 64 \
     --dsa-indexer-topk 256 \
@@ -149,5 +160,5 @@ torchrun \
     --dsa-min-memory-profile-rank 0 \
     --dsa-kernel-cache-indexer-k \
     --dsa-indexer-use-sparse-loss \
-    $( [ "${USE_CUDNN}" = "1" ] && echo "--dsa-use-cudnn" ) \
+    ${DSA_EXTRA} \
     --no-rope-fusion" )
