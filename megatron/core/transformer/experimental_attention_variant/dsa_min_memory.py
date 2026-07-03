@@ -93,6 +93,12 @@ def _distributed_rank() -> int:
 
 
 class _DSATimingProfiler:
+    _MEDIAN_WINDOW = 5
+    # keyed by label: list of completed (fwd, bwd) pairs, each entry is (totals, counts, order)
+    _paired_history: Dict[str, List[Dict[str, Tuple[Dict[str, float], Dict[str, int], List[str]]]]] = {}
+    # keyed by label: pending forward data waiting to be paired with a backward
+    _pending_fwd: Dict[str, Tuple[Dict[str, float], Dict[str, int], List[str]]] = {}
+
     def __init__(
         self,
         enabled: bool,
@@ -164,9 +170,33 @@ class _DSATimingProfiler:
             for name in order
         )
         print(f"[rank{self.rank}] DSA min-memory {phase}{label}: {parts}", flush=True)
-        header = "\t".join(["phase", "label"] + [f"{n}_total_ms" for n in order] + [f"{n}_avg_ms" for n in order])
-        values = "\t".join([phase, self.label] + [f"{totals[n]:.3f}" for n in order] + [f"{totals[n]/counts[n]:.3f}" for n in order])
-        print(f"[rank{self.rank}] TSV:\n{header}\n{values}", flush=True)
+
+        _csv_exclude = {"selected_index_scores_fwd_score_fallback"}
+
+        def _tsv_lines(p: str, t: Dict[str, float], c: Dict[str, int], o: List[str]) -> str:
+            cols = [n for n in o if n not in _csv_exclude]
+            header = ",".join(["phase", "label"] + [f"{n}_total_ms" for n in cols] + [f"{n}_avg_ms" for n in cols])
+            values = ",".join([p, self.label] + [f"{t[n]:.3f}" for n in cols] + [f"{t[n]/c[n]:.3f}" for n in cols])
+            return f"{header}\n{values}"
+
+        if phase == "forward":
+            _DSATimingProfiler._pending_fwd[self.label] = (totals, counts, order)
+        elif phase == "backward" and self.label in _DSATimingProfiler._pending_fwd:
+            fwd_data = _DSATimingProfiler._pending_fwd.pop(self.label)
+            pairs = _DSATimingProfiler._paired_history.setdefault(self.label, [])
+            pairs.append({"forward": fwd_data, "backward": (totals, counts, order)})
+            if len(pairs) >= _DSATimingProfiler._MEDIAN_WINDOW:
+                sorted_pairs = sorted(pairs, key=lambda p: p["forward"][0].get("forward_total", 0.0))
+                med = sorted_pairs[len(sorted_pairs) // 2]
+                ft, fc, fo = med["forward"]
+                bt, bc, bo = med["backward"]
+                print(
+                    f"[rank{self.rank}] CSV (median fwd of {_DSATimingProfiler._MEDIAN_WINDOW}):\n"
+                    f"{_tsv_lines('forward', ft, fc, fo)}\n"
+                    f"{_tsv_lines('backward', bt, bc, bo)}",
+                    flush=True,
+                )
+                _DSATimingProfiler._paired_history[self.label] = []
 
 
 @contextmanager
