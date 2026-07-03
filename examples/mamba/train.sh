@@ -47,11 +47,16 @@ export PYTHONPATH=${ROOT_DIR}:$PYTHONPATH
 # 8B Nemotron-H hybrid: 60 layers, 4 attention + Mamba + MLP
 HYBRID_LAYER_PATTERN="M-M-M--M-M*-M-M-M-M--M*-M-M-M-M-M*--M-M-M-M-M*-M--M-M-M-"
 
-SEQ_LEN=8192
-TRAIN_SAMPLES=122070313
-LR_WARMUP_SAMPLES=3051758
-LR_DECAY_SAMPLES=122070313
-LR_WSD_DECAY_SAMPLES=24414063
+SEQ_LEN=${SEQ_LEN:-8192}
+
+if [ -n "${TRAIN_ITERS}" ]; then
+    TRAIN_ITERS_ARGS="--train-iters ${TRAIN_ITERS} --lr-warmup-iters 0"
+else
+    TRAIN_ITERS_ARGS="--train-samples 122070313 \
+    --lr-warmup-samples 3051758 \
+    --lr-decay-samples 122070313 \
+    --lr-wsd-decay-samples 24414063"
+fi
 
 $( [ "${USE_NSYS}" = "1" ] && echo "nsys profile \
     -s none \
@@ -85,12 +90,8 @@ torchrun \
     --bf16 \
     --seq-length ${SEQ_LEN} \
     --max-position-embeddings ${SEQ_LEN} \
-    --train-samples ${TRAIN_SAMPLES} \
+    ${TRAIN_ITERS_ARGS} \
     --lr-decay-style WSD \
-    --lr-decay-samples ${LR_DECAY_SAMPLES} \
-    --lr-warmup-samples ${LR_WARMUP_SAMPLES} \
-    --lr-wsd-decay-style minus_sqrt \
-    --lr-wsd-decay-samples ${LR_WSD_DECAY_SAMPLES} \
     --micro-batch-size 1 \
     --global-batch-size 4 \
     --lr 8e-4 \
