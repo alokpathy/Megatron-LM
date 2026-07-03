@@ -49,14 +49,16 @@ HYBRID_LAYER_PATTERN="M-M-M--M-M*-M-M-M-M--M*-M-M-M-M-M*--M-M-M-M-M*-M--M-M-M-"
 
 SEQ_LEN=${SEQ_LEN:-8192}
 
+GBS=4
 if [ -n "${TRAIN_ITERS}" ]; then
-    TRAIN_ITERS_ARGS="--train-iters ${TRAIN_ITERS} --lr-warmup-iters 0"
+    TRAIN_SAMPLES=$((TRAIN_ITERS * GBS))
 else
-    TRAIN_ITERS_ARGS="--train-samples 122070313 \
+    TRAIN_SAMPLES=122070313
+fi
+TRAIN_ITERS_ARGS="--train-samples ${TRAIN_SAMPLES} \
     --lr-warmup-samples 3051758 \
     --lr-decay-samples 122070313 \
     --lr-wsd-decay-samples 24414063"
-fi
 
 $( [ "${USE_NSYS}" = "1" ] && echo "nsys profile \
     -s none \
