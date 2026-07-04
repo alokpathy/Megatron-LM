@@ -173,11 +173,13 @@ class _DSATimingProfiler:
 
         _csv_exclude = {"selected_index_scores_fwd_score_fallback"}
 
-        def _tsv_lines(p: str, t: Dict[str, float], c: Dict[str, int], o: List[str]) -> str:
+        def _csv_values(p: str, t: Dict[str, float], c: Dict[str, int], o: List[str]) -> str:
             cols = [n for n in o if n not in _csv_exclude]
-            header = ",".join(["phase", "label"] + [f"{n}_total_ms" for n in cols] + [f"{n}_avg_ms" for n in cols])
-            values = ",".join([p, self.label] + [f"{t[n]:.3f}" for n in cols] + [f"{t[n]/c[n]:.3f}" for n in cols])
-            return f"{header}\n{values}"
+            return ",".join([p, self.label] + [f"{t[n]:.3f}" for n in cols] + [f"{t[n]/c[n]:.3f}" for n in cols])
+
+        def _csv_header(o: List[str]) -> str:
+            cols = [n for n in o if n not in _csv_exclude]
+            return ",".join(["phase", "label"] + [f"{n}_total_ms" for n in cols] + [f"{n}_avg_ms" for n in cols])
 
         if phase == "forward":
             _DSATimingProfiler._pending_fwd[self.label] = (totals, counts, order)
@@ -192,8 +194,9 @@ class _DSATimingProfiler:
                 bt, bc, bo = med["backward"]
                 print(
                     f"[rank{self.rank}] CSV (median fwd of {_DSATimingProfiler._MEDIAN_WINDOW}):\n"
-                    f"{_tsv_lines('forward', ft, fc, fo)}\n"
-                    f"{_tsv_lines('backward', bt, bc, bo)}",
+                    f"{_csv_header(fo)}\n"
+                    f"{_csv_values('forward', ft, fc, fo)}\n"
+                    f"{_csv_values('backward', bt, bc, bo)}",
                     flush=True,
                 )
                 _DSATimingProfiler._paired_history[self.label] = []
