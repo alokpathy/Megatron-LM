@@ -30,6 +30,7 @@ from megatron.core.transformer.experimental_attention_variant.dsa_min_memory imp
     _accumulate_simplified_learned_k_wgrad,
     _captured_mass_backward_torch,
     _dense_main_attention_stats,
+    _main_attention_aux_query_block_size,
     dsa_main_attention_aux_loss,
     dsa_dense_indexer_loss,
     dsa_min_memory_gqa,
@@ -134,6 +135,87 @@ def test_dense_main_attention_stats_matches_materialized_gqa_oracle():
 
     torch.testing.assert_close(dense_output, expected_output, rtol=1.0e-5, atol=1.0e-6)
     torch.testing.assert_close(selected_mass, expected_mass, rtol=1.0e-5, atol=1.0e-6)
+
+
+def test_dense_main_attention_stats_bounds_causal_scan_and_reuses_logsumexp(monkeypatch):
+    import megatron.core.transformer.experimental_attention_variant.dsa_min_memory as min_memory
+
+    torch.manual_seed(1705)
+    q_start = 5
+    query = torch.randn(3, 1, 4, 5)
+    key = torch.randn(20, 1, 2, 5)
+    value = torch.randn(20, 1, 2, 3)
+    selected_indices = torch.tensor([[[0, 5], [1, 6], [2, 7]]])
+    scale = query.size(-1) ** -0.5
+    calls = []
+    original = min_memory._dense_teacher_logits_block
+
+    def _recording_logits(query_tile, key_block, softmax_scale, tile_q_start, k_start):
+        calls.append((k_start, k_start + key_block.size(0)))
+        return original(query_tile, key_block, softmax_scale, tile_q_start, k_start)
+
+    monkeypatch.setattr(min_memory, "_dense_teacher_logits_block", _recording_logits)
+    dense_output, selected_mass, running_max, running_sum = _dense_main_attention_stats(
+        query,
+        key,
+        value,
+        selected_indices,
+        scale,
+        q_start,
+        key_chunk_size=2,
+        compute_dense_output=True,
+    )
+    causal_key_end = q_start + query.size(0)
+    assert max(k_end for _, k_end in calls) == causal_key_end
+    assert all(k_end <= causal_key_end for _, k_end in calls)
+
+    dense_logsumexp = running_max + torch.log(running_sum)
+    torch.testing.assert_close(running_sum, torch.ones_like(running_sum), rtol=0.0, atol=0.0)
+    calls.clear()
+    reused_output, reused_mass, reused_max, reused_sum = _dense_main_attention_stats(
+        query,
+        key,
+        value,
+        selected_indices,
+        scale,
+        q_start,
+        key_chunk_size=2,
+        compute_dense_output=True,
+        precomputed_logsumexp=dense_logsumexp,
+    )
+    # Reusing log-sum-exp leaves only the single dense-output pass.
+    assert len(calls) == (causal_key_end + 1) // 2
+    torch.testing.assert_close(reused_output, dense_output, rtol=0.0, atol=0.0)
+    torch.testing.assert_close(reused_mass, selected_mass, rtol=0.0, atol=0.0)
+    torch.testing.assert_close(reused_max, dense_logsumexp)
+    torch.testing.assert_close(reused_sum, torch.ones_like(dense_logsumexp))
+
+    calls.clear()
+    _captured_mass_backward_torch(
+        query,
+        key,
+        selected_indices,
+        selected_mass,
+        dense_logsumexp,
+        torch.ones_like(dense_logsumexp),
+        torch.ones_like(selected_mass),
+        scale,
+        q_start,
+        key_chunk_size=2,
+        grad_query=torch.zeros_like(query),
+        grad_key=torch.zeros_like(key),
+    )
+    assert len(calls) == (causal_key_end + 1) // 2
+    assert all(k_end <= causal_key_end for _, k_end in calls)
+
+
+def test_main_attention_aux_query_block_size_respects_logits_budget():
+    query = torch.empty(1, 1, 16, 8)
+    assert _main_attention_aux_query_block_size(query, 2048, 2048) == 2048
+
+    larger_local_batch = torch.empty(1, 2, 32, 8)
+    assert _main_attention_aux_query_block_size(larger_local_batch, 2048, 2048) == 512
+    assert _main_attention_aux_query_block_size(query, 32, 2048) == 32
 
 
 def test_captured_mass_backward_matches_materialized_gqa_oracle():

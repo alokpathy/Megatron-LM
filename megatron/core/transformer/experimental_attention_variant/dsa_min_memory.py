@@ -4648,7 +4648,26 @@ def dsa_min_memory_gqa_forward_only(
     return output
 
 
-_MAIN_ATTENTION_AUX_QUERY_BLOCK_SIZE = 32
+_MAIN_ATTENTION_AUX_MAX_QUERY_BLOCK_SIZE = 2048
+_MAIN_ATTENTION_AUX_LOGITS_BUDGET_BYTES = 256 * 1024 * 1024
+
+
+def _main_attention_aux_query_block_size(
+    query: torch.Tensor,
+    query_chunk_size: int,
+    key_chunk_size: int,
+) -> int:
+    """Choose a launch-efficient query tile while bounding the FP32 logits scratch."""
+    bytes_per_query = (
+        query.size(1) * query.size(2) * max(1, key_chunk_size) * torch.float32.itemsize
+    )
+    budget_block_size = max(1, _MAIN_ATTENTION_AUX_LOGITS_BUDGET_BYTES // bytes_per_query)
+    block_size = min(
+        query_chunk_size,
+        _MAIN_ATTENTION_AUX_MAX_QUERY_BLOCK_SIZE,
+        budget_block_size,
+    )
+    return 1 << (block_size.bit_length() - 1)
 
 
 def _dense_main_attention_stats(
@@ -4660,22 +4679,33 @@ def _dense_main_attention_stats(
     q_start: int,
     key_chunk_size: int,
     compute_dense_output: bool,
+    precomputed_logsumexp: Optional[torch.Tensor] = None,
 ) -> Tuple[Optional[torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor]:
     """Compute dense output, softmax stats, and selected mass without a dense score tensor."""
     query_len, batch_size, num_query_heads, _ = query_tile.shape
     num_query_groups = key.size(2)
     repeat_factor = num_query_heads // num_query_groups
-    running_max = None
-    running_sum = None
-    for k_start in range(0, key.size(0), key_chunk_size):
-        k_end = min(k_start + key_chunk_size, key.size(0))
-        logits = _dense_teacher_logits_block(
-            query_tile, key[k_start:k_end], softmax_scale, q_start, k_start
-        )
-        running_max, running_sum = _update_running_softmax_stats(
-            logits, running_max, running_sum
-        )
-    assert running_max is not None and running_sum is not None
+    causal_key_end = min(key.size(0), q_start + query_len)
+    if precomputed_logsumexp is None:
+        running_max = None
+        running_sum = None
+        for k_start in range(0, causal_key_end, key_chunk_size):
+            k_end = min(k_start + key_chunk_size, causal_key_end)
+            logits = _dense_teacher_logits_block(
+                query_tile, key[k_start:k_end], softmax_scale, q_start, k_start
+            )
+            running_max, running_sum = _update_running_softmax_stats(
+                logits, running_max, running_sum
+            )
+        assert running_max is not None and running_sum is not None
+        # Use the saved representation in forward too, keeping recomputed backward exact.
+        running_max = running_max + torch.log(running_sum)
+        running_sum = torch.ones_like(running_max)
+    else:
+        expected_shape = (batch_size, num_query_heads, query_len)
+        assert precomputed_logsumexp.shape == expected_shape
+        running_max = precomputed_logsumexp
+        running_sum = torch.ones_like(precomputed_logsumexp)
 
     dense_output = None
     if compute_dense_output:
@@ -4684,21 +4714,24 @@ def _dense_main_attention_stats(
             device=query_tile.device,
             dtype=torch.float32,
         )
-        for k_start in range(0, key.size(0), key_chunk_size):
-            k_end = min(k_start + key_chunk_size, key.size(0))
+        for k_start in range(0, causal_key_end, key_chunk_size):
+            k_end = min(k_start + key_chunk_size, causal_key_end)
             logits = _dense_teacher_logits_block(
                 query_tile, key[k_start:k_end], softmax_scale, q_start, k_start
             )
             probs = torch.exp(logits - running_max.unsqueeze(-1)) / running_sum.unsqueeze(-1)
-            value_heads = value[k_start:k_end].permute(1, 2, 0, 3).repeat_interleave(
-                repeat_factor, dim=1
-            )
             # Match sparse attention: probabilities are rounded before the value GEMM.
-            dense_output += torch.einsum(
-                "bhqk,bhkd->bhqd",
-                probs.to(value.dtype).float(),
-                value_heads.float(),
+            probs = probs.to(value.dtype).float().reshape(
+                batch_size,
+                num_query_groups,
+                repeat_factor,
+                query_len,
+                k_end - k_start,
             )
+            value_groups = value[k_start:k_end].permute(1, 2, 0, 3).float()
+            dense_output += torch.einsum(
+                "bgrqk,bgkd->bgrqd", probs, value_groups
+            ).reshape(batch_size, num_query_heads, query_len, value.size(-1))
         dense_output = dense_output.to(value.dtype).float()
 
     selected_mass = torch.zeros(
@@ -4745,15 +4778,21 @@ def _main_attention_aux_forward_tile(
     output_enabled: bool,
     q_start: int,
     key_chunk_size: int,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    query_block_size: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     mass_loss_sum = query_tile.new_zeros((), dtype=torch.float32)
     output_loss_sum = query_tile.new_zeros((), dtype=torch.float32)
     captured_mass_sum = query_tile.new_zeros((), dtype=torch.float32)
-    for sub_start in range(0, query_tile.size(0), _MAIN_ATTENTION_AUX_QUERY_BLOCK_SIZE):
-        sub_end = min(sub_start + _MAIN_ATTENTION_AUX_QUERY_BLOCK_SIZE, query_tile.size(0))
+    dense_logsumexp = torch.empty(
+        (query_tile.size(1), query_tile.size(2), query_tile.size(0)),
+        device=query_tile.device,
+        dtype=torch.float32,
+    )
+    for sub_start in range(0, query_tile.size(0), query_block_size):
+        sub_end = min(sub_start + query_block_size, query_tile.size(0))
         query_sub = query_tile[sub_start:sub_end]
         indices_sub = selected_indices[:, sub_start:sub_end]
-        dense_output, selected_mass, _, _ = _dense_main_attention_stats(
+        dense_output, selected_mass, running_max, running_sum = _dense_main_attention_stats(
             query_sub,
             key,
             value,
@@ -4763,6 +4802,7 @@ def _main_attention_aux_forward_tile(
             key_chunk_size,
             output_enabled,
         )
+        dense_logsumexp[:, :, sub_start:sub_end] = running_max + torch.log(running_sum)
         captured_mass_sum += selected_mass.sum()
         if mass_enabled:
             mass_loss_sum += torch.relu(mass_target - selected_mass).square().sum()
@@ -4781,7 +4821,7 @@ def _main_attention_aux_forward_tile(
             output_loss_sum += (
                 (sparse_output - dense_output).square().sum(dim=-1) / denominator
             ).sum()
-    return mass_loss_sum, output_loss_sum, captured_mass_sum
+    return mass_loss_sum, output_loss_sum, captured_mass_sum, dense_logsumexp
 
 
 def _captured_mass_backward_torch(
@@ -4806,27 +4846,40 @@ def _captured_mass_backward_torch(
     q = query_tile.permute(1, 2, 0, 3).float()
     grad_q = torch.zeros_like(q) if grad_query is not None else None
 
-    for k_start in range(0, key.size(0), key_chunk_size):
-        k_end = min(k_start + key_chunk_size, key.size(0))
+    causal_key_end = min(key.size(0), q_start + query_tile.size(0))
+    for k_start in range(0, causal_key_end, key_chunk_size):
+        k_end = min(k_start + key_chunk_size, causal_key_end)
         logits = _dense_teacher_logits_block(
             query_tile, key[k_start:k_end], softmax_scale, q_start, k_start
         )
         probs = torch.exp(logits - running_max.unsqueeze(-1)) / running_sum.unsqueeze(-1)
         dscores = grad_mass.unsqueeze(-1) * probs * (-selected_mass.unsqueeze(-1))
-        key_heads = key[k_start:k_end].permute(1, 2, 0, 3).repeat_interleave(
-            repeat_factor, dim=1
-        ).float()
+        dscores = dscores.reshape(
+            batch_size,
+            num_query_groups,
+            repeat_factor,
+            query_tile.size(0),
+            k_end - k_start,
+        )
+        q_grouped = q.reshape(
+            batch_size,
+            num_query_groups,
+            repeat_factor,
+            query_tile.size(0),
+            query_tile.size(-1),
+        )
+        key_groups = key[k_start:k_end].permute(1, 2, 0, 3).float()
         if grad_q is not None:
-            grad_q += torch.einsum("bhqk,bhkd->bhqd", dscores, key_heads) * softmax_scale
+            grad_q += (
+                torch.einsum("bgrqk,bgkd->bgrqd", dscores, key_groups)
+                .reshape_as(grad_q)
+                .mul_(softmax_scale)
+            )
         if grad_key is not None:
-            grad_key_heads = torch.einsum("bhqk,bhqd->bhkd", dscores, q) * softmax_scale
-            grad_key_grouped = grad_key_heads.reshape(
-                batch_size,
-                num_query_groups,
-                repeat_factor,
-                k_end - k_start,
-                key.size(-1),
-            ).sum(dim=2)
+            grad_key_grouped = (
+                torch.einsum("bgrqk,bgrqd->bgkd", dscores, q_grouped)
+                * softmax_scale
+            )
             grad_key[k_start:k_end].add_(grad_key_grouped.permute(2, 0, 1, 3))
 
     batch_index = torch.arange(batch_size, device=query_tile.device)[:, None, None]
@@ -5125,9 +5178,17 @@ class DSAMainAttentionAuxLossFn(torch.autograd.Function):
             profile_enabled, profile_rank, f"{profile_label} attention_aux", query.device
         )
         dense_key_chunk_size = min(key_chunk_size, 2048)
+        aux_query_block_size = _main_attention_aux_query_block_size(
+            query, query_chunk_size, dense_key_chunk_size
+        )
         mass_loss_sum = query.new_zeros((), dtype=torch.float32)
         output_loss_sum = query.new_zeros((), dtype=torch.float32)
         captured_mass_sum = query.new_zeros((), dtype=torch.float32)
+        dense_logsumexp = torch.empty(
+            (query.size(1), query.size(2), query.size(0)),
+            device=query.device,
+            dtype=torch.float32,
+        )
         global_num_heads = query.size(2) * pg_collection.tp.size()
         total_entries = query.size(0) * query.size(1) * global_num_heads
         with torch.no_grad(), _triton_dispatch_enabled(use_triton), profile.record(
@@ -5165,7 +5226,7 @@ class DSAMainAttentionAuxLossFn(torch.autograd.Function):
                         "aux_fwd",
                     )
                 with _profile_record(profile, "attention_aux_dense_fwd", query.device):
-                    tile_mass_loss, tile_output_loss, tile_mass = (
+                    tile_mass_loss, tile_output_loss, tile_mass, tile_logsumexp = (
                         _main_attention_aux_forward_tile(
                             query[q_start:q_end],
                             key,
@@ -5177,11 +5238,13 @@ class DSAMainAttentionAuxLossFn(torch.autograd.Function):
                             output_loss_coeff > 0.0,
                             q_start,
                             dense_key_chunk_size,
+                            aux_query_block_size,
                         )
                     )
                 mass_loss_sum += tile_mass_loss
                 output_loss_sum += tile_output_loss
                 captured_mass_sum += tile_mass
+                dense_logsumexp[:, :, q_start:q_end] = tile_logsumexp
         profile.log("attention_aux_forward")
 
         ctx.save_for_backward(
@@ -5194,6 +5257,7 @@ class DSAMainAttentionAuxLossFn(torch.autograd.Function):
             k_norm_weight,
             k_norm_bias,
             linear_weights_weight,
+            dense_logsumexp,
         )
         ctx.has_k_norm_bias = has_k_norm_bias
         ctx.k_norm_eps = k_norm_eps
@@ -5214,6 +5278,7 @@ class DSAMainAttentionAuxLossFn(torch.autograd.Function):
         ctx.query_chunk_size = query_chunk_size
         ctx.key_chunk_size = key_chunk_size
         ctx.dense_key_chunk_size = dense_key_chunk_size
+        ctx.aux_query_block_size = aux_query_block_size
         ctx.pg_collection = pg_collection
         ctx.rotary_interleaved = rotary_interleaved
         ctx.simplified_input_norm = simplified_input_norm
@@ -5240,6 +5305,7 @@ class DSAMainAttentionAuxLossFn(torch.autograd.Function):
             k_norm_weight,
             k_norm_bias,
             linear_weights_weight,
+            dense_logsumexp,
         ) = ctx.saved_tensors
         grad_query = _grad_accumulator(query) if ctx.needs_input_grad[0] else None
         grad_key = _grad_accumulator(key) if ctx.needs_input_grad[1] else None
@@ -5305,10 +5371,10 @@ class DSAMainAttentionAuxLossFn(torch.autograd.Function):
                     )
 
                 for sub_start in range(
-                    0, q_end - q_start, _MAIN_ATTENTION_AUX_QUERY_BLOCK_SIZE
+                    0, q_end - q_start, ctx.aux_query_block_size
                 ):
                     sub_end = min(
-                        sub_start + _MAIN_ATTENTION_AUX_QUERY_BLOCK_SIZE, q_end - q_start
+                        sub_start + ctx.aux_query_block_size, q_end - q_start
                     )
                     global_q_start = q_start + sub_start
                     query_sub = query[global_q_start : q_start + sub_end]
@@ -5323,6 +5389,7 @@ class DSAMainAttentionAuxLossFn(torch.autograd.Function):
                             global_q_start,
                             ctx.dense_key_chunk_size,
                             compute_output_grad,
+                            dense_logsumexp[:, :, global_q_start : q_start + sub_end],
                         )
                     )
                     if compute_mass_grad:
