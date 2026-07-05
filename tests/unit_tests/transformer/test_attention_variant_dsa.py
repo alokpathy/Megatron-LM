@@ -15,6 +15,7 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
     DSAIndexer,
     DSAIndexerLossAutoScaler,
     DSAIndexerSubmodules,
+    DSAMainAttentionAuxLossAutoScaler,
     DSAttention,
     DSAttentionSubmodules,
     FusedDSAIndexerLoss,
@@ -348,6 +349,25 @@ def test_forward_step_sets_dsa_indexer_loss_scale_for_microbatch_mode(
         )
     finally:
         DSAIndexerLossAutoScaler.main_loss_backward_scale = previous_scale
+
+
+def test_main_attention_aux_loss_autoscaler_attaches_scaled_loss():
+    previous_scale = DSAMainAttentionAuxLossAutoScaler.main_loss_backward_scale
+    try:
+        DSAMainAttentionAuxLossAutoScaler.main_loss_backward_scale = None
+        DSAMainAttentionAuxLossAutoScaler.set_loss_scale(torch.tensor(0.25))
+        output = torch.randn(3, requires_grad=True)
+        aux_parameter = torch.tensor(2.0, requires_grad=True)
+
+        attached = DSAMainAttentionAuxLossAutoScaler.apply(
+            output, aux_parameter.square()
+        )
+        attached.sum().backward()
+
+        torch.testing.assert_close(output.grad, torch.ones_like(output))
+        torch.testing.assert_close(aux_parameter.grad, torch.tensor(1.0))
+    finally:
+        DSAMainAttentionAuxLossAutoScaler.main_loss_backward_scale = previous_scale
 
 
 @pytest.mark.parametrize("seqlen_and_topk", [[16, 8], [32, 16], [64, 32]])

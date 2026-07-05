@@ -147,7 +147,10 @@ from megatron.core.datasets.data_schedule import HybridCPDataLoaderWrapper
 from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
 from megatron.core.transformer.moe import upcycling_utils
 from megatron.core.transformer.moe.moe_utils import track_moe_metrics, clear_aux_losses_tracker
-from megatron.core.transformer.experimental_attention_variant.dsa import DSAIndexerLossLoggingHelper
+from megatron.core.transformer.experimental_attention_variant.dsa import (
+    DSAIndexerLossLoggingHelper,
+    DSAMainAttentionAuxLossLoggingHelper,
+)
 from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
 from megatron.core.parallel_state import (
     destroy_global_memory_buffer,
@@ -2645,6 +2648,18 @@ def training_log(
         indexer_loss_scale = 1 / get_num_microbatches()
         DSAIndexerLossLoggingHelper.track_indexer_metrics(
             loss_scale=indexer_loss_scale,
+            iteration=iteration,
+            writer=writer,
+            wandb_writer=wandb_writer,
+            total_loss_dict=total_loss_dict,
+        )
+
+    if (
+        getattr(args, "dsa_topk_mass_loss_coeff", 0.0) > 0.0
+        or getattr(args, "dsa_output_consistency_loss_coeff", 0.0) > 0.0
+    ):
+        DSAMainAttentionAuxLossLoggingHelper.track_metrics(
+            loss_scale=1 / get_num_microbatches(),
             iteration=iteration,
             writer=writer,
             wandb_writer=wandb_writer,

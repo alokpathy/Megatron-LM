@@ -25,6 +25,8 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.experimental_attention_variant.dsa import (
     DSAIndexerLossAutoScaler,
     DSAIndexerLossLoggingHelper,
+    DSAMainAttentionAuxLossAutoScaler,
+    DSAMainAttentionAuxLossLoggingHelper,
     fused_qk_topk_chunked,
     fused_qk_topk_naive,
     rotate_activation,
@@ -35,6 +37,7 @@ from megatron.core.transformer.experimental_attention_variant.dsa_diagnostics im
 )
 from megatron.core.transformer.experimental_attention_variant.dsa_min_memory import (
     dsa_dense_indexer_loss,
+    dsa_main_attention_aux_loss,
     dsa_min_memory_gqa,
     dsa_min_memory_gqa_forward_only,
 )
@@ -1664,7 +1667,53 @@ class DSGQACoreAttention(MegatronModule):
             layer_number=self.layer_number,
             num_layers=self.config.num_layers,
         )
-        return DSAIndexerLossAutoScaler.apply(output, indexer_loss)
+        mass_loss_coeff = getattr(self.config, "dsa_topk_mass_loss_coeff", 0.0)
+        output_loss_coeff = getattr(
+            self.config, "dsa_output_consistency_loss_coeff", 0.0
+        )
+        if mass_loss_coeff <= 0.0 and output_loss_coeff <= 0.0:
+            return DSAIndexerLossAutoScaler.apply(output, indexer_loss)
+
+        output = DSAIndexerLossAutoScaler.apply(output, indexer_loss)
+        mass_loss, output_loss, captured_mass = dsa_main_attention_aux_loss(
+            query=query,
+            key=key,
+            value=value,
+            hidden_states=hidden_states.detach(),
+            indexer=self.indexer,
+            attention_softmax_scale=self.softmax_scale,
+            use_indexer_rope=use_indexer_rope,
+            aux_topk=self.config.dsa_attention_aux_topk,
+            mass_loss_coeff=mass_loss_coeff,
+            mass_target=self.config.dsa_topk_mass_target,
+            output_loss_coeff=output_loss_coeff,
+            query_chunk_size=getattr(self.config, "dsa_kernel_query_block_size", None),
+            key_chunk_size=getattr(self.config, "dsa_kernel_key_block_size", None),
+            simplified_input_norm=indexer_input_norm,
+            profile_enabled=getattr(self.config, "dsa_min_memory_profile", False),
+            profile_rank=getattr(self.config, "dsa_min_memory_profile_rank", 0),
+            profile_label=f"layer={self.layer_number}",
+            use_triton=dsa_kernel_backend == "triton-min-memory",
+        )
+        zero = captured_mass.new_zeros(())
+        raw_mass_loss = mass_loss / mass_loss_coeff if mass_loss_coeff > 0.0 else zero
+        raw_output_loss = (
+            output_loss / output_loss_coeff if output_loss_coeff > 0.0 else zero
+        )
+        DSAMainAttentionAuxLossLoggingHelper.save_loss_to_tracker(
+            captured_mass=captured_mass,
+            mass_loss=mass_loss,
+            raw_mass_loss=raw_mass_loss,
+            output_loss=output_loss,
+            raw_output_loss=raw_output_loss,
+            layer_number=self.layer_number,
+            num_layers=self.config.num_layers,
+            tp_group=self.indexer.pg_collection.tp,
+        )
+        aux_loss = mass_loss if mass_loss_coeff > 0.0 else output_loss
+        if mass_loss_coeff > 0.0 and output_loss_coeff > 0.0:
+            aux_loss = mass_loss + output_loss
+        return DSAMainAttentionAuxLossAutoScaler.apply(output, aux_loss)
 
     def forward_dynamic(
         self,
