@@ -1248,6 +1248,8 @@ def _topk_index_tile_impl(
     profile_suffix: str = "fwd",
     full_k_index: Optional[torch.Tensor] = None,
     use_cudnn: bool = False,
+    indexer_input_norm=None,
+    input_norm_stats: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     with _profile_record(profile, f"routing_q_project_{profile_suffix}", hidden_states.device):
         with torch.cuda.nvtx.range("dsa_mm_indexer_q_project"):
