@@ -223,6 +223,7 @@ class DynamicInferenceEngine(AbstractEngine):
         """Reset by removing all requests and reset all state."""
 
         self.context.reset()
+        self.context.dsa_diagnostics.reset_runtime()
 
         # Request state.
         self.request_counter = Counter()
@@ -784,6 +785,7 @@ class DynamicInferenceEngine(AbstractEngine):
             request.stop_word_ids = stop_word_ids
 
         if request.status != Status.FAILED:
+            self.context.dsa_diagnostics.register_request(request_id, len(request.prompt_tokens))
             self.waiting_request_ids.append(request_id)
         else:
             self.failed_request_ids.append(request_id)
@@ -1321,6 +1323,11 @@ class DynamicInferenceEngine(AbstractEngine):
                 routing_indices_per_request,
             )
 
+            # Diagnostic records are buffered by attention modules and written outside forward.
+            self.context.dsa_diagnostics.flush()
+            for finished_request_id in finished_request_ids.tolist():
+                self.context.dsa_diagnostics.unregister_request(finished_request_id)
+
         else:
             active_request_ids: list[int] = []
             finished_request_records: list[DynamicInferenceRequestRecord] = []
@@ -1333,6 +1340,7 @@ class DynamicInferenceEngine(AbstractEngine):
             failed_request.add_event_fail()
             finished_request_records.append(failed_entry.record)
             failed_entry.future.set_result(failed_entry.record)
+            self.context.dsa_diagnostics.unregister_request(failed_request_id)
         self.failed_request_ids.clear()
         range_pop()
 

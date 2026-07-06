@@ -27,6 +27,9 @@ from megatron.core.models.common.embeddings.rope_utils import apply_rotary_pos_e
 from megatron.core.package_info import __version__ as mcore_version
 from megatron.core.ssm.mamba_hybrid_layer_allocation import get_layer_maps_from_layer_type_list
 from megatron.core.transformer import MLATransformerConfig, TransformerConfig
+from megatron.core.transformer.experimental_attention_variant.dsa_diagnostics import (
+    DSADiagnosticsCollector,
+)
 from megatron.core.utils import deprecate_args
 from megatron.core.utils import divide as core_divide
 from megatron.core.utils import get_pg_size, internal_api
@@ -241,6 +244,8 @@ class DynamicInferenceContext(BaseInferenceContext):
     )
     def __init__(self, model_config: TransformerConfig, inference_config: InferenceConfig):
         super().__init__(inference_config=inference_config)
+
+        self.dsa_diagnostics = DSADiagnosticsCollector(model_config)
 
         self.cache_mla_latent = (
             isinstance(model_config, MLATransformerConfig) and model_config.cache_mla_latents

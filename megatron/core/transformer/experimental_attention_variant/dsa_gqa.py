@@ -25,12 +25,19 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.experimental_attention_variant.dsa import (
     DSAIndexerLossAutoScaler,
     DSAIndexerLossLoggingHelper,
+    DSAMainAttentionAuxLossAutoScaler,
+    DSAMainAttentionAuxLossLoggingHelper,
     fused_qk_topk_chunked,
     fused_qk_topk_naive,
     rotate_activation,
 )
+from megatron.core.transformer.experimental_attention_variant.dsa_diagnostics import (
+    assert_tp_support_consistent,
+    compute_dsa_attention_diagnostics,
+)
 from megatron.core.transformer.experimental_attention_variant.dsa_min_memory import (
     dsa_dense_indexer_loss,
+    dsa_main_attention_aux_loss,
     dsa_min_memory_gqa,
     dsa_min_memory_gqa_forward_only,
 )
@@ -81,7 +88,7 @@ def _build_shifted_causal_mask(
 
 
 @dataclass(frozen=True)
-class _SimplifiedIndexerInputNormSpec:
+class _DSAIndexerInputNormSpec:
     normalization: str
     weight: torch.Tensor
     bias: Optional[torch.Tensor]
@@ -89,15 +96,15 @@ class _SimplifiedIndexerInputNormSpec:
     zero_centered_gamma: bool
 
 
-def _simplified_indexer_norm_spec(
+def _indexer_input_norm_spec(
     linear_qkv, config: TransformerConfig
-) -> Optional[_SimplifiedIndexerInputNormSpec]:
+) -> Optional[_DSAIndexerInputNormSpec]:
     """Describe a norm fused into main QKV without registering another parameter copy."""
     norm_weight = getattr(linear_qkv, "layer_norm_weight", None)
     if norm_weight is None:
         return None
     norm_bias = getattr(linear_qkv, "layer_norm_bias", None)
-    return _SimplifiedIndexerInputNormSpec(
+    return _DSAIndexerInputNormSpec(
         normalization=config.normalization,
         weight=norm_weight.detach(),
         bias=None if norm_bias is None else norm_bias.detach(),
@@ -106,15 +113,15 @@ def _simplified_indexer_norm_spec(
     )
 
 
-def _simplified_indexer_input(
+def _normalized_indexer_input(
     hidden_states: torch.Tensor,
-    norm_spec: Optional[_SimplifiedIndexerInputNormSpec],
+    norm_spec: Optional[_DSAIndexerInputNormSpec],
 ) -> torch.Tensor:
     """Return the detached activation seen by the main Q projection.
 
-    TE layer specs commonly fuse the attention input norm into ``linear_qkv``. A simplified
-    indexer initialized from the main-Q weight must consume that normalized activation too;
-    otherwise the copied weight is applied to a different distribution. With an unfused spec,
+    TE layer specs commonly fuse the attention input norm into ``linear_qkv``. An indexer that
+    opts into the main-Q input norm must consume that normalized activation too; otherwise its
+    projection weights are applied to a different distribution. With an unfused spec,
     ``hidden_states`` has already passed through the transformer's input norm.
     """
     hidden_states = hidden_states.detach()
@@ -136,9 +143,15 @@ def _simplified_indexer_input(
                 hidden_states, normalized_shape, norm_weight, norm_spec.bias, eps
             )
     raise NotImplementedError(
-        "Simplified DSA cannot reproduce the fused main-Q input normalization "
+        "DSA cannot reproduce the fused main-Q input normalization "
         f"for normalization={norm_spec.normalization!r}."
     )
+
+
+# Preserve internal names imported by existing simplified-DSA tests and downstream code.
+_SimplifiedIndexerInputNormSpec = _DSAIndexerInputNormSpec
+_simplified_indexer_norm_spec = _indexer_input_norm_spec
+_simplified_indexer_input = _normalized_indexer_input
 
 
 def _build_selected_causal_mask(
@@ -1123,7 +1136,7 @@ class DSGQACoreAttention(MegatronModule):
         attention_mask: torch.Tensor,
         hidden_states: torch.Tensor,
         use_indexer_rope: bool = False,
-        indexer_input_norm: Optional[_SimplifiedIndexerInputNormSpec] = None,
+        indexer_input_norm: Optional[_DSAIndexerInputNormSpec] = None,
         attn_mask_type: AttnMaskType = None,
         attention_bias: torch.Tensor = None,
         packed_seq_params: PackedSeqParams = None,
@@ -1167,8 +1180,10 @@ class DSGQACoreAttention(MegatronModule):
         )
 
         hidden_states = hidden_states.detach()
-        if simplified_indexer:
-            hidden_states = _simplified_indexer_input(hidden_states, indexer_input_norm)
+        if simplified_indexer or getattr(
+            self.config, "dsa_standard_indexer_use_main_input_norm", False
+        ):
+            hidden_states = _normalized_indexer_input(hidden_states, indexer_input_norm)
 
         if attn_mask_type is not None:
             assert attn_mask_type == AttnMaskType.causal, 'Only causal mask is supported for now'
@@ -1431,7 +1446,7 @@ class DSGQACoreAttention(MegatronModule):
         attention_mask: torch.Tensor,
         hidden_states: torch.Tensor,
         use_indexer_rope: bool = False,
-        indexer_input_norm: Optional[_SimplifiedIndexerInputNormSpec] = None,
+        indexer_input_norm: Optional[_DSAIndexerInputNormSpec] = None,
         attn_mask_type: AttnMaskType = None,
         attention_bias: torch.Tensor = None,
         packed_seq_params: PackedSeqParams = None,
@@ -1662,7 +1677,53 @@ class DSGQACoreAttention(MegatronModule):
             layer_number=self.layer_number,
             num_layers=self.config.num_layers,
         )
-        return DSAIndexerLossAutoScaler.apply(output, indexer_loss)
+        mass_loss_coeff = getattr(self.config, "dsa_topk_mass_loss_coeff", 0.0)
+        output_loss_coeff = getattr(
+            self.config, "dsa_output_consistency_loss_coeff", 0.0
+        )
+        if mass_loss_coeff <= 0.0 and output_loss_coeff <= 0.0:
+            return DSAIndexerLossAutoScaler.apply(output, indexer_loss)
+
+        output = DSAIndexerLossAutoScaler.apply(output, indexer_loss)
+        mass_loss, output_loss, captured_mass = dsa_main_attention_aux_loss(
+            query=query,
+            key=key,
+            value=value,
+            hidden_states=hidden_states.detach(),
+            indexer=self.indexer,
+            attention_softmax_scale=self.softmax_scale,
+            use_indexer_rope=use_indexer_rope,
+            aux_topk=self.config.dsa_attention_aux_topk,
+            mass_loss_coeff=mass_loss_coeff,
+            mass_target=self.config.dsa_topk_mass_target,
+            output_loss_coeff=output_loss_coeff,
+            query_chunk_size=getattr(self.config, "dsa_kernel_query_block_size", None),
+            key_chunk_size=getattr(self.config, "dsa_kernel_key_block_size", None),
+            simplified_input_norm=indexer_input_norm,
+            profile_enabled=getattr(self.config, "dsa_min_memory_profile", False),
+            profile_rank=getattr(self.config, "dsa_min_memory_profile_rank", 0),
+            profile_label=f"layer={self.layer_number}",
+            use_triton=dsa_kernel_backend == "triton-min-memory",
+        )
+        zero = captured_mass.new_zeros(())
+        raw_mass_loss = mass_loss / mass_loss_coeff if mass_loss_coeff > 0.0 else zero
+        raw_output_loss = (
+            output_loss / output_loss_coeff if output_loss_coeff > 0.0 else zero
+        )
+        DSAMainAttentionAuxLossLoggingHelper.save_loss_to_tracker(
+            captured_mass=captured_mass,
+            mass_loss=mass_loss,
+            raw_mass_loss=raw_mass_loss,
+            output_loss=output_loss,
+            raw_output_loss=raw_output_loss,
+            layer_number=self.layer_number,
+            num_layers=self.config.num_layers,
+            tp_group=self.indexer.pg_collection.tp,
+        )
+        aux_loss = mass_loss if mass_loss_coeff > 0.0 else output_loss
+        if mass_loss_coeff > 0.0 and output_loss_coeff > 0.0:
+            aux_loss = mass_loss + output_loss
+        return DSAMainAttentionAuxLossAutoScaler.apply(output, aux_loss)
 
     def forward_dynamic(
         self,
@@ -1674,7 +1735,7 @@ class DSGQACoreAttention(MegatronModule):
         provider_layer_number: int,
         block_table: torch.Tensor,
         use_indexer_rope: bool = False,
-        indexer_input_norm: Optional[_SimplifiedIndexerInputNormSpec] = None,
+        indexer_input_norm: Optional[_DSAIndexerInputNormSpec] = None,
     ) -> torch.Tensor:
         assert not self.training, "Dynamic DSA-GQA inference only supports eval mode."
         assert value_cache is not None, "Dynamic DSA-GQA requires value cache."
@@ -1685,8 +1746,11 @@ class DSGQACoreAttention(MegatronModule):
         simplified_learned_k = simplified_indexer and getattr(
             self.config, "dsa_simplified_use_learned_k", False
         )
+        if simplified_indexer or getattr(
+            self.config, "dsa_standard_indexer_use_main_input_norm", False
+        ):
+            hidden_states = _normalized_indexer_input(hidden_states, indexer_input_norm)
         if simplified_indexer:
-            hidden_states = _simplified_indexer_input(hidden_states, indexer_input_norm)
             if simplified_learned_k:
                 q_index, k_index_current = self.indexer.forward_qk_dynamic(
                     hidden_states,
@@ -1731,6 +1795,15 @@ class DSGQACoreAttention(MegatronModule):
         q_cursor = 0
         block_size_tokens = inference_context.block_size_tokens
         num_requests = inference_context.padded_active_request_count
+        diagnostics = getattr(inference_context, "dsa_diagnostics", None)
+        diagnostics_enabled = diagnostics is not None and diagnostics.enabled
+        active_request_ids = (
+            inference_context.request_ids[
+                inference_context.paused_request_count : inference_context.total_request_count
+            ]
+            if diagnostics_enabled
+            else None
+        )
 
         for request_idx in range(num_requests):
             query_length = int(query_lengths[request_idx].item())
@@ -1771,6 +1844,19 @@ class DSGQACoreAttention(MegatronModule):
             request_mask = _build_shifted_causal_mask(
                 query_length, key_length, request_offset, request_query.device
             )
+            request_id = None
+            diagnostic_queries = []
+            if diagnostics_enabled and diagnostics.layer_enabled(self.layer_number):
+                assert active_request_ids is not None
+                if request_idx >= active_request_ids.numel():
+                    raise RuntimeError("DSA diagnostics encountered an unmapped padded request.")
+                request_id = int(active_request_ids[request_idx].item())
+                diagnostic_queries = diagnostics.selected_queries(
+                    request_id=request_id,
+                    layer_number=self.layer_number,
+                    query_start_position=request_offset,
+                    query_length=query_length,
+                )
 
             key_chunk_size = getattr(self.config, "dsa_indexer_topk_key_chunk_size", None)
             if simplified_indexer and (key_chunk_size is None or key_chunk_size <= 0):
@@ -1820,6 +1906,50 @@ class DSGQACoreAttention(MegatronModule):
                     self.indexer.index_topk,
                     request_mask,
                 )
+
+            diagnostic_topk_indices = None
+            if diagnostic_queries:
+                diagnostic_rows = torch.tensor(
+                    [item["local_index"] for item in diagnostic_queries],
+                    device=request_q_index.device,
+                    dtype=torch.long,
+                )
+                diagnostic_topk = min(max(diagnostics.topk_values), key_length)
+                if diagnostic_topk <= topk_indices.size(-1):
+                    diagnostic_topk_indices = topk_indices.index_select(1, diagnostic_rows)
+                else:
+                    diagnostic_q_index = request_q_index.index_select(0, diagnostic_rows)
+                    diagnostic_mask = request_mask.index_select(0, diagnostic_rows)
+                    diagnostic_key_chunk_size = key_chunk_size
+                    if diagnostic_key_chunk_size is None or diagnostic_key_chunk_size <= 0:
+                        diagnostic_key_chunk_size = getattr(
+                            self.config, "dsa_kernel_key_block_size", None
+                        )
+                    if diagnostic_key_chunk_size is None or diagnostic_key_chunk_size <= 0:
+                        diagnostic_key_chunk_size = 2048
+                    diagnostic_weights = (
+                        None
+                        if request_weights is None
+                        else request_weights.index_select(0, diagnostic_rows)
+                    )
+                    if simplified_indexer:
+                        _, diagnostic_topk_indices = _simplified_qk_topk_chunked(
+                            diagnostic_q_index,
+                            request_index_key,
+                            diagnostic_topk,
+                            self.indexer.softmax_scale,
+                            diagnostic_mask,
+                            diagnostic_key_chunk_size,
+                        )
+                    else:
+                        _, diagnostic_topk_indices = fused_qk_topk_chunked(
+                            diagnostic_q_index,
+                            request_index_key,
+                            diagnostic_weights,
+                            diagnostic_topk,
+                            diagnostic_mask,
+                            diagnostic_key_chunk_size,
+                        )
             sparse_attention_query_chunk_size = getattr(
                 self.config, "dsa_sparse_attention_query_chunk_size", None
             )
@@ -1830,7 +1960,7 @@ class DSGQACoreAttention(MegatronModule):
                 sparse_attention_query_chunk_size = getattr(
                     self.config, "dsa_kernel_query_block_size", None
                 )
-            output[query_start:query_end] = unfused_grouped_dsa_fn(
+            request_output = unfused_grouped_dsa_fn(
                 request_query,
                 request_key,
                 request_value,
@@ -1844,6 +1974,54 @@ class DSGQACoreAttention(MegatronModule):
                     else getattr(self.config, "dsa_sparse_attention_use_gather", False)
                 ),
             )
+            output[query_start:query_end] = request_output
+
+            if diagnostic_queries:
+                tp_group = self.indexer.pg_collection.tp
+                assert_tp_support_consistent(
+                    topk_indices.index_select(1, diagnostic_rows),
+                    tp_group,
+                    "model",
+                )
+                assert_tp_support_consistent(
+                    diagnostic_topk_indices,
+                    tp_group,
+                    "expanded",
+                )
+                for diagnostic_idx, query_metadata in enumerate(diagnostic_queries):
+                    local_idx = query_metadata["local_index"]
+                    metrics = compute_dsa_attention_diagnostics(
+                        query=request_query[local_idx : local_idx + 1],
+                        key=request_key,
+                        value=request_value,
+                        indexer_support=diagnostic_topk_indices[0, diagnostic_idx],
+                        model_support=topk_indices[0, local_idx],
+                        softmax_scale=self.softmax_scale,
+                        topk_values=diagnostics.topk_values,
+                        query_position=query_metadata["position"],
+                        tp_group=tp_group,
+                        model_output=request_output[local_idx],
+                        dump_support_indices=diagnostics.dump_support_indices,
+                    )
+                    diagnostics.record(
+                        {
+                            "request_id": request_id,
+                            "layer": self.layer_number,
+                            "phase": query_metadata["phase"],
+                            "offset": query_metadata["offset"],
+                            "query_position": query_metadata["position"],
+                            "prompt_length": query_metadata["prompt_length"],
+                            "context_length": key_length,
+                            "model_topk": self.indexer.index_topk,
+                            "diagnostic_score_precision": "fp32",
+                            "indexer_mode": (
+                                "simplified_learned_k"
+                                if simplified_learned_k
+                                else "simplified_main_k" if simplified_indexer else "standard"
+                            ),
+                            **metrics,
+                        }
+                    )
 
         if q_cursor != inference_context.active_token_count:
             raise RuntimeError(
@@ -1941,11 +2119,16 @@ class DSGroupedSelfAttention(SelfAttention):
         if self.config.experimental_attention_variant != "dsa":
             return {}
         indexer_input_norm = None
+        simplified_indexer = getattr(self.config, "dsa_indexer_mode", "standard") == "simplified"
+        normalized_standard_indexer = (
+            not simplified_indexer
+            and getattr(self.config, "dsa_standard_indexer_use_main_input_norm", False)
+        )
         if (
-            getattr(self.config, "dsa_indexer_mode", "standard") == "simplified"
+            (simplified_indexer or normalized_standard_indexer)
             and not getattr(self.config, "dsa_fwd_skip_dsa", False)
         ):
-            indexer_input_norm = _simplified_indexer_norm_spec(self.linear_qkv, self.config)
+            indexer_input_norm = _indexer_input_norm_spec(self.linear_qkv, self.config)
         return {
             "hidden_states": hidden_states,
             "use_indexer_rope": self._use_indexer_rope(
@@ -1967,7 +2150,7 @@ class DSGroupedSelfAttention(SelfAttention):
         packed_seq_params: Optional[PackedSeqParams],
         hidden_states: torch.Tensor,
         use_indexer_rope: bool,
-        indexer_input_norm: Optional[_SimplifiedIndexerInputNormSpec] = None,
+        indexer_input_norm: Optional[_DSAIndexerInputNormSpec] = None,
     ) -> torch.Tensor:
         if self.config.experimental_attention_variant != "dsa":
             return super()._dynamic_core_attention_forward(

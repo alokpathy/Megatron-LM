@@ -292,6 +292,9 @@ class TransformerConfig(ModelParallelConfig):
     dsa_simplified_use_learned_k: bool = False
     """Whether simplified DSA uses a learned indexer K instead of main-attention K."""
 
+    dsa_standard_indexer_use_main_input_norm: bool = False
+    """Whether standard DSA consumes the normalized input used by the main QKV projection."""
+
     dsa_indexer_n_heads: Optional[int] = None
     """Number of DSA indexer heads."""
 
@@ -309,6 +312,29 @@ class TransformerConfig(ModelParallelConfig):
 
     dsa_min_memory_profile_rank: int = 0
     """Global rank that prints DSA min-memory timings. Set to -1 to print on every rank."""
+
+    dsa_diagnostics: bool = False
+    """Whether to collect sampled dense-vs-sparse diagnostics during dynamic DSA inference."""
+
+    dsa_diagnostics_output_dir: Optional[str] = None
+    """Directory for rank-local DSA diagnostic JSONL shards."""
+
+    dsa_diagnostics_layers: Optional[List[int]] = None
+    """Optional 1-indexed DSA layer numbers to diagnose; all DSA layers when unset."""
+
+    dsa_diagnostics_topk_values: List[int] = field(
+        default_factory=lambda: [512, 1024, 2048, 4096, 8192]
+    )
+    """Support budgets evaluated by sampled DSA diagnostics."""
+
+    dsa_diagnostics_prefill_tail_offsets: List[int] = field(default_factory=lambda: [0])
+    """Prompt query offsets measured backward from the final prefill token."""
+
+    dsa_diagnostics_decode_offsets: List[int] = field(default_factory=list)
+    """Zero-based generated-token offsets selected as decode diagnostic queries."""
+
+    dsa_diagnostics_dump_support_indices: bool = False
+    """Whether diagnostic JSONL records include potentially large support-index arrays."""
 
     dsa_kernel_query_block_size: Optional[int] = None
     """Optional query tile size for DSA min-memory kernel backends."""
@@ -359,6 +385,18 @@ class TransformerConfig(ModelParallelConfig):
 
     dsa_indexer_loss_coeff: Optional[float] = None
     """Coefficient for the DSA indexer KL divergence loss. Set to 0 to disable indexer loss."""
+
+    dsa_attention_aux_topk: Optional[int] = None
+    """Direct router top-k used by optional main-attention auxiliary losses."""
+
+    dsa_topk_mass_loss_coeff: float = 0.0
+    """Coefficient for the main-attention top-k captured-mass hinge loss."""
+
+    dsa_topk_mass_target: float = 0.95
+    """Target dense-attention probability mass inside dsa_attention_aux_topk."""
+
+    dsa_output_consistency_loss_coeff: float = 0.0
+    """Coefficient for sparse output consistency against a stop-gradient dense output."""
 
     dsa_indexer_loss_recompute: bool = False
     """Whether to recompute the DSA indexer KL loss during backward to reduce activation memory."""
@@ -2239,6 +2277,36 @@ class TransformerConfig(ModelParallelConfig):
         assert (
             not self.dsa_fwd_use_dense_attn or self.experimental_attention_variant == "dsa"
         ), "dsa_fwd_use_dense_attn requires experimental_attention_variant='dsa'."
+        assert not self.dsa_diagnostics or self.experimental_attention_variant == "dsa", (
+            "dsa_diagnostics requires experimental_attention_variant='dsa'."
+        )
+        if self.dsa_diagnostics:
+            assert self.dsa_diagnostics_output_dir, (
+                "dsa_diagnostics_output_dir must be set when DSA diagnostics are enabled."
+            )
+            assert self.cuda_graph_impl == "none", (
+                "dsa_diagnostics requires cuda_graph_impl='none' because CUDA graph replay "
+                "bypasses Python-side diagnostic query selection."
+            )
+            assert self.dsa_diagnostics_topk_values and all(
+                value > 0 for value in self.dsa_diagnostics_topk_values
+            ), "dsa_diagnostics_topk_values must contain positive integers."
+            assert all(value > 0 for value in (self.dsa_diagnostics_layers or [])), (
+                "dsa_diagnostics_layers must contain positive 1-indexed layer numbers."
+            )
+            assert all(value <= self.num_layers for value in (self.dsa_diagnostics_layers or [])), (
+                "dsa_diagnostics_layers cannot exceed num_layers."
+            )
+            assert all(value >= 0 for value in self.dsa_diagnostics_prefill_tail_offsets), (
+                "dsa_diagnostics_prefill_tail_offsets must be non-negative."
+            )
+            assert all(value >= 0 for value in self.dsa_diagnostics_decode_offsets), (
+                "dsa_diagnostics_decode_offsets must be non-negative."
+            )
+            assert (
+                self.dsa_diagnostics_prefill_tail_offsets
+                or self.dsa_diagnostics_decode_offsets
+            ), "DSA diagnostics require at least one prefill-tail or decode offset."
         assert (
             self.dsa_indexer_mode == "standard"
             or self.experimental_attention_variant == "dsa"
@@ -2249,6 +2317,13 @@ class TransformerConfig(ModelParallelConfig):
         ), (
             "dsa_simplified_use_learned_k requires experimental_attention_variant='dsa' "
             "and dsa_indexer_mode='simplified'."
+        )
+        assert not self.dsa_standard_indexer_use_main_input_norm or (
+            self.experimental_attention_variant == "dsa"
+            and self.dsa_indexer_mode == "standard"
+        ), (
+            "dsa_standard_indexer_use_main_input_norm requires "
+            "experimental_attention_variant='dsa' and dsa_indexer_mode='standard'."
         )
         assert (
             not self.dsa_fwd_skip_dsa or self.experimental_attention_variant == "dsa"
@@ -2340,6 +2415,16 @@ class TransformerConfig(ModelParallelConfig):
             assert self.dsa_indexer_topk is not None and self.dsa_indexer_topk > 0, (
                 "dsa_indexer_topk must be set to a positive integer when using DSA."
             )
+            attention_aux_enabled = (
+                self.dsa_topk_mass_loss_coeff > 0.0
+                or self.dsa_output_consistency_loss_coeff > 0.0
+            )
+            assert self.dsa_topk_mass_loss_coeff >= 0.0, (
+                "dsa_topk_mass_loss_coeff must be non-negative."
+            )
+            assert self.dsa_output_consistency_loss_coeff >= 0.0, (
+                "dsa_output_consistency_loss_coeff must be non-negative."
+            )
             assert (
                 not self.dsa_train_indexer_only or (self.dsa_indexer_loss_coeff or 0.0) > 0.0
             ), "dsa_train_indexer_only requires dsa_indexer_loss_coeff > 0."
@@ -2359,6 +2444,32 @@ class TransformerConfig(ModelParallelConfig):
                 and not dense_dsa_warmup
                 and not self.dsa_indexer_use_sparse_loss
             )
+            if attention_aux_enabled:
+                if self.dsa_topk_mass_loss_coeff > 0.0:
+                    assert 0.0 < self.dsa_topk_mass_target <= 1.0, (
+                        "dsa_topk_mass_target must be in (0, 1]."
+                    )
+                if self.dsa_attention_aux_topk is None:
+                    self.dsa_attention_aux_topk = self.dsa_indexer_topk
+                assert self.dsa_attention_aux_topk > 0, (
+                    "dsa_attention_aux_topk must be positive."
+                )
+                assert self.dsa_attention_aux_topk <= self.dsa_indexer_topk, (
+                    "dsa_attention_aux_topk cannot exceed dsa_indexer_topk."
+                )
+                assert min_memory_dsa_backend, (
+                    "DSA main-attention auxiliary losses require a min-memory backend."
+                )
+                assert not skip_dsa and not dense_dsa_warmup, (
+                    "DSA main-attention auxiliary losses require sparse forward attention."
+                )
+                assert not self.dsa_train_indexer_only, (
+                    "DSA main-attention auxiliary losses update the backbone and are incompatible "
+                    "with dsa_train_indexer_only."
+                )
+                assert self.attention_dropout == 0.0, (
+                    "DSA main-attention auxiliary losses initially require attention_dropout=0."
+                )
             assert self.dsa_kernel_backend in (
                 'reference',
                 'triton-min-memory',
