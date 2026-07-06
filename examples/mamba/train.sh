@@ -128,6 +128,8 @@ torchrun \
     --async-save \
     --use-persistent-ckpt-worker \
     --ckpt-assume-constant-structure \
+    --wandb-project atripathy-cudnn-dsa \
+    --wandb-exp-name ${NAME} \
     --log-interval 1 \
     --log-memory-interval 1 \
     --log-params-norm \
