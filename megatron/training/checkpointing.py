@@ -128,6 +128,7 @@ def check_checkpoint_args(checkpoint_args):
     _compare('experimental_attention_variant', default=None)
     _compare('dsa_indexer_mode', default='standard')
     _compare('dsa_simplified_use_learned_k', default=False)
+    _compare('dsa_standard_indexer_use_main_input_norm', default=False)
     _compare('dsa_indexer_n_heads', default=None)
     _compare('dsa_indexer_head_dim', default=None)
     _compare('dsa_indexer_topk', default=None)
@@ -1486,8 +1487,11 @@ def load_args_from_checkpoint(
         # arguments; otherwise an old checkpoint can accidentally retain a runtime True value.
         if not hasattr(checkpoint_args, 'dsa_simplified_use_learned_k'):
             setattr(checkpoint_args, 'dsa_simplified_use_learned_k', False)
+        if not hasattr(checkpoint_args, 'dsa_standard_indexer_use_main_input_norm'):
+            setattr(checkpoint_args, 'dsa_standard_indexer_use_main_input_norm', False)
         _set_arg('dsa_indexer_mode', force=True)
         _set_arg('dsa_simplified_use_learned_k', force=True)
+        _set_arg('dsa_standard_indexer_use_main_input_norm', force=True)
         _set_arg('dsa_indexer_n_heads', force=True)
         _set_arg('dsa_indexer_head_dim', force=True)
         _set_arg('dsa_indexer_topk', force=True)

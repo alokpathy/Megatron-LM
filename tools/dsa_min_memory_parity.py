@@ -35,6 +35,7 @@ def _import_dsa_modules() -> None:
     global dsa_min_memory_gqa_forward_only
     global _project_k_index_block
     global _project_q_index_tile
+    global _indexer_input_norm_stats
     global _selected_index_scores_tile
     global _project_simplified_q_index_tile
     global _routing_key_chunk_size
@@ -65,6 +66,7 @@ def _import_dsa_modules() -> None:
         dsa_min_memory_gqa_forward_only as _dsa_min_memory_gqa_forward_only,
         _project_k_index_block as _project_k_index_block_imported,
         _project_q_index_tile as _project_q_index_tile_imported,
+        _indexer_input_norm_stats as _indexer_input_norm_stats_imported,
         _project_simplified_q_index_tile as _project_simplified_q_index_tile_imported,
         _routing_key_chunk_size as _routing_key_chunk_size_imported,
         _selected_index_scores_tile as _selected_index_scores_tile_imported,
@@ -83,6 +85,7 @@ def _import_dsa_modules() -> None:
     dsa_min_memory_gqa_forward_only = _dsa_min_memory_gqa_forward_only
     _project_k_index_block = _project_k_index_block_imported
     _project_q_index_tile = _project_q_index_tile_imported
+    _indexer_input_norm_stats = _indexer_input_norm_stats_imported
     _project_simplified_q_index_tile = _project_simplified_q_index_tile_imported
     _routing_key_chunk_size = _routing_key_chunk_size_imported
     _selected_index_scores_tile = _selected_index_scores_tile_imported
@@ -517,6 +520,56 @@ def _indexer_from_case(case: Case, args, pg_collection):
     )()
 
 
+def _standard_input_norm(args, device: torch.device, dtype: torch.dtype):
+    if args.standard_input_norm == "none":
+        return None
+    weight = torch.linspace(0.75, 1.25, args.hidden_size, device=device, dtype=dtype)
+    if args.zero_centered_gamma:
+        weight = weight - 1.0
+    bias = (
+        torch.linspace(-0.1, 0.1, args.hidden_size, device=device, dtype=dtype)
+        if args.standard_input_norm == "layernorm"
+        else None
+    )
+    return SimpleNamespace(
+        normalization=(
+            "LayerNorm" if args.standard_input_norm == "layernorm" else "RMSNorm"
+        ),
+        weight=weight,
+        bias=bias,
+        eps=args.layernorm_eps,
+        zero_centered_gamma=args.zero_centered_gamma,
+    )
+
+
+def _standard_indexer_input_oracle(
+    hidden_states: torch.Tensor,
+    args,
+    norm_stats: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    norm = _standard_input_norm(args, hidden_states.device, hidden_states.dtype)
+    if norm is None:
+        return hidden_states
+    weight = norm.weight + 1.0 if norm.zero_centered_gamma else norm.weight
+    if norm.normalization == "RMSNorm":
+        hidden_float = hidden_states.float()
+        rstd = norm_stats
+        if rstd is None:
+            rstd = torch.rsqrt(
+                hidden_float.square().mean(dim=-1, keepdim=True) + norm.eps
+            )
+        elif rstd.dim() == hidden_states.dim() - 1:
+            rstd = rstd.unsqueeze(-1)
+        return (hidden_float * rstd * weight.float()).to(hidden_states.dtype)
+    return F.layer_norm(
+        hidden_states,
+        (hidden_states.size(-1),),
+        weight,
+        norm.bias,
+        norm.eps,
+    )
+
+
 def _simplified_indexer_from_case(case: Case, args, pg_collection):
     indexer = type(
         "_SimplifiedIndexer",
@@ -583,15 +636,23 @@ def _apply_rope_oracle(
     return torch.cat((tensor_nope, tensor_pe), dim=-1)
 
 
-def _project_indexer(case: Case, args, rotary_pos_emb):
+def _project_indexer(
+    case: Case,
+    args,
+    rotary_pos_emb,
+    input_norm_stats: Optional[torch.Tensor] = None,
+):
     """Standard-DSA projection oracle independent of min-memory projection helpers."""
-    q_index = F.linear(case.hidden_states, case.linear_q_weight).reshape(
+    indexer_input = _standard_indexer_input_oracle(
+        case.hidden_states, args, norm_stats=input_norm_stats
+    )
+    q_index = F.linear(indexer_input, case.linear_q_weight).reshape(
         args.seq_len,
         args.batch_size,
         args.indexer_heads,
         args.indexer_head_dim,
     )
-    k_index = F.linear(case.hidden_states, case.linear_k_weight)
+    k_index = F.linear(indexer_input, case.linear_k_weight)
     k_index = F.layer_norm(
         k_index,
         (args.indexer_head_dim,),
@@ -619,7 +680,7 @@ def _project_indexer(case: Case, args, rotary_pos_emb):
         # suitable elementwise oracle for this component.
         q_index = rotate_activation(q_index)
         k_index = rotate_activation(k_index)
-    weights = F.linear(case.hidden_states, case.linear_weights_weight)
+    weights = F.linear(indexer_input, case.linear_weights_weight)
     weights = weights * (args.indexer_heads**-0.5) * (args.indexer_head_dim**-0.5)
     return q_index, k_index, weights
 
@@ -655,8 +716,16 @@ def _reference_teacher_scores(
     return teacher / teacher.sum(dim=-1, keepdim=True)
 
 
-def _reference_run(case: Case, args, rotary_pos_emb, topk_override: Optional[torch.Tensor] = None):
-    q_index, k_index, weights = _project_indexer(case, args, rotary_pos_emb)
+def _reference_run(
+    case: Case,
+    args,
+    rotary_pos_emb,
+    topk_override: Optional[torch.Tensor] = None,
+    input_norm_stats: Optional[torch.Tensor] = None,
+):
+    q_index, k_index, weights = _project_indexer(
+        case, args, rotary_pos_emb, input_norm_stats=input_norm_stats
+    )
     index_scores, natural_topk_indices = fused_qk_topk_naive(
         q_index, k_index, weights, args.topk, _causal_mask(args.seq_len, case.query.device)
     )
@@ -706,6 +775,7 @@ def _reference_run(case: Case, args, rotary_pos_emb, topk_override: Optional[tor
 
 
 def _min_memory_run(case: Case, args, rotary_pos_emb, use_triton: bool):
+    input_norm = _standard_input_norm(args, case.hidden_states.device, case.hidden_states.dtype)
     output, loss = DSAMinMemoryGQAFn.apply(
         case.query,
         case.key,
@@ -738,6 +808,7 @@ def _min_memory_run(case: Case, args, rotary_pos_emb, use_triton: bool):
         args.cache_indexer_k,
         args.cache_selected_scores,
         use_triton,
+        input_norm,
     )
     (output.float().sum() + loss.float()).backward()
     return {
@@ -759,6 +830,10 @@ def _min_memory_components(case: Case, args, rotary_pos_emb, use_triton: bool):
     all_teacher_scores = []
     all_sparse_outputs = []
     with _triton_dispatch_enabled(use_triton), torch.no_grad():
+        input_norm = _standard_input_norm(
+            args, case.hidden_states.device, case.hidden_states.dtype
+        )
+        input_norm_stats = _indexer_input_norm_stats(case.hidden_states, input_norm)
         for q_start in range(0, args.seq_len, args.query_block_size):
             q_end = min(q_start + args.query_block_size, args.seq_len)
             topk_scores, topk_indices, q_index, weights = _topk_index_tile(
@@ -781,6 +856,8 @@ def _min_memory_components(case: Case, args, rotary_pos_emb, use_triton: bool):
                 args.indexer_rotary_dim > 0,
                 args.hadamard,
                 key_block,
+                input_norm,
+                input_norm_stats,
             )
             if topk_indices.size(-1) < target_topk:
                 pad = target_topk - topk_indices.size(-1)
@@ -806,6 +883,8 @@ def _min_memory_components(case: Case, args, rotary_pos_emb, use_triton: bool):
                 args.rotary_interleaved,
                 args.indexer_rotary_dim > 0,
                 args.hadamard,
+                input_norm,
+                input_norm_stats,
             )
             teacher_scores = _teacher_scores_tile(
                 case.query[q_start:q_end],
@@ -833,6 +912,7 @@ def _min_memory_components(case: Case, args, rotary_pos_emb, use_triton: bool):
     return {
         "q_index": torch.cat(q_indices, dim=0),
         "weights": torch.cat(all_weights, dim=0),
+        "input_norm_stats": input_norm_stats,
         "topk_scores": torch.cat(all_topk_scores, dim=1),
         "topk_indices": torch.cat(all_topk_indices, dim=1),
         "selected_scores": torch.cat(all_selected_scores, dim=1),
@@ -948,6 +1028,7 @@ def _dense_min_memory_loss_and_grads(
     use_triton: bool,
 ) -> Tuple[torch.Tensor, Dict[str, Optional[torch.Tensor]], Dict[str, Optional[torch.Tensor]]]:
     indexer = _indexer_from_case(case, args, pg_collection)
+    input_norm = _standard_input_norm(args, case.hidden_states.device, case.hidden_states.dtype)
     loss = dsa_dense_indexer_loss(
         query=case.query,
         key=case.key,
@@ -959,6 +1040,7 @@ def _dense_min_memory_loss_and_grads(
         query_chunk_size=args.query_block_size,
         key_chunk_size=args.key_block_size,
         use_triton=use_triton,
+        simplified_input_norm=input_norm,
     )
     grad_inputs = (
         case.linear_q_weight,
@@ -1062,6 +1144,7 @@ def _dense_full_support_run(case: Case, args, pg_collection, use_triton: bool):
         use_gather=False,
     )
     indexer = _indexer_from_case(case, args, pg_collection)
+    input_norm = _standard_input_norm(args, case.hidden_states.device, case.hidden_states.dtype)
     loss = dsa_dense_indexer_loss(
         query=case.query,
         key=case.key,
@@ -1073,6 +1156,7 @@ def _dense_full_support_run(case: Case, args, pg_collection, use_triton: bool):
         query_chunk_size=args.query_block_size,
         key_chunk_size=args.key_block_size,
         use_triton=use_triton,
+        simplified_input_norm=input_norm,
     )
     grad_inputs = (
         case.query,
@@ -1170,6 +1254,7 @@ def _min_memory_sparse_fwd_dense_loss_run(
     use_triton: bool,
 ):
     indexer = _indexer_from_case(case, args, pg_collection)
+    input_norm = _standard_input_norm(args, case.hidden_states.device, case.hidden_states.dtype)
     output, sparse_loss = dsa_min_memory_gqa(
         query=case.query,
         key=case.key,
@@ -1185,6 +1270,7 @@ def _min_memory_sparse_fwd_dense_loss_run(
         cache_indexer_k=args.cache_indexer_k,
         cache_selected_scores=False,
         use_triton=use_triton,
+        simplified_input_norm=input_norm,
     )
     hidden_for_loss = case.hidden_states.detach().requires_grad_(True)
     loss = dsa_dense_indexer_loss(
@@ -1198,6 +1284,7 @@ def _min_memory_sparse_fwd_dense_loss_run(
         query_chunk_size=args.query_block_size,
         key_chunk_size=args.key_block_size,
         use_triton=use_triton,
+        simplified_input_norm=input_norm,
     )
     grad_inputs = (
         case.query,
@@ -2569,6 +2656,11 @@ def _attention_aux_support(
     )
     support = []
     with torch.no_grad(), _triton_dispatch_enabled(use_triton):
+        input_norm_stats = (
+            None
+            if args.attention_aux_simplified
+            else _indexer_input_norm_stats(case.hidden_states, simplified_input_norm)
+        )
         for q_start in range(0, args.seq_len, query_chunk_size):
             q_end = min(q_start + query_chunk_size, args.seq_len)
             if args.attention_aux_simplified:
@@ -2612,6 +2704,8 @@ def _attention_aux_support(
                     args.indexer_rotary_dim > 0,
                     args.hadamard,
                     key_chunk_size,
+                    simplified_input_norm,
+                    input_norm_stats,
                 )
             support.append(indices)
     return torch.cat(support, dim=1)
@@ -2720,7 +2814,11 @@ def _run_attention_aux_parity(
     base = _make_case(args, device, dtype)
     actual_case = _clone_case(base)
     reference_case = _clone_case(base)
-    simplified_input_norm = _attention_aux_input_norm(args, device, dtype)
+    simplified_input_norm = (
+        _attention_aux_input_norm(args, device, dtype)
+        if args.attention_aux_simplified
+        else _standard_input_norm(args, device, dtype)
+    )
     actual_indexer = (
         _simplified_indexer_from_case(actual_case, args, pg_collection)
         if args.attention_aux_simplified
@@ -2907,9 +3005,18 @@ def _parse_args():
         help="Synthetic fused main-Q input norm used by simplified-mode parity checks.",
     )
     parser.add_argument(
+        "--standard-input-norm",
+        choices=("none", "rmsnorm", "layernorm"),
+        default="none",
+        help=(
+            "Synthetic detached main-Q input norm used by standard-DSA parity checks. "
+            "This exercises --dsa-standard-indexer-use-main-input-norm semantics."
+        ),
+    )
+    parser.add_argument(
         "--zero-centered-gamma",
         action="store_true",
-        help="Interpret the synthetic simplified input-norm weight as zero-centered gamma.",
+        help="Interpret the selected synthetic input-norm weight as zero-centered gamma.",
     )
     parser.add_argument("--hadamard", action="store_true")
     parser.add_argument("--loss-coeff", type=float, default=0.7)
@@ -3028,7 +3135,8 @@ def main() -> int:
         f"DSA parity backend={args.backend} device={device} dtype={dtype} "
         f"S={args.seq_len} B={args.batch_size} Hq={args.num_query_heads} "
         f"G={args.num_query_groups} topk={args.topk} index_dim={args.indexer_head_dim} "
-        f"hadamard={args.hadamard} rotary_dim={args.indexer_rotary_dim}",
+        f"hadamard={args.hadamard} rotary_dim={args.indexer_rotary_dim} "
+        f"input_norm={args.standard_input_norm}",
         flush=True,
     )
 
@@ -3038,15 +3146,40 @@ def main() -> int:
 
     components = _min_memory_components(comp_case, args, rotary_pos_emb, use_triton)
     ref_case = _clone_case(base)
+    # Top-k is discontinuous at BF16 rounding boundaries. Validate Triton RSTD
+    # independently below, then hold it fixed while checking the remaining pipeline.
     with _triton_dispatch_enabled(False):
         reference = _reference_run(
-            ref_case, args, rotary_pos_emb, topk_override=components["topk_indices"]
+            ref_case,
+            args,
+            rotary_pos_emb,
+            topk_override=components["topk_indices"],
+            input_norm_stats=components["input_norm_stats"],
         )
     min_memory = _min_memory_run(min_case, args, rotary_pos_emb, use_triton)
 
     failures = 0
-    failures += not _check_tensor("q_index", components["q_index"], reference["q_index"], atol, rtol, args.fail_fast)
-    failures += not _check_tensor("weights", components["weights"], reference["weights"], atol, rtol, args.fail_fast)
+    if components["input_norm_stats"] is not None:
+        with torch.no_grad():
+            hidden_float = comp_case.hidden_states.float()
+            reference_rstd = torch.rsqrt(
+                hidden_float.square().mean(dim=-1) + args.layernorm_eps
+            )
+    if components["input_norm_stats"] is not None:
+        failures += not _check_tensor(
+            "input_norm_rstd",
+            components["input_norm_stats"],
+            reference_rstd,
+            2.0e-5,
+            2.0e-5,
+            args.fail_fast,
+        )
+    failures += not _check_tensor(
+        "q_index", components["q_index"], reference["q_index"], atol, rtol, args.fail_fast
+    )
+    failures += not _check_tensor(
+        "weights", components["weights"], reference["weights"], atol, rtol, args.fail_fast
+    )
     failures += not _check_topk_support_with_score_error(
         "topk_support",
         components["topk_indices"],

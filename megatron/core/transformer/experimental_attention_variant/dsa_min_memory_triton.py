@@ -485,6 +485,7 @@ def _dsa_linear_wgrad_kernel(
         "topk",
         "hidden_size",
         "out_features",
+        "APPLY_INPUT_NORM",
         "USE_BF16_OPERANDS",
         "USE_FP16_OPERANDS",
     ],
@@ -494,6 +495,8 @@ def _dsa_selected_k_linear_kernel(
     hidden_ptr,
     topk_indices_ptr,
     weight_ptr,
+    input_norm_weight_ptr,
+    input_norm_rstd_ptr,
     out_ptr,
     total_rows: tl.constexpr,
     query_len: tl.constexpr,
@@ -508,12 +511,16 @@ def _dsa_selected_k_linear_kernel(
     ti_stride_k: tl.constexpr,
     weight_stride_o: tl.constexpr,
     weight_stride_i: tl.constexpr,
+    inw_stride_h: tl.constexpr,
+    inr_stride_s: tl.constexpr,
+    inr_stride_b: tl.constexpr,
     out_stride_b: tl.constexpr,
     out_stride_m: tl.constexpr,
     out_stride_k: tl.constexpr,
     out_stride_d: tl.constexpr,
     USE_BF16_OPERANDS: tl.constexpr,
     USE_FP16_OPERANDS: tl.constexpr,
+    APPLY_INPUT_NORM: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
     BLOCK_H: tl.constexpr,
@@ -538,6 +545,14 @@ def _dsa_selected_k_linear_kernel(
         mask=row_mask,
         other=0,
     )
+    if APPLY_INPUT_NORM:
+        input_rstd = tl.load(
+            input_norm_rstd_ptr
+            + selected * inr_stride_s
+            + batch_idx * inr_stride_b,
+            mask=row_mask,
+            other=0.0,
+        ).to(tl.float32)
 
     acc = tl.zeros((BLOCK_N, BLOCK_D), dtype=tl.float32)
     for hidden_start in tl.range(0, hidden_size, BLOCK_H):
@@ -550,6 +565,13 @@ def _dsa_selected_k_linear_kernel(
             mask=row_mask[:, None] & (hidden_offsets[None, :] < hidden_size),
             other=0.0,
         )
+        if APPLY_INPUT_NORM:
+            input_norm_weight = tl.load(
+                input_norm_weight_ptr + hidden_offsets * inw_stride_h,
+                mask=hidden_offsets < hidden_size,
+                other=0.0,
+            ).to(tl.float32)
+            hidden = hidden.to(tl.float32) * input_rstd[:, None] * input_norm_weight[None, :]
         weight = tl.load(
             weight_ptr
             + offs_d[None, :] * weight_stride_o
@@ -592,6 +614,7 @@ def _dsa_selected_k_linear_kernel(
         "USE_ROPE",
         "USE_HADAMARD",
         "HAS_BIAS",
+        "APPLY_INPUT_NORM",
         "USE_BF16_OPERANDS",
         "USE_FP16_OPERANDS",
         "STORE_K_LINEAR",
@@ -602,6 +625,8 @@ def _dsa_selected_k_project_score_kernel(
     hidden_ptr,
     topk_indices_ptr,
     linear_k_weight_ptr,
+    input_norm_weight_ptr,
+    input_norm_rstd_ptr,
     k_norm_weight_ptr,
     k_norm_bias_ptr,
     q_ptr,
@@ -627,6 +652,9 @@ def _dsa_selected_k_project_score_kernel(
     ti_stride_k: tl.constexpr,
     lkw_stride_o: tl.constexpr,
     lkw_stride_i: tl.constexpr,
+    inw_stride_h: tl.constexpr,
+    inr_stride_s: tl.constexpr,
+    inr_stride_b: tl.constexpr,
     knw_stride_d: tl.constexpr,
     knb_stride_d: tl.constexpr,
     q_stride_m: tl.constexpr,
@@ -652,6 +680,7 @@ def _dsa_selected_k_project_score_kernel(
     USE_ROPE: tl.constexpr,
     USE_HADAMARD: tl.constexpr,
     HAS_BIAS: tl.constexpr,
+    APPLY_INPUT_NORM: tl.constexpr,
     USE_BF16_OPERANDS: tl.constexpr,
     USE_FP16_OPERANDS: tl.constexpr,
     STORE_K_LINEAR: tl.constexpr,
@@ -697,6 +726,14 @@ def _dsa_selected_k_project_score_kernel(
         mask=row_mask,
         other=0,
     )
+    if APPLY_INPUT_NORM:
+        input_rstd = tl.load(
+            input_norm_rstd_ptr
+            + selected * inr_stride_s
+            + batch_idx * inr_stride_b,
+            mask=row_mask,
+            other=0.0,
+        ).to(tl.float32)
 
     k_linear = tl.zeros((BLOCK_N, BLOCK_D), dtype=tl.float32)
     for hidden_start in tl.range(0, hidden_size, BLOCK_H):
@@ -709,6 +746,13 @@ def _dsa_selected_k_project_score_kernel(
             mask=row_mask_hidden & (hidden_offsets[None, :] < hidden_size),
             other=0.0,
         )
+        if APPLY_INPUT_NORM:
+            input_norm_weight = tl.load(
+                input_norm_weight_ptr + hidden_offsets * inw_stride_h,
+                mask=hidden_offsets < hidden_size,
+                other=0.0,
+            ).to(tl.float32)
+            hidden = hidden.to(tl.float32) * input_rstd[:, None] * input_norm_weight[None, :]
         linear_k_weight = tl.load(
             linear_k_weight_ptr
             + offs_d_weight * lkw_stride_o
@@ -1176,7 +1220,6 @@ def _dsa_simplified_input_norm_stats_kernel(
         "topk",
         "USE_BF16_OPERANDS",
         "USE_FP16_OPERANDS",
-        "ZERO_CENTERED_GAMMA",
     ],
 )
 @triton.jit
@@ -1209,7 +1252,6 @@ def _dsa_simplified_gathered_linear_wgrad_kernel(
     out_stride_i: tl.constexpr,
     USE_BF16_OPERANDS: tl.constexpr,
     USE_FP16_OPERANDS: tl.constexpr,
-    ZERO_CENTERED_GAMMA: tl.constexpr,
     BLOCK_O: tl.constexpr,
     BLOCK_I: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -1261,12 +1303,6 @@ def _dsa_simplified_gathered_linear_wgrad_kernel(
             mask=offs_i < hidden_size,
             other=0.0,
         ).to(tl.float32)
-        if ZERO_CENTERED_GAMMA:
-            norm_weight += 1.0
-            if USE_BF16_OPERANDS:
-                norm_weight = norm_weight.to(tl.bfloat16).to(tl.float32)
-            elif USE_FP16_OPERANDS:
-                norm_weight = norm_weight.to(tl.float16).to(tl.float32)
         hidden = hidden * rstd[:, None] * norm_weight[None, :]
         if USE_BF16_OPERANDS:
             grad_output = grad_output.to(tl.bfloat16)
@@ -3445,6 +3481,9 @@ def triton_selected_k_linear(
     hidden_states: torch.Tensor,
     topk_indices: torch.Tensor,
     linear_k_weight: torch.Tensor,
+    input_norm_weight: Optional[torch.Tensor] = None,
+    input_norm_stats: Optional[torch.Tensor] = None,
+    input_norm_zero_centered_gamma: bool = False,
 ) -> Optional[torch.Tensor]:
     if _triton_disabled():
         return None
@@ -3460,6 +3499,23 @@ def triton_selected_k_linear(
         return None
     if linear_k_weight.dtype != hidden_states.dtype:
         return None
+    apply_input_norm = input_norm_weight is not None or input_norm_stats is not None
+    if apply_input_norm:
+        if input_norm_weight is None or input_norm_stats is None:
+            return None
+        if not _supported_tensor(input_norm_weight):
+            return None
+        if (
+            input_norm_weight.device != hidden_states.device
+            or input_norm_stats.device != hidden_states.device
+        ):
+            return None
+        if input_norm_weight.numel() != hidden_states.size(-1):
+            return None
+        if input_norm_stats.shape != hidden_states.shape[:2]:
+            return None
+        if not input_norm_stats.is_cuda or input_norm_stats.dtype != torch.float32:
+            return None
     if hidden_states.dim() != 3 or topk_indices.dim() != 3 or linear_k_weight.dim() != 2:
         return None
     if hidden_states.size(1) != topk_indices.size(0):
@@ -3475,6 +3531,14 @@ def triton_selected_k_linear(
             (*topk_indices.shape, out_features), dtype=hidden_states.dtype
         )
 
+    # Match PyTorch/TE zero-centered-gamma semantics: gamma + 1 is formed in
+    # the norm parameter dtype before normalization proceeds in FP32.
+    effective_input_norm_weight = None
+    if apply_input_norm:
+        effective_input_norm_weight = input_norm_weight.detach()
+        if input_norm_zero_centered_gamma:
+            effective_input_norm_weight = effective_input_norm_weight + 1.0
+
     output = hidden_states.new_empty(
         (*topk_indices.shape, out_features), dtype=hidden_states.dtype
     )
@@ -3489,6 +3553,8 @@ def triton_selected_k_linear(
             hidden_states,
             topk_indices,
             linear_k_weight,
+            effective_input_norm_weight if apply_input_norm else linear_k_weight,
+            input_norm_stats if apply_input_norm else hidden_states,
             output,
             total_rows,
             query_len,
@@ -3498,9 +3564,20 @@ def triton_selected_k_linear(
             *hidden_states.stride(),
             *topk_indices.stride(),
             *linear_k_weight.stride(),
+            (
+                effective_input_norm_weight.stride(0)
+                if apply_input_norm
+                else linear_k_weight.stride(-1)
+            ),
+            *(
+                input_norm_stats.stride()
+                if apply_input_norm
+                else hidden_states.stride()[:2]
+            ),
             *output.stride(),
             USE_BF16_OPERANDS=hidden_states.dtype == torch.bfloat16,
             USE_FP16_OPERANDS=hidden_states.dtype == torch.float16,
+            APPLY_INPUT_NORM=apply_input_norm,
         )
     except _TRITON_RESOURCE_ERRORS:
         return None
@@ -3526,6 +3603,9 @@ def triton_selected_index_scores_from_hidden(
     mscale: float,
     interpolation_scale: float,
     return_k_linear: bool = False,
+    input_norm_weight: Optional[torch.Tensor] = None,
+    input_norm_stats: Optional[torch.Tensor] = None,
+    input_norm_zero_centered_gamma: bool = False,
 ) -> Optional[Tuple[torch.Tensor, Optional[torch.Tensor]]]:
     if _triton_disabled():
         return None
@@ -3551,6 +3631,23 @@ def triton_selected_index_scores_from_hidden(
         return None
     if linear_k_weight.dtype != hidden_states.dtype:
         return None
+    apply_input_norm = input_norm_weight is not None or input_norm_stats is not None
+    if apply_input_norm:
+        if input_norm_weight is None or input_norm_stats is None:
+            return None
+        if not _supported_tensor(input_norm_weight):
+            return None
+        if (
+            input_norm_weight.device != hidden_states.device
+            or input_norm_stats.device != hidden_states.device
+        ):
+            return None
+        if input_norm_weight.numel() != hidden_states.size(-1):
+            return None
+        if input_norm_stats.shape != hidden_states.shape[:2]:
+            return None
+        if not input_norm_stats.is_cuda or input_norm_stats.dtype != torch.float32:
+            return None
     if hidden_states.dim() != 3 or topk_indices.dim() != 3 or linear_k_weight.dim() != 2:
         return None
     if hidden_states.size(1) != topk_indices.size(0):
@@ -3593,6 +3690,14 @@ def triton_selected_index_scores_from_hidden(
     if not use_indexer_rope:
         inv_freq = k_norm_weight.new_empty((1,), dtype=torch.float32)
 
+    # Keep gamma formation in the source parameter dtype, as in the exact
+    # tiled PyTorch normalization path, before the kernel promotes it to FP32.
+    effective_input_norm_weight = None
+    if apply_input_norm:
+        effective_input_norm_weight = input_norm_weight.detach()
+        if input_norm_zero_centered_gamma:
+            effective_input_norm_weight = effective_input_norm_weight + 1.0
+
     total_rows = topk_indices.numel()
     scores = torch.empty((batch_size, query_len, topk), device=hidden_states.device, dtype=torch.float32)
     store_k_linear = return_k_linear or use_indexer_rope
@@ -3610,6 +3715,8 @@ def triton_selected_index_scores_from_hidden(
             hidden_states,
             topk_indices,
             linear_k_weight,
+            effective_input_norm_weight if apply_input_norm else linear_k_weight,
+            input_norm_stats if apply_input_norm else hidden_states,
             k_norm_weight,
             k_norm_bias,
             q_index,
@@ -3630,6 +3737,16 @@ def triton_selected_index_scores_from_hidden(
             *hidden_states.stride(),
             *topk_indices.stride(),
             *linear_k_weight.stride(),
+            (
+                effective_input_norm_weight.stride(0)
+                if apply_input_norm
+                else linear_k_weight.stride(-1)
+            ),
+            *(
+                input_norm_stats.stride()
+                if apply_input_norm
+                else hidden_states.stride()[:2]
+            ),
             *k_norm_weight.stride(),
             *(k_norm_bias.stride() if has_k_norm_bias else (1,)),
             *q_index.stride(),
@@ -3644,6 +3761,7 @@ def triton_selected_index_scores_from_hidden(
             USE_ROPE=use_indexer_rope,
             USE_HADAMARD=use_hadamard,
             HAS_BIAS=has_k_norm_bias,
+            APPLY_INPUT_NORM=apply_input_norm,
             USE_BF16_OPERANDS=hidden_states.dtype == torch.bfloat16,
             USE_FP16_OPERANDS=hidden_states.dtype == torch.float16,
             STORE_K_LINEAR=store_k_linear,
@@ -3897,6 +4015,12 @@ def triton_simplified_gathered_linear_wgrad(
     if total_rows == 0:
         return True
 
+    # Form the effective gamma in the parameter dtype. This agrees with the
+    # forward normalization even when norm and activation dtypes differ.
+    effective_norm_weight = norm_weight.detach()
+    if zero_centered_gamma:
+        effective_norm_weight = effective_norm_weight + 1.0
+
     out_delta = torch.empty_like(grad_weight, dtype=torch.float32)
     wgrad_grid = lambda meta: (
         triton.cdiv(out_features, meta["BLOCK_O"]),
@@ -3907,7 +4031,7 @@ def triton_simplified_gathered_linear_wgrad(
             grad_output,
             hidden_states,
             topk_indices,
-            norm_weight,
+            effective_norm_weight,
             rstd,
             out_delta,
             total_rows,
@@ -3918,12 +4042,11 @@ def triton_simplified_gathered_linear_wgrad(
             *grad_output.stride(),
             *hidden_states.stride(),
             *topk_indices.stride(),
-            norm_weight.stride(0),
+            effective_norm_weight.stride(0),
             *rstd.stride(),
             *out_delta.stride(),
             USE_BF16_OPERANDS=hidden_states.dtype == torch.bfloat16,
             USE_FP16_OPERANDS=hidden_states.dtype == torch.float16,
-            ZERO_CENTERED_GAMMA=bool(zero_centered_gamma),
         )
     except _TRITON_RESOURCE_ERRORS:
         return False

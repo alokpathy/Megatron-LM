@@ -925,6 +925,15 @@ def validate_args(args, defaults={}):
         raise AssertionError(
             '--dsa-simplified-use-learned-k requires --dsa-indexer-mode simplified'
         )
+    if getattr(args, 'dsa_standard_indexer_use_main_input_norm', False):
+        assert args.experimental_attention_variant == 'dsa', (
+            '--dsa-standard-indexer-use-main-input-norm requires '
+            '--experimental-attention-variant dsa'
+        )
+        assert getattr(args, 'dsa_indexer_mode', 'standard') == 'standard', (
+            '--dsa-standard-indexer-use-main-input-norm requires '
+            '--dsa-indexer-mode standard'
+        )
     if getattr(args, 'dsa_indexer_reset_method', 'random') != 'random':
         assert getattr(args, 'dsa_reset_indexer_on_load', False), \
             '--dsa-indexer-reset-method requires --dsa-reset-indexer-on-load'
@@ -3168,6 +3177,15 @@ def _add_experimental_attention_variant_args(parser):
         help=(
             'Use a separate learned K projection for simplified DSA instead of reusing the '
             'main-attention K cache.'
+        ),
+    )
+    _maybe_add_argument(
+        '--dsa-standard-indexer-use-main-input-norm',
+        action='store_true',
+        help=(
+            'Make the standard DSA Q, K, and routing-weight projections consume the detached '
+            'normalized activation used by the main QKV projection. The default preserves the '
+            'historical residual-stream input.'
         ),
     )
     _maybe_add_argument(

@@ -88,7 +88,7 @@ def _build_shifted_causal_mask(
 
 
 @dataclass(frozen=True)
-class _SimplifiedIndexerInputNormSpec:
+class _DSAIndexerInputNormSpec:
     normalization: str
     weight: torch.Tensor
     bias: Optional[torch.Tensor]
@@ -96,15 +96,15 @@ class _SimplifiedIndexerInputNormSpec:
     zero_centered_gamma: bool
 
 
-def _simplified_indexer_norm_spec(
+def _indexer_input_norm_spec(
     linear_qkv, config: TransformerConfig
-) -> Optional[_SimplifiedIndexerInputNormSpec]:
+) -> Optional[_DSAIndexerInputNormSpec]:
     """Describe a norm fused into main QKV without registering another parameter copy."""
     norm_weight = getattr(linear_qkv, "layer_norm_weight", None)
     if norm_weight is None:
         return None
     norm_bias = getattr(linear_qkv, "layer_norm_bias", None)
-    return _SimplifiedIndexerInputNormSpec(
+    return _DSAIndexerInputNormSpec(
         normalization=config.normalization,
         weight=norm_weight.detach(),
         bias=None if norm_bias is None else norm_bias.detach(),
@@ -113,15 +113,15 @@ def _simplified_indexer_norm_spec(
     )
 
 
-def _simplified_indexer_input(
+def _normalized_indexer_input(
     hidden_states: torch.Tensor,
-    norm_spec: Optional[_SimplifiedIndexerInputNormSpec],
+    norm_spec: Optional[_DSAIndexerInputNormSpec],
 ) -> torch.Tensor:
     """Return the detached activation seen by the main Q projection.
 
-    TE layer specs commonly fuse the attention input norm into ``linear_qkv``. A simplified
-    indexer initialized from the main-Q weight must consume that normalized activation too;
-    otherwise the copied weight is applied to a different distribution. With an unfused spec,
+    TE layer specs commonly fuse the attention input norm into ``linear_qkv``. An indexer that
+    opts into the main-Q input norm must consume that normalized activation too; otherwise its
+    projection weights are applied to a different distribution. With an unfused spec,
     ``hidden_states`` has already passed through the transformer's input norm.
     """
     hidden_states = hidden_states.detach()
@@ -143,9 +143,15 @@ def _simplified_indexer_input(
                 hidden_states, normalized_shape, norm_weight, norm_spec.bias, eps
             )
     raise NotImplementedError(
-        "Simplified DSA cannot reproduce the fused main-Q input normalization "
+        "DSA cannot reproduce the fused main-Q input normalization "
         f"for normalization={norm_spec.normalization!r}."
     )
+
+
+# Preserve internal names imported by existing simplified-DSA tests and downstream code.
+_SimplifiedIndexerInputNormSpec = _DSAIndexerInputNormSpec
+_simplified_indexer_norm_spec = _indexer_input_norm_spec
+_simplified_indexer_input = _normalized_indexer_input
 
 
 def _build_selected_causal_mask(
@@ -1130,7 +1136,7 @@ class DSGQACoreAttention(MegatronModule):
         attention_mask: torch.Tensor,
         hidden_states: torch.Tensor,
         use_indexer_rope: bool = False,
-        indexer_input_norm: Optional[_SimplifiedIndexerInputNormSpec] = None,
+        indexer_input_norm: Optional[_DSAIndexerInputNormSpec] = None,
         attn_mask_type: AttnMaskType = None,
         attention_bias: torch.Tensor = None,
         packed_seq_params: PackedSeqParams = None,
@@ -1174,8 +1180,10 @@ class DSGQACoreAttention(MegatronModule):
         )
 
         hidden_states = hidden_states.detach()
-        if simplified_indexer:
-            hidden_states = _simplified_indexer_input(hidden_states, indexer_input_norm)
+        if simplified_indexer or getattr(
+            self.config, "dsa_standard_indexer_use_main_input_norm", False
+        ):
+            hidden_states = _normalized_indexer_input(hidden_states, indexer_input_norm)
 
         if attn_mask_type is not None:
             assert attn_mask_type == AttnMaskType.causal, 'Only causal mask is supported for now'
@@ -1438,7 +1446,7 @@ class DSGQACoreAttention(MegatronModule):
         attention_mask: torch.Tensor,
         hidden_states: torch.Tensor,
         use_indexer_rope: bool = False,
-        indexer_input_norm: Optional[_SimplifiedIndexerInputNormSpec] = None,
+        indexer_input_norm: Optional[_DSAIndexerInputNormSpec] = None,
         attn_mask_type: AttnMaskType = None,
         attention_bias: torch.Tensor = None,
         packed_seq_params: PackedSeqParams = None,
@@ -1725,7 +1733,7 @@ class DSGQACoreAttention(MegatronModule):
         provider_layer_number: int,
         block_table: torch.Tensor,
         use_indexer_rope: bool = False,
-        indexer_input_norm: Optional[_SimplifiedIndexerInputNormSpec] = None,
+        indexer_input_norm: Optional[_DSAIndexerInputNormSpec] = None,
     ) -> torch.Tensor:
         assert not self.training, "Dynamic DSA-GQA inference only supports eval mode."
         assert value_cache is not None, "Dynamic DSA-GQA requires value cache."
@@ -1736,8 +1744,11 @@ class DSGQACoreAttention(MegatronModule):
         simplified_learned_k = simplified_indexer and getattr(
             self.config, "dsa_simplified_use_learned_k", False
         )
+        if simplified_indexer or getattr(
+            self.config, "dsa_standard_indexer_use_main_input_norm", False
+        ):
+            hidden_states = _normalized_indexer_input(hidden_states, indexer_input_norm)
         if simplified_indexer:
-            hidden_states = _simplified_indexer_input(hidden_states, indexer_input_norm)
             if simplified_learned_k:
                 q_index, k_index_current = self.indexer.forward_qk_dynamic(
                     hidden_states,
@@ -2106,11 +2117,16 @@ class DSGroupedSelfAttention(SelfAttention):
         if self.config.experimental_attention_variant != "dsa":
             return {}
         indexer_input_norm = None
+        simplified_indexer = getattr(self.config, "dsa_indexer_mode", "standard") == "simplified"
+        normalized_standard_indexer = (
+            not simplified_indexer
+            and getattr(self.config, "dsa_standard_indexer_use_main_input_norm", False)
+        )
         if (
-            getattr(self.config, "dsa_indexer_mode", "standard") == "simplified"
+            (simplified_indexer or normalized_standard_indexer)
             and not getattr(self.config, "dsa_fwd_skip_dsa", False)
         ):
-            indexer_input_norm = _simplified_indexer_norm_spec(self.linear_qkv, self.config)
+            indexer_input_norm = _indexer_input_norm_spec(self.linear_qkv, self.config)
         return {
             "hidden_states": hidden_states,
             "use_indexer_rope": self._use_indexer_rope(
@@ -2132,7 +2148,7 @@ class DSGroupedSelfAttention(SelfAttention):
         packed_seq_params: Optional[PackedSeqParams],
         hidden_states: torch.Tensor,
         use_indexer_rope: bool,
-        indexer_input_norm: Optional[_SimplifiedIndexerInputNormSpec] = None,
+        indexer_input_norm: Optional[_DSAIndexerInputNormSpec] = None,
     ) -> torch.Tensor:
         if self.config.experimental_attention_variant != "dsa":
             return super()._dynamic_core_attention_forward(
