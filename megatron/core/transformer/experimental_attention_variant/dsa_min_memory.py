@@ -3918,6 +3918,7 @@ class DSAMinMemoryGQAFn(torch.autograd.Function):
             None,
             None,
             None,
+            None,  # indexer_input_norm
         )
 
 
