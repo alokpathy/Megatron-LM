@@ -114,7 +114,7 @@ torchrun \
     --no-create-attention-mask-in-dataloader \
     --use-distributed-optimizer \
     --overlap-grad-reduce \
-    --tensor-model-parallel-size 4 \
+    --tensor-model-parallel-size 1 \
     --pipeline-model-parallel-size 1 \
     --ddp-num-buckets 8 \
     --attention-backend flash \
@@ -159,7 +159,7 @@ torchrun \
     --dsa-kernel-backend ${DSA_KERNEL_BACKEND} \
     --dsa-indexer-n-heads 32 \
     --dsa-indexer-head-dim 64 \
-    --dsa-indexer-topk 256 \
+    --dsa-indexer-topk 1024 \
     --dsa-indexer-use-hadamard \
     --dsa-indexer-loss-coeff 0.01 \
     --dsa-min-memory-profile \
