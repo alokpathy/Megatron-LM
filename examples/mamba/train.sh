@@ -1,8 +1,8 @@
 #!/bin/bash
 
-# Use: bash train.sh [run-name] [1=enable-dsa (default 1)] [1=enable-nsys (default 0)] [backend (default triton)] [seq-len (default 8192)]
+# Use: bash train.sh [run-name] [1=enable-dsa (default 1)] [1=enable-nsys (default 0)] [backend (default triton)] [seq-len (default 8192)] [1=enable-wandb (default 0)]
 # backend: triton = triton-min-memory, torch = torch-min-memory, cudnn = triton-min-memory + cuDNN indexer
-# e.g. bash train.sh my_run 1 0 cudnn 16384
+# e.g. bash train.sh my_run 1 0 cudnn 16384 1
 
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export NVTE_FWD_LAYERNORM_SM_MARGIN=16
@@ -17,6 +17,7 @@ USE_DSA="${2:-1}"
 USE_NSYS="${3:-0}"
 DSA_BACKEND="${4:-triton}"  # triton | torch | cudnn
 SEQ_LEN="${5:-8192}"
+USE_WANDB="${6:-0}"
 
 if [ "${DSA_BACKEND}" = "triton" ]; then
     DSA_KERNEL_BACKEND="triton-min-memory"
@@ -31,7 +32,7 @@ else
     echo "Unknown DSA_BACKEND=${DSA_BACKEND}. Use triton, torch, or cudnn." && exit 1
 fi
 
-echo "NAME=${NAME} USE_DSA=${USE_DSA} USE_NSYS=${USE_NSYS} DSA_BACKEND=${DSA_BACKEND} SEQ_LEN=${SEQ_LEN}"
+echo "NAME=${NAME} USE_DSA=${USE_DSA} USE_NSYS=${USE_NSYS} DSA_BACKEND=${DSA_BACKEND} SEQ_LEN=${SEQ_LEN} USE_WANDB=${USE_WANDB}"
 
 TOKENIZER_MODEL="${ROOT_DIR}/tokenizers/multiMixV8.gpt4o_nc_sd.500000.128k.vocab.json"
 BLEND_PATH="${ROOT_DIR}/blend_files/1t_singlephase.json"
@@ -127,8 +128,9 @@ torchrun \
     --async-save \
     --use-persistent-ckpt-worker \
     --ckpt-assume-constant-structure \
+    $( [ "${USE_WANDB}" = "1" ] && echo "\
     --wandb-project atripathy-cudnn-dsa \
-    --wandb-exp-name ${NAME} \
+    --wandb-exp-name ${NAME}" ) \
     --log-interval 1 \
     --log-memory-interval 1 \
     --log-params-norm \
