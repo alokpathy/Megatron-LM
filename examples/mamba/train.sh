@@ -114,7 +114,7 @@ torchrun \
     --no-create-attention-mask-in-dataloader \
     --use-distributed-optimizer \
     --overlap-grad-reduce \
-    --tensor-model-parallel-size 1 \
+    --tensor-model-parallel-size 2 \
     --pipeline-model-parallel-size 1 \
     --ddp-num-buckets 8 \
     --attention-backend flash \
