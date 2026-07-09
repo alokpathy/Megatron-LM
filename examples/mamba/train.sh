@@ -164,7 +164,9 @@ torchrun \
     --dsa-indexer-loss-coeff 0.01 \
     --dsa-min-memory-profile \
     --dsa-min-memory-profile-rank 0 \
+    --dsa-kernel-cache-routing \
     --dsa-kernel-cache-indexer-k \
+    --dsa-kernel-cache-selected-scores \
     --dsa-indexer-use-sparse-loss \
     ${DSA_EXTRA} \
     --no-rope-fusion" )
