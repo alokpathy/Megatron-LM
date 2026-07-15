@@ -42,6 +42,12 @@ EMU_TP="${EMU_TP:-1}"
 EMU_EP="${EMU_EP:-1}"
 EMU_PP="${EMU_PP:-1}"
 
+echo "=================== script inputs ==================="
+echo "positional: NAME=${NAME} USE_DSA=${USE_DSA} USE_NSYS=${USE_NSYS} DSA_BACKEND=${DSA_BACKEND} SEQ_LEN=${SEQ_LEN} USE_WANDB=${USE_WANDB}"
+echo "env:        EMU_TP=${EMU_TP} EMU_EP=${EMU_EP} EMU_PP=${EMU_PP} TRAIN_ITERS=${TRAIN_ITERS:-<unset>}"
+echo "raw argv:   $0 $@"
+echo "====================================================="
+
 if [ "${DSA_BACKEND}" = "triton" ]; then
     DSA_KERNEL_BACKEND="triton-min-memory"; DSA_EXTRA=""
 elif [ "${DSA_BACKEND}" = "torch" ]; then
