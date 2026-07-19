@@ -351,6 +351,96 @@ def test_forward_step_sets_dsa_indexer_loss_scale_for_microbatch_mode(
         DSAIndexerLossAutoScaler.main_loss_backward_scale = previous_scale
 
 
+def test_forward_step_allows_missing_dsa_indexer_loss_coeff():
+    from types import SimpleNamespace
+
+    from megatron.core.pipeline_parallel.schedules import forward_step_calc_loss
+
+    previous_scale = DSAIndexerLossAutoScaler.main_loss_backward_scale
+    DSAIndexerLossAutoScaler.main_loss_backward_scale = None
+    try:
+        config = SimpleNamespace(
+            calculate_per_token_loss=False,
+            timers=None,
+            grad_scale_func=None,
+            experimental_attention_variant="dsa",
+            dsa_indexer_loss_coeff=None,
+            num_moe_experts=None,
+            mtp_num_layers=None,
+        )
+        forward_step_calc_loss(
+            model=SimpleNamespace(vp_stage=None),
+            output_tensor=torch.ones(2),
+            loss_func=lambda output: (output.sum(), {"loss": output.sum().detach()}),
+            config=config,
+            vp_stage=None,
+            collect_non_loss_data=False,
+            num_microbatches=4,
+            forward_data_store=[],
+            cp_group_size=1,
+            is_last_stage=True,
+        )
+
+        assert DSAIndexerLossAutoScaler.main_loss_backward_scale is None
+    finally:
+        DSAIndexerLossAutoScaler.main_loss_backward_scale = previous_scale
+
+
+def test_dsattention_train_main_only_routes_without_indexer_loss(monkeypatch):
+    from types import SimpleNamespace
+
+    import megatron.core.transformer.experimental_attention_variant.dsa as dsa
+
+    class _Indexer:
+        index_topk = 2
+
+        def forward_with_scores(self, x, qr, **_kwargs):
+            batch_size = x.size(1)
+            sq = x.size(0)
+            assert not x.requires_grad
+            assert not qr.requires_grad
+            return x.new_zeros((batch_size, sq, sq)), torch.zeros(
+                (batch_size, sq, self.index_topk), dtype=torch.long
+            )
+
+    class _UnexpectedIndexerLoss:
+        @staticmethod
+        def apply(*_args, **_kwargs):
+            raise AssertionError("main-only mode must not construct indexer KL")
+
+    monkeypatch.setattr(dsa, "FusedDSAIndexerLoss", _UnexpectedIndexerLoss)
+    monkeypatch.setattr(
+        dsa,
+        "unfused_dsa_fn",
+        lambda query, *_args, **_kwargs: query,
+    )
+
+    core = SimpleNamespace(
+        config=SimpleNamespace(dsa_train_main_only=True),
+        indexer=_Indexer(),
+        softmax_scale=0.5,
+        training=True,
+    )
+    query = torch.randn(4, 1, 2, 4, requires_grad=True)
+    key = torch.randn(4, 1, 2, 4, requires_grad=True)
+    value = torch.randn(4, 1, 2, 4, requires_grad=True)
+    x = torch.randn(4, 1, 8, requires_grad=True)
+    qr = torch.randn(4, 1, 4, requires_grad=True)
+
+    output = DSAttention.forward(
+        core,
+        query,
+        key,
+        value,
+        None,
+        x,
+        qr,
+        attn_mask_type=AttnMaskType.causal,
+    )
+
+    assert output is query
+
+
 def test_main_attention_aux_loss_autoscaler_attaches_scaled_loss():
     previous_scale = DSAMainAttentionAuxLossAutoScaler.main_loss_backward_scale
     try:

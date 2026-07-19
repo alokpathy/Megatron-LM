@@ -1201,7 +1201,12 @@ class DSGQACoreAttention(MegatronModule):
             if not sparse_attention_use_gather:
                 sparse_attention_mask = routing_mask
 
-        indexer_loss_coeff = getattr(self.config, 'dsa_indexer_loss_coeff', 0.0) or 0.0
+        train_main_only = getattr(self.config, "dsa_train_main_only", False)
+        indexer_loss_coeff = (
+            0.0
+            if train_main_only
+            else (getattr(self.config, 'dsa_indexer_loss_coeff', 0.0) or 0.0)
+        )
         if self.training and torch.is_grad_enabled():
             sparse_indexer_loss = getattr(self.config, "dsa_indexer_use_sparse_loss", False)
             sparse_indexer_loss_use_topk_only = getattr(
@@ -1455,8 +1460,14 @@ class DSGQACoreAttention(MegatronModule):
         dsa_kernel_backend = getattr(self.config, "dsa_kernel_backend", "reference")
         skip_dsa = getattr(self.config, "dsa_fwd_skip_dsa", False)
         dense_warmup = getattr(self.config, "dsa_fwd_use_dense_attn", False)
+        train_main_only = getattr(self.config, "dsa_train_main_only", False)
         sparse_indexer_loss = getattr(self.config, "dsa_indexer_use_sparse_loss", False)
-        sparse_fwd_dense_loss = not skip_dsa and not dense_warmup and not sparse_indexer_loss
+        sparse_fwd_dense_loss = (
+            not train_main_only
+            and not skip_dsa
+            and not dense_warmup
+            and not sparse_indexer_loss
+        )
         simplified_indexer = getattr(self.config, "dsa_indexer_mode", "standard") == "simplified"
         assert attention_bias is None, "attention_bias is not supported for DSA-GQA."
         assert packed_seq_params is None, "Packed sequence is not supported for DSA-GQA."
@@ -1523,6 +1534,17 @@ class DSGQACoreAttention(MegatronModule):
             raise NotImplementedError(
                 "Sparse-forward dense-loss mode has no selected-score sparse loss; do not set "
                 "dsa_kernel_cache_selected_scores."
+            )
+        if train_main_only and getattr(
+            self.config, "dsa_kernel_cache_selected_scores", False
+        ):
+            raise NotImplementedError(
+                "dsa_train_main_only has no selected-score KL backward; do not set "
+                "dsa_kernel_cache_selected_scores."
+            )
+        if train_main_only and (skip_dsa or dense_warmup):
+            raise NotImplementedError(
+                "dsa_train_main_only requires sparse DSA forward attention."
             )
         if not simplified_indexer and not getattr(self.config, "dsa_indexer_use_hadamard", False):
             raise NotImplementedError(
@@ -1623,12 +1645,15 @@ class DSGQACoreAttention(MegatronModule):
                 f"dsa_kernel_backend='{dsa_kernel_backend}' currently supports training only."
             )
 
-        indexer_loss_coeff = getattr(self.config, "dsa_indexer_loss_coeff", 0.0) or 0.0
-        if indexer_loss_coeff <= 0:
+        configured_indexer_loss_coeff = (
+            getattr(self.config, "dsa_indexer_loss_coeff", 0.0) or 0.0
+        )
+        if not train_main_only and configured_indexer_loss_coeff <= 0:
             raise NotImplementedError(
                 f"dsa_kernel_backend='{dsa_kernel_backend}' expects dsa_indexer_loss_coeff > 0 "
                 "for indexer training."
             )
+        indexer_loss_coeff = 0.0 if train_main_only else configured_indexer_loss_coeff
 
         sparse_loss_coeff = indexer_loss_coeff if sparse_indexer_loss else 0.0
         output, indexer_loss = dsa_min_memory_gqa(
@@ -1671,20 +1696,24 @@ class DSGQACoreAttention(MegatronModule):
                 profile_label=f"layer={self.layer_number}",
                 use_triton=dsa_kernel_backend == "triton-min-memory",
             )
-        DSAIndexerLossLoggingHelper.save_loss_to_tracker(
-            loss=indexer_loss,
-            raw_loss=indexer_loss / indexer_loss_coeff,
-            layer_number=self.layer_number,
-            num_layers=self.config.num_layers,
-        )
+        if not train_main_only:
+            DSAIndexerLossLoggingHelper.save_loss_to_tracker(
+                loss=indexer_loss,
+                raw_loss=indexer_loss / indexer_loss_coeff,
+                layer_number=self.layer_number,
+                num_layers=self.config.num_layers,
+            )
         mass_loss_coeff = getattr(self.config, "dsa_topk_mass_loss_coeff", 0.0)
         output_loss_coeff = getattr(
             self.config, "dsa_output_consistency_loss_coeff", 0.0
         )
         if mass_loss_coeff <= 0.0 and output_loss_coeff <= 0.0:
+            if train_main_only:
+                return output
             return DSAIndexerLossAutoScaler.apply(output, indexer_loss)
 
-        output = DSAIndexerLossAutoScaler.apply(output, indexer_loss)
+        if not train_main_only:
+            output = DSAIndexerLossAutoScaler.apply(output, indexer_loss)
         mass_loss, output_loss, captured_mass = dsa_main_attention_aux_loss(
             query=query,
             key=key,

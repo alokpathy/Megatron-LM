@@ -360,6 +360,9 @@ class TransformerConfig(ModelParallelConfig):
     dsa_train_indexer_only: bool = False
     """Whether to freeze non-indexer parameters and train only DSA indexer parameters."""
 
+    dsa_train_main_only: bool = False
+    """Whether to freeze DSA indexer parameters and train only non-indexer parameters."""
+
     dsa_reset_indexer_on_load: bool = False
     """Whether to reset DSA indexer parameters and optimizer state after checkpoint load."""
 
@@ -2334,8 +2337,36 @@ class TransformerConfig(ModelParallelConfig):
         assert (
             not self.dsa_train_indexer_only or self.experimental_attention_variant == "dsa"
         ), "dsa_train_indexer_only requires experimental_attention_variant='dsa'."
+        assert (
+            not self.dsa_train_main_only or self.experimental_attention_variant == "dsa"
+        ), "dsa_train_main_only requires experimental_attention_variant='dsa'."
         assert not (self.dsa_fwd_skip_dsa and self.dsa_train_indexer_only), (
             "dsa_fwd_skip_dsa is incompatible with dsa_train_indexer_only."
+        )
+        assert not (self.dsa_train_main_only and self.dsa_train_indexer_only), (
+            "dsa_train_main_only is incompatible with dsa_train_indexer_only."
+        )
+        assert not (self.dsa_train_main_only and self.dsa_fwd_skip_dsa), (
+            "dsa_train_main_only requires sparse DSA forward attention."
+        )
+        assert not (self.dsa_train_main_only and self.dsa_fwd_use_dense_attn), (
+            "dsa_train_main_only requires sparse DSA forward attention."
+        )
+        assert not (self.dsa_train_main_only and self.dsa_reset_indexer_on_load), (
+            "dsa_train_main_only is incompatible with dsa_reset_indexer_on_load."
+        )
+        assert not (
+            self.dsa_train_main_only
+            and self.dsa_indexer_activation_start_samples is not None
+        ), (
+            "dsa_train_main_only has no indexer optimizer group; leave "
+            "dsa_indexer_activation_start_samples unset."
+        )
+        assert not (
+            self.dsa_train_main_only and self.dsa_indexer_activation_warmup_samples != 0
+        ), (
+            "dsa_train_main_only has no indexer optimizer group; leave "
+            "dsa_indexer_activation_warmup_samples at zero."
         )
         assert not (self.dsa_fwd_skip_dsa and self.dsa_reset_indexer_on_load), (
             "dsa_fwd_skip_dsa must be disabled when resetting the indexer for activation."
@@ -2428,6 +2459,35 @@ class TransformerConfig(ModelParallelConfig):
             assert (
                 not self.dsa_train_indexer_only or (self.dsa_indexer_loss_coeff or 0.0) > 0.0
             ), "dsa_train_indexer_only requires dsa_indexer_loss_coeff > 0."
+            if self.dsa_train_main_only:
+                assert (self.dsa_indexer_loss_coeff or 0.0) == 0.0, (
+                    "dsa_train_main_only disables indexer KL; leave "
+                    "dsa_indexer_loss_coeff unset or set it to zero."
+                )
+                assert not self.dsa_indexer_use_sparse_loss, (
+                    "dsa_train_main_only disables indexer KL; do not set "
+                    "dsa_indexer_use_sparse_loss."
+                )
+                assert not self.dsa_indexer_sparse_loss_use_topk_only, (
+                    "dsa_train_main_only disables indexer KL; do not set "
+                    "dsa_indexer_sparse_loss_use_topk_only."
+                )
+                assert not self.dsa_indexer_loss_recompute, (
+                    "dsa_train_main_only disables indexer KL; do not set "
+                    "dsa_indexer_loss_recompute."
+                )
+                assert self.dsa_indexer_loss_query_chunk_size is None, (
+                    "dsa_train_main_only disables indexer KL; leave "
+                    "dsa_indexer_loss_query_chunk_size unset."
+                )
+                assert not self.dsa_indexer_topk_recompute, (
+                    "dsa_train_main_only uses nondifferentiable frozen routing; do not set "
+                    "dsa_indexer_topk_recompute."
+                )
+                assert not self.dsa_kernel_cache_selected_scores, (
+                    "dsa_train_main_only has no selected-score KL backward; do not set "
+                    "dsa_kernel_cache_selected_scores."
+                )
             assert (
                 self.dsa_indexer_topk_key_chunk_size is None
                 or self.dsa_indexer_topk_key_chunk_size > 0
@@ -2440,6 +2500,7 @@ class TransformerConfig(ModelParallelConfig):
             dense_dsa_warmup = self.dsa_fwd_use_dense_attn
             sparse_fwd_dense_loss = (
                 min_memory_dsa_backend
+                and not self.dsa_train_main_only
                 and not skip_dsa
                 and not dense_dsa_warmup
                 and not self.dsa_indexer_use_sparse_loss
@@ -2601,6 +2662,8 @@ class TransformerConfig(ModelParallelConfig):
                         "dsa_fwd_use_dense_attn has no selected scores; do not set "
                         "dsa_kernel_cache_selected_scores."
                     )
+                elif self.dsa_train_main_only:
+                    pass
                 else:
                     assert (self.dsa_indexer_loss_coeff or 0.0) > 0.0, (
                         "min-memory dsa_kernel_backend requires dsa_indexer_loss_coeff > 0."

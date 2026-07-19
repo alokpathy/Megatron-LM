@@ -1285,6 +1285,52 @@ def test_standard_main_input_norm_is_model_defining_checkpoint_metadata(monkeypa
     assert loaded_args.dsa_standard_indexer_use_main_input_norm is True
 
 
+def test_dsa_trainability_mode_requires_no_load_optim_for_transitions(monkeypatch):
+    import megatron.training.checkpointing as checkpointing
+
+    common = dict(
+        num_layers=1,
+        hidden_size=32,
+        num_attention_heads=4,
+        add_position_embedding=True,
+        experimental_attention_variant="dsa",
+        dsa_indexer_mode="standard",
+        dsa_simplified_use_learned_k=False,
+        dsa_simplified_indexer_disable_main_input_norm=False,
+        dsa_standard_indexer_use_main_input_norm=False,
+        dsa_indexer_n_heads=2,
+        dsa_indexer_head_dim=8,
+        dsa_indexer_topk=4,
+        dsa_indexer_use_hadamard=True,
+        vocab_file=None,
+        data_parallel_random_init=False,
+        phase_transition_iterations=None,
+        use_dist_ckpt=True,
+    )
+    runtime_args = SimpleNamespace(
+        **common,
+        dsa_train_main_only=True,
+        dsa_train_indexer_only=False,
+        no_load_optim=False,
+        finetune=False,
+    )
+    monkeypatch.setattr(checkpointing, "get_args", lambda: runtime_args)
+    monkeypatch.setattr(checkpointing, "get_checkpoint_version", lambda: 3.0)
+
+    checkpointing.check_checkpoint_args(
+        SimpleNamespace(
+            **common,
+            dsa_train_main_only=True,
+            dsa_train_indexer_only=False,
+        )
+    )
+    with pytest.raises(AssertionError, match="Use --no-load-optim"):
+        checkpointing.check_checkpoint_args(SimpleNamespace(**common))
+
+    runtime_args.no_load_optim = True
+    checkpointing.check_checkpoint_args(SimpleNamespace(**common))
+
+
 def test_transformer_config_rejects_reset_while_dsa_is_still_skipped():
     with pytest.raises(AssertionError, match="disabled when resetting"):
         TransformerConfig(
@@ -1868,7 +1914,10 @@ def test_simplified_learned_k_bounds_selected_k_scratch(monkeypatch):
 
 
 @pytest.mark.parametrize("learned_k", [False, True])
-def test_simplified_zero_loss_coefficient_produces_zero_indexer_gradient(learned_k):
+@pytest.mark.parametrize("freeze_indexer", [False, True])
+def test_simplified_train_main_only_zero_loss_produces_no_indexer_update(
+    learned_k, freeze_indexer
+):
     torch.manual_seed(654)
     seqlen, batch_size, hidden_size = 6, 1, 8
     num_query_heads, head_dim, topk = 4, 2, 3
@@ -1877,6 +1926,10 @@ def test_simplified_zero_loss_coefficient_produces_zero_indexer_gradient(learned
     value = torch.randn(seqlen, batch_size, 1, head_dim, requires_grad=True)
     hidden_states = torch.randn(seqlen, batch_size, hidden_size)
     indexer = _simplified_test_indexer(hidden_size, head_dim, topk, learned_k=learned_k)
+    if freeze_indexer:
+        for param in (indexer.linear_q.weight, indexer.linear_k.weight if learned_k else None):
+            if param is not None:
+                param.requires_grad_(False)
 
     output, indexer_loss = dsa_min_memory_gqa(
         query,
@@ -1894,15 +1947,96 @@ def test_simplified_zero_loss_coefficient_produces_zero_indexer_gradient(learned
     indexer_weights = (indexer.linear_q.weight,)
     if learned_k:
         indexer_weights += (indexer.linear_k.weight,)
+    grad_inputs = (query, key, value)
+    if not freeze_indexer:
+        grad_inputs += indexer_weights
     grads = torch.autograd.grad(
         output.float().sum() + indexer_loss,
-        (query, key, value, *indexer_weights),
+        grad_inputs,
     )
 
     torch.testing.assert_close(indexer_loss, torch.zeros_like(indexer_loss))
     assert any(torch.count_nonzero(grad) for grad in grads[:3])
-    for grad in grads[3:]:
-        torch.testing.assert_close(grad, torch.zeros_like(grad))
+    if freeze_indexer:
+        assert all(not weight.requires_grad for weight in indexer_weights)
+    else:
+        for grad in grads[3:]:
+            torch.testing.assert_close(grad, torch.zeros_like(grad))
+
+
+@pytest.mark.parametrize(
+    "cache_routing,cache_indexer_k",
+    [(False, False), (True, False), (False, True), (True, True)],
+)
+def test_standard_train_main_only_zero_loss_backpropagates_only_attention(
+    cache_routing, cache_indexer_k
+):
+    torch.manual_seed(655)
+    seqlen, batch_size, hidden_size = 6, 1, 8
+    num_query_heads, num_query_groups, head_dim = 4, 2, 2
+    index_heads, index_dim, topk = 2, 4, 3
+    query = torch.randn(seqlen, batch_size, num_query_heads, head_dim, requires_grad=True)
+    key = torch.randn(seqlen, batch_size, num_query_groups, head_dim, requires_grad=True)
+    value = torch.randn(seqlen, batch_size, num_query_groups, head_dim, requires_grad=True)
+    hidden_states = torch.randn(seqlen, batch_size, hidden_size)
+    indexer = SimpleNamespace(
+        index_n_heads=index_heads,
+        index_head_dim=index_dim,
+        index_topk=topk,
+        index_rotary_dim=0,
+        rotary_pos_emb=None,
+        pg_collection=_DummyPGCollection(),
+        config=SimpleNamespace(
+            dsa_indexer_mode="standard",
+            dsa_indexer_use_hadamard=False,
+            layernorm_epsilon=1.0e-5,
+            rotary_interleaved=False,
+        ),
+    )
+    indexer.linear_q = torch.nn.Linear(
+        hidden_size, index_heads * index_dim, bias=False
+    )
+    indexer.linear_k = torch.nn.Linear(hidden_size, index_dim, bias=False)
+    indexer.k_norm = torch.nn.LayerNorm(index_dim, eps=1.0e-5)
+    indexer.linear_weights_proj = torch.nn.Linear(
+        hidden_size, index_heads, bias=False
+    )
+    indexer_modules = (
+        indexer.linear_q,
+        indexer.linear_k,
+        indexer.k_norm,
+        indexer.linear_weights_proj,
+    )
+    for module in indexer_modules:
+        module.requires_grad_(False)
+
+    output, indexer_loss = dsa_min_memory_gqa(
+        query,
+        key,
+        value,
+        hidden_states,
+        indexer,
+        head_dim**-0.5,
+        0.0,
+        False,
+        query_chunk_size=4,
+        key_chunk_size=3,
+        cache_routing=cache_routing,
+        cache_indexer_k=cache_indexer_k,
+        use_triton=False,
+    )
+    grads = torch.autograd.grad(
+        output.float().sum() + indexer_loss,
+        (query, key, value),
+    )
+
+    torch.testing.assert_close(indexer_loss, torch.zeros_like(indexer_loss))
+    assert all(torch.count_nonzero(grad) for grad in grads)
+    assert all(
+        param.grad is None
+        for module in indexer_modules
+        for param in module.parameters()
+    )
 
 
 def test_simplified_main_q_mean_reset_uses_all_query_heads():
@@ -2237,6 +2371,41 @@ def test_dsa_train_indexer_only_freezes_exactly_indexer_submodule_parameters(mon
         assert param.requires_grad == name.startswith("block.indexer.")
 
 
+def test_dsa_train_main_only_allows_pipeline_stage_without_local_indexer(monkeypatch):
+    import megatron.training.training as training
+
+    model = torch.nn.Linear(3, 2)
+    monkeypatch.setattr(training, "_global_dsa_indexer_reset_count", lambda local_count: 5)
+
+    training._freeze_dsa_indexer_parameters([model])
+
+    assert all(param.requires_grad for param in model.parameters())
+
+
+def test_dsa_train_main_only_freezes_exactly_indexer_and_preserves_other_freezes(monkeypatch):
+    import megatron.training.training as training
+
+    class _Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.backbone = torch.nn.Linear(3, 2)
+            self.block = torch.nn.Module()
+            self.block.indexer = torch.nn.Linear(3, 2)
+            self.indexer_aux = torch.nn.Linear(3, 2)
+            self.backbone.bias.requires_grad_(False)
+
+    model = _Model()
+    monkeypatch.setattr(training, "_global_dsa_indexer_reset_count", lambda count: count)
+
+    training._freeze_dsa_indexer_parameters([model])
+
+    for name, param in model.named_parameters():
+        if name.startswith("block.indexer.") or name == "backbone.bias":
+            assert not param.requires_grad
+        else:
+            assert param.requires_grad
+
+
 def test_dsa_indexer_optimizer_refresh_preserves_backbone_master_weights(monkeypatch):
     import megatron.training.training as training
 
@@ -2494,6 +2663,86 @@ def test_transformer_config_attention_aux_is_inert_by_default():
     assert config.dsa_topk_mass_loss_coeff == 0.0
     assert config.dsa_output_consistency_loss_coeff == 0.0
     assert config.dsa_attention_aux_topk is None
+
+
+@pytest.mark.parametrize(
+    "backend", ["reference", "torch-min-memory", "triton-min-memory"]
+)
+def test_transformer_config_accepts_dsa_train_main_only(backend):
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=32,
+        num_attention_heads=4,
+        experimental_attention_variant="dsa",
+        dsa_indexer_n_heads=2,
+        dsa_indexer_head_dim=8,
+        dsa_indexer_topk=4,
+        dsa_kernel_backend=backend,
+        dsa_indexer_loss_coeff=0.0,
+        dsa_indexer_use_hadamard=True,
+        dsa_train_main_only=True,
+    )
+
+    assert config.dsa_train_main_only
+    assert not config.dsa_indexer_use_sparse_loss
+
+
+def test_transformer_config_accepts_attention_aux_with_dsa_train_main_only():
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=32,
+        num_attention_heads=4,
+        experimental_attention_variant="dsa",
+        dsa_indexer_n_heads=2,
+        dsa_indexer_head_dim=8,
+        dsa_indexer_topk=4,
+        dsa_kernel_backend="triton-min-memory",
+        dsa_indexer_loss_coeff=0.0,
+        dsa_indexer_use_hadamard=True,
+        dsa_train_main_only=True,
+        dsa_topk_mass_loss_coeff=0.2,
+        dsa_output_consistency_loss_coeff=0.3,
+        attention_dropout=0.0,
+    )
+
+    assert config.dsa_attention_aux_topk == 4
+
+
+@pytest.mark.parametrize(
+    "override,match",
+    [
+        ({"dsa_indexer_loss_coeff": 0.1}, "leave dsa_indexer_loss_coeff"),
+        ({"dsa_indexer_use_sparse_loss": True}, "dsa_indexer_use_sparse_loss"),
+        ({"dsa_fwd_use_dense_attn": True}, "sparse DSA forward"),
+        ({"dsa_fwd_skip_dsa": True}, "sparse DSA forward"),
+        ({"dsa_train_indexer_only": True}, "incompatible"),
+        ({"dsa_kernel_cache_selected_scores": True}, "selected-score"),
+        ({"dsa_reset_indexer_on_load": True}, "incompatible"),
+        ({"dsa_indexer_activation_start_samples": 100}, "activation_start_samples"),
+        ({"dsa_indexer_activation_warmup_samples": 100}, "warmup_samples"),
+        ({"dsa_indexer_topk_recompute": True}, "nondifferentiable frozen routing"),
+    ],
+)
+def test_transformer_config_rejects_incompatible_dsa_train_main_only_modes(
+    override, match
+):
+    kwargs = dict(
+        num_layers=1,
+        hidden_size=32,
+        num_attention_heads=4,
+        experimental_attention_variant="dsa",
+        dsa_indexer_n_heads=2,
+        dsa_indexer_head_dim=8,
+        dsa_indexer_topk=4,
+        dsa_kernel_backend="triton-min-memory",
+        dsa_indexer_loss_coeff=0.0,
+        dsa_indexer_use_hadamard=True,
+        dsa_train_main_only=True,
+    )
+    kwargs.update(override)
+
+    with pytest.raises(AssertionError, match=match):
+        TransformerConfig(**kwargs)
 
 
 @pytest.mark.parametrize("sparse_indexer_loss", [False, True])
@@ -2814,7 +3063,260 @@ def test_min_memory_attention_aux_dispatch_is_strictly_coefficient_gated(
     assert len(aux_calls) == expected_aux_calls
 
 
-def test_simplified_dynamic_inference_uses_sparse_gather_and_main_k_cache(monkeypatch):
+def test_reference_train_main_only_routes_without_constructing_indexer_loss(monkeypatch):
+    import megatron.core.transformer.experimental_attention_variant.dsa_gqa as dsa_gqa
+
+    class _Indexer:
+        def forward_before_topk(self, hidden_states, **_kwargs):
+            sq, batch_size, _ = hidden_states.shape
+            q_index = hidden_states.new_zeros((sq, batch_size, 1, 4))
+            k_index = hidden_states.new_zeros((sq, batch_size, 1, 4))
+            weights = hidden_states.new_ones((sq, batch_size, 1))
+            return q_index, k_index, weights
+
+    topk_calls = []
+
+    def _fake_topk(q_index, _k_index, _weights, topk, _mask):
+        topk_calls.append((q_index.shape, topk))
+        sq, batch_size = q_index.shape[:2]
+        scores = q_index.new_zeros((batch_size, sq, sq), dtype=torch.float32)
+        indices = torch.zeros((batch_size, sq, topk), dtype=torch.long)
+        return scores, indices
+
+    def _unexpected_indexer_loss(*_args, **_kwargs):
+        raise AssertionError("main-only mode must not construct indexer KL")
+
+    monkeypatch.setattr(dsa_gqa, "fused_qk_topk_naive", _fake_topk)
+    monkeypatch.setattr(dsa_gqa, "compute_gqa_dsa_indexer_loss", _unexpected_indexer_loss)
+    monkeypatch.setattr(
+        dsa_gqa,
+        "unfused_grouped_dsa_fn",
+        lambda query, *_args, **_kwargs: query,
+    )
+
+    core = SimpleNamespace(
+        config=SimpleNamespace(
+            sequence_parallel=False,
+            dsa_kernel_backend="reference",
+            dsa_fwd_skip_dsa=False,
+            dsa_indexer_mode="standard",
+            dsa_sparse_attention_use_gather=False,
+            dsa_standard_indexer_use_main_input_norm=False,
+            dsa_train_main_only=True,
+            dsa_indexer_loss_coeff=0.0,
+            dsa_indexer_use_sparse_loss=False,
+            dsa_indexer_sparse_loss_use_topk_only=False,
+            dsa_indexer_loss_recompute=False,
+            dsa_indexer_topk_key_chunk_size=None,
+            dsa_indexer_topk_recompute=False,
+            dsa_sparse_attention_recompute=False,
+            dsa_sparse_attention_query_chunk_size=None,
+        ),
+        indexer=_Indexer(),
+        softmax_scale=0.5,
+        training=True,
+        layer_number=1,
+    )
+    core.indexer.index_topk = 2
+    query = torch.randn(4, 1, 4, 4, requires_grad=True)
+    key = torch.randn(4, 1, 2, 4, requires_grad=True)
+    value = torch.randn(4, 1, 2, 4, requires_grad=True)
+    hidden_states = torch.randn(4, 1, 8)
+
+    output = DSGQACoreAttention.forward(
+        core,
+        query,
+        key,
+        value,
+        None,
+        hidden_states,
+        attn_mask_type=AttnMaskType.causal,
+    )
+
+    assert output is query
+    assert topk_calls == [(torch.Size([4, 1, 1, 4]), 2)]
+
+
+def test_min_memory_train_main_only_skips_indexer_loss_and_autoscaler(monkeypatch):
+    import megatron.core.transformer.experimental_attention_variant.dsa_gqa as dsa_gqa
+
+    calls = []
+
+    def _fake_min_memory(**kwargs):
+        calls.append(kwargs)
+        return kwargs["query"], kwargs["query"].new_zeros((), dtype=torch.float32)
+
+    def _unexpected(*_args, **_kwargs):
+        raise AssertionError("main-only mode must not execute indexer-loss plumbing")
+
+    monkeypatch.setattr(dsa_gqa, "dsa_min_memory_gqa", _fake_min_memory)
+    monkeypatch.setattr(dsa_gqa, "dsa_dense_indexer_loss", _unexpected)
+    monkeypatch.setattr(
+        dsa_gqa.DSAIndexerLossLoggingHelper,
+        "save_loss_to_tracker",
+        staticmethod(_unexpected),
+    )
+    monkeypatch.setattr(
+        dsa_gqa.DSAIndexerLossAutoScaler,
+        "apply",
+        staticmethod(_unexpected),
+    )
+
+    config = SimpleNamespace(
+        dsa_kernel_backend="triton-min-memory",
+        dsa_fwd_skip_dsa=False,
+        dsa_fwd_use_dense_attn=False,
+        dsa_train_main_only=True,
+        dsa_indexer_use_sparse_loss=False,
+        dsa_indexer_mode="standard",
+        dsa_sparse_attention_use_gather=False,
+        dsa_indexer_use_hadamard=True,
+        fp8=None,
+        fp8_param=False,
+        fp4=None,
+        layernorm_zero_centered_gamma=False,
+        dsa_indexer_loss_coeff=0.0,
+        dsa_kernel_query_block_size=2,
+        dsa_kernel_key_block_size=3,
+        dsa_kernel_cache_routing=True,
+        dsa_kernel_cache_indexer_k=True,
+        dsa_kernel_cache_selected_scores=False,
+        dsa_min_memory_profile=False,
+        dsa_min_memory_profile_rank=0,
+        dsa_topk_mass_loss_coeff=0.0,
+        dsa_output_consistency_loss_coeff=0.0,
+        num_layers=1,
+    )
+    core = SimpleNamespace(
+        config=config,
+        indexer=SimpleNamespace(pg_collection=_DummyPGCollection()),
+        softmax_scale=0.5,
+        training=True,
+        layer_number=1,
+    )
+    query = torch.randn(4, 1, 4, 4, requires_grad=True)
+    key = torch.randn(4, 1, 2, 4, requires_grad=True)
+    value = torch.randn(4, 1, 2, 4, requires_grad=True)
+    hidden_states = torch.randn(4, 1, 8)
+
+    output = DSGQACoreAttention._forward_min_memory(
+        core,
+        query,
+        key,
+        value,
+        None,
+        hidden_states,
+        attn_mask_type=AttnMaskType.causal,
+    )
+
+    assert output is query
+    assert len(calls) == 1
+    assert calls[0]["loss_coeff"] == 0.0
+    assert calls[0]["cache_routing"]
+    assert calls[0]["cache_indexer_k"]
+    assert not calls[0]["cache_selected_scores"]
+
+
+def test_min_memory_train_main_only_attaches_only_main_attention_aux_loss(monkeypatch):
+    import megatron.core.transformer.experimental_attention_variant.dsa_gqa as dsa_gqa
+
+    observed = {"aux": 0, "aux_autoscaler": 0}
+
+    def _fake_min_memory(**kwargs):
+        return kwargs["query"], kwargs["query"].new_zeros((), dtype=torch.float32)
+
+    def _fake_aux(**kwargs):
+        observed["aux"] += 1
+        zero = kwargs["query"].sum() * 0.0
+        return zero.float(), zero.float(), zero.detach().float()
+
+    def _fake_aux_autoscaler(output, _loss):
+        observed["aux_autoscaler"] += 1
+        return output
+
+    def _unexpected(*_args, **_kwargs):
+        raise AssertionError("main-only mode must not execute indexer-loss plumbing")
+
+    monkeypatch.setattr(dsa_gqa, "dsa_min_memory_gqa", _fake_min_memory)
+    monkeypatch.setattr(dsa_gqa, "dsa_main_attention_aux_loss", _fake_aux)
+    monkeypatch.setattr(
+        dsa_gqa.DSAIndexerLossLoggingHelper,
+        "save_loss_to_tracker",
+        staticmethod(_unexpected),
+    )
+    monkeypatch.setattr(
+        dsa_gqa.DSAIndexerLossAutoScaler,
+        "apply",
+        staticmethod(_unexpected),
+    )
+    monkeypatch.setattr(
+        dsa_gqa.DSAMainAttentionAuxLossLoggingHelper,
+        "save_loss_to_tracker",
+        staticmethod(lambda **_kwargs: None),
+    )
+    monkeypatch.setattr(
+        dsa_gqa.DSAMainAttentionAuxLossAutoScaler,
+        "apply",
+        staticmethod(_fake_aux_autoscaler),
+    )
+
+    config = SimpleNamespace(
+        dsa_kernel_backend="torch-min-memory",
+        dsa_fwd_skip_dsa=False,
+        dsa_fwd_use_dense_attn=False,
+        dsa_train_main_only=True,
+        dsa_indexer_use_sparse_loss=False,
+        dsa_indexer_mode="standard",
+        dsa_sparse_attention_use_gather=False,
+        dsa_indexer_use_hadamard=True,
+        fp8=None,
+        fp8_param=False,
+        fp4=None,
+        layernorm_zero_centered_gamma=False,
+        dsa_indexer_loss_coeff=0.0,
+        dsa_kernel_query_block_size=2,
+        dsa_kernel_key_block_size=3,
+        dsa_kernel_cache_routing=False,
+        dsa_kernel_cache_indexer_k=False,
+        dsa_kernel_cache_selected_scores=False,
+        dsa_min_memory_profile=False,
+        dsa_min_memory_profile_rank=0,
+        dsa_topk_mass_loss_coeff=0.2,
+        dsa_topk_mass_target=0.9,
+        dsa_output_consistency_loss_coeff=0.3,
+        dsa_attention_aux_topk=2,
+        num_layers=1,
+    )
+    core = SimpleNamespace(
+        config=config,
+        indexer=SimpleNamespace(pg_collection=_DummyPGCollection()),
+        softmax_scale=0.5,
+        training=True,
+        layer_number=1,
+    )
+    query = torch.randn(4, 1, 4, 4, requires_grad=True)
+    key = torch.randn(4, 1, 2, 4, requires_grad=True)
+    value = torch.randn(4, 1, 2, 4, requires_grad=True)
+    hidden_states = torch.randn(4, 1, 8)
+
+    output = DSGQACoreAttention._forward_min_memory(
+        core,
+        query,
+        key,
+        value,
+        None,
+        hidden_states,
+        attn_mask_type=AttnMaskType.causal,
+    )
+
+    assert output is query
+    assert observed == {"aux": 1, "aux_autoscaler": 1}
+
+
+@pytest.mark.parametrize("disable_main_input_norm", [False, True])
+def test_simplified_dynamic_inference_uses_sparse_gather_and_main_k_cache(
+    monkeypatch, disable_main_input_norm
+):
     import megatron.core.transformer.experimental_attention_variant.dsa_gqa as dsa_gqa
 
     calls = []

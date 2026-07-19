@@ -1364,6 +1364,14 @@ class DSAttention(MegatronModule):
             )
 
         if self.training and torch.is_grad_enabled():
+            if getattr(self.config, "dsa_train_main_only", False):
+                _, topk_indices = self.indexer.forward_with_scores(
+                    x, qr, mask=float_mask, packed_seq_params=packed_seq_params
+                )
+                return unfused_dsa_fn(
+                    query, key, value, topk_indices, self.softmax_scale
+                )
+
             # ===================================
             # Prepare inputs for indexer loss
             # ===================================

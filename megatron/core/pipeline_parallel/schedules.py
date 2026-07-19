@@ -315,7 +315,7 @@ def forward_step_calc_loss(
     # Set the loss scale for DSA indexer KL loss.
     if (
         getattr(config, 'experimental_attention_variant', None) == 'dsa'
-        and getattr(config, 'dsa_indexer_loss_coeff', 0.0) > 0.0
+        and (getattr(config, 'dsa_indexer_loss_coeff', 0.0) or 0.0) > 0.0
     ):
         loss_scale = (
             config.grad_scale_func(torch.ones(1, device=output_tensor.device))

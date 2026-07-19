@@ -715,6 +715,48 @@ def _freeze_non_dsa_indexer_parameters(model):
     )
 
 
+def _freeze_dsa_indexer_parameters(model):
+    """Freeze DSA indexer parameters while preserving all other trainability choices."""
+
+    indexer_param_count = 0
+    indexer_element_count = 0
+    trainable_main_param_count = 0
+    trainable_main_element_count = 0
+
+    for model_module in model:
+        for name, param in model_module.named_parameters():
+            if _is_dsa_indexer_param_name(name):
+                param.requires_grad_(False)
+                indexer_param_count += 1
+                indexer_element_count += param.nelement()
+            elif param.requires_grad:
+                trainable_main_param_count += 1
+                trainable_main_element_count += param.nelement()
+
+    global_indexer_param_count = _global_dsa_indexer_reset_count(indexer_param_count)
+    global_trainable_main_param_count = _global_dsa_indexer_reset_count(
+        trainable_main_param_count
+    )
+    if global_indexer_param_count == 0:
+        raise RuntimeError(
+            "--dsa-train-main-only was set, but no DSA indexer parameters were found. "
+            "Check that --experimental-attention-variant dsa is active and DSA layers are built."
+        )
+    if global_trainable_main_param_count == 0:
+        raise RuntimeError(
+            "--dsa-train-main-only left no non-indexer parameters trainable."
+        )
+
+    print_rank_0(
+        " > DSA train-main-only: frozen indexer params "
+        f"{indexer_param_count} local tensors ({global_indexer_param_count} across ranks) / "
+        f"{indexer_element_count} local elements; trainable non-indexer params "
+        f"{trainable_main_param_count} local tensors "
+        f"({global_trainable_main_param_count} across ranks) / "
+        f"{trainable_main_element_count} local elements."
+    )
+
+
 def _is_dsa_indexer_param_name(name: str) -> bool:
     """Return true when a parameter name belongs to a DSA indexer module."""
     return name.startswith("indexer.") or ".indexer." in name
@@ -1791,6 +1833,18 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
                 "the module forward pre-hooks that overlapped param gather depends on."
             )
         _freeze_non_dsa_indexer_parameters(model)
+    elif getattr(args, "dsa_train_main_only", False):
+        if getattr(args, "experimental_attention_variant", None) != "dsa":
+            raise RuntimeError(
+                "--dsa-train-main-only requires --experimental-attention-variant dsa."
+            )
+        if getattr(args, "use_torch_fsdp2", False) or getattr(
+            args, "use_megatron_fsdp", False
+        ):
+            raise RuntimeError(
+                "--dsa-train-main-only currently supports DDP/distributed-optimizer models only."
+            )
+        _freeze_dsa_indexer_parameters(model)
 
     # Print number of parameters.
     num_parameters = sum(

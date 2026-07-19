@@ -856,6 +856,43 @@ def validate_args(args, defaults={}):
         assert not getattr(args, 'dsa_train_indexer_only', False), \
             '--dsa-fwd-skip-dsa is incompatible with --dsa-train-indexer-only'
 
+    if getattr(args, 'dsa_train_main_only', False):
+        assert args.experimental_attention_variant == 'dsa', \
+            '--dsa-train-main-only requires --experimental-attention-variant dsa'
+        assert not getattr(args, 'dsa_train_indexer_only', False), \
+            '--dsa-train-main-only is incompatible with --dsa-train-indexer-only'
+        assert not getattr(args, 'dsa_fwd_skip_dsa', False), \
+            '--dsa-train-main-only requires sparse DSA forward attention'
+        assert not getattr(args, 'dsa_fwd_use_dense_attn', False), \
+            '--dsa-train-main-only requires sparse DSA forward attention'
+        assert not getattr(args, 'dsa_reset_indexer_on_load', False), \
+            '--dsa-train-main-only is incompatible with --dsa-reset-indexer-on-load'
+        assert (getattr(args, 'dsa_indexer_loss_coeff', None) or 0.0) == 0.0, \
+            '--dsa-train-main-only requires --dsa-indexer-loss-coeff to be unset or zero'
+        assert not getattr(args, 'dsa_indexer_use_sparse_loss', False), \
+            '--dsa-train-main-only disables indexer KL; do not set --dsa-indexer-use-sparse-loss'
+        assert not getattr(args, 'dsa_indexer_sparse_loss_use_topk_only', False), \
+            '--dsa-train-main-only disables indexer KL; do not set topk-only sparse loss'
+        assert not getattr(args, 'dsa_indexer_loss_recompute', False), \
+            '--dsa-train-main-only disables indexer KL; do not set indexer-loss recompute'
+        assert getattr(args, 'dsa_indexer_loss_query_chunk_size', None) is None, \
+            '--dsa-train-main-only disables indexer KL; leave its query chunk size unset'
+        assert not getattr(args, 'dsa_indexer_topk_recompute', False), \
+            '--dsa-train-main-only uses frozen routing; do not set topk recompute'
+        assert not getattr(args, 'dsa_kernel_cache_selected_scores', False), \
+            '--dsa-train-main-only has no selected-score KL backward'
+        assert not getattr(args, 'dsa_separate_indexer_grad_clip', False), \
+            '--dsa-train-main-only has no indexer gradients to clip separately'
+        assert getattr(args, 'dsa_indexer_clip_grad', None) is None, \
+            '--dsa-train-main-only has no indexer gradients to clip'
+        assert getattr(args, 'dsa_indexer_activation_start_samples', None) is None, \
+            '--dsa-train-main-only has no indexer learning-rate activation start'
+        assert getattr(args, 'dsa_indexer_activation_warmup_samples', 0) == 0, \
+            '--dsa-train-main-only has no indexer learning-rate warmup'
+        assert not getattr(args, 'use_torch_fsdp2', False) and not getattr(
+            args, 'use_megatron_fsdp', False
+        ), '--dsa-train-main-only currently supports DDP/distributed-optimizer models only'
+
     dsa_attention_aux_enabled = (
         getattr(args, 'dsa_topk_mass_loss_coeff', 0.0) > 0.0
         or getattr(args, 'dsa_output_consistency_loss_coeff', 0.0) > 0.0
@@ -3351,6 +3388,17 @@ def _add_experimental_attention_variant_args(parser):
         help=(
             'Freeze non-indexer parameters and train only DSA indexer parameters. '
             'Intended for DSA indexer warmup from a dense GQA checkpoint.'
+        ),
+    )
+    _maybe_add_argument(
+        '--dsa-train-main-only',
+        action='store_true',
+        help=(
+            'Freeze DSA indexer parameters, skip indexer KL construction, and train only '
+            'otherwise-trainable non-indexer parameters through sparse DSA attention. '
+            'The frozen router weights can still produce changing support as backbone '
+            'representations evolve. Use --no-load-optim when transitioning into or out of '
+            'this mode.'
         ),
     )
     _maybe_add_argument(
