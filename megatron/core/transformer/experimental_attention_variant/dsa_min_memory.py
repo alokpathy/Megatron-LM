@@ -1137,10 +1137,16 @@ def _cudnn_indexer_topk_full_k(
     q_bf = q_index.permute(1, 0, 2, 3).contiguous()                 # (B, q_len, H, D)
     k_bf = k_index_full.permute(1, 0, 2).unsqueeze(2).contiguous()  # (B, k_total, 1, D)
     w_bf = weights.permute(1, 0, 2).contiguous()                   # (B, q_len, H)
+    # The kernel applies its causal mask relative to the query block (row i attends
+    # keys <= i). Query-chunking means row i is really at absolute position q_start+i,
+    # so tell the kernel each batch's query-block start offset; otherwise every
+    # q_start>0 tile is masked as if it started at position 0.
+    q_causal_offsets = torch.full((b,), q_start, dtype=torch.int32, device=q_bf.device)
     with _profile_record(profile, f"routing_cudnn_score_{profile_suffix}", q_index.device):
         with torch.cuda.nvtx.range("dsa_mm_indexer_forward_cudnn"):
             scores = _DSA.indexer_forward_wrapper(
                 q_bf, k_bf, w_bf, ratio=1, sm_scale=1.0, stream=None,
+                q_causal_offsets=q_causal_offsets,
             )["scores"]                                            # (B, q_len, k_total) FP32
     # Causal mask: query position q_start+i may attend to key positions <= q_start+i.
     # Timed separately because the masked_fill + contiguous reshape of the
