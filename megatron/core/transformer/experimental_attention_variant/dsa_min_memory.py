@@ -1151,12 +1151,25 @@ def _cudnn_indexer_topk_full_k(
             invalid = _causal_invalid_mask(q_start, q_end, 0, k_total, scores.device)  # (q_len, k_total)
             scores = scores.masked_fill(invalid.unsqueeze(0), float("-inf"))
             flat = scores.reshape(b * q_len, k_total).contiguous()
-            seq_lens = torch.full((b * q_len,), k_total, dtype=torch.int32, device=flat.device)
+            # The cuDNN varlen top-k treats seq_lens[r] as the count of valid (in
+            # this layout, contiguous-from-0) keys for row r. Causal masking leaves
+            # each row with only its finite prefix; passing a constant k_total makes
+            # the kernel scan the -inf tail and emit out-of-range indices (which then
+            # fault the downstream gather). Pass each row's true valid-key count.
+            seq_lens = torch.isfinite(flat).sum(dim=1).to(torch.int32)
     with _profile_record(profile, f"routing_cudnn_topk_{profile_suffix}", q_index.device):
         with torch.cuda.nvtx.range("dsa_mm_indexer_top_k_cudnn"):
             topk_indices = _DSA.indexer_top_k_wrapper(
                 flat, seq_lens, top_k=topk, return_val=False, stream=None,
             )["indices"].reshape(b, q_len, topk)
+            # Rows with fewer valid keys than top_k come back with -1 padding slots.
+            # Match the Triton path (which stores the first causally-invalid key
+            # position, query_pos+1): replace -1 with query_pos+1 clamped in range.
+            # It is in-range (no OOB in downstream gathers, incl. the wgrad kernel)
+            # and > query_pos, so _selected_causal_invalid_mask drops it from attention.
+            q_pos = (q_start + torch.arange(q_len, device=topk_indices.device)).view(1, q_len, 1)
+            pad_idx = torch.clamp(q_pos + 1, max=k_total - 1).to(topk_indices.dtype)
+            topk_indices = torch.where(topk_indices < 0, pad_idx, topk_indices)
     with _profile_record(profile, f"routing_cudnn_sort_{profile_suffix}", q_index.device):
         with torch.cuda.nvtx.range("dsa_mm_indexer_sort_cudnn"):
             topk_indices, _ = torch.sort(topk_indices.to(torch.long), dim=-1)
