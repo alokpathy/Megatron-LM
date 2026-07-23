@@ -42,9 +42,17 @@ EMU_TP="${EMU_TP:-1}"
 EMU_EP="${EMU_EP:-1}"
 EMU_PP="${EMU_PP:-1}"
 
+# --- DSA min-memory query chunk size (unset -> defaults to min(seq_len, 512)) ---
+QBLOCK="${QBLOCK:-}"
+if [ -n "${QBLOCK}" ]; then
+    QBLOCK_ARG="--dsa-kernel-query-block-size ${QBLOCK}"
+else
+    QBLOCK_ARG=""
+fi
+
 echo "=================== script inputs ==================="
 echo "positional: NAME=${NAME} USE_DSA=${USE_DSA} USE_NSYS=${USE_NSYS} DSA_BACKEND=${DSA_BACKEND} SEQ_LEN=${SEQ_LEN} USE_WANDB=${USE_WANDB}"
-echo "env:        EMU_TP=${EMU_TP} EMU_EP=${EMU_EP} EMU_PP=${EMU_PP} TRAIN_ITERS=${TRAIN_ITERS:-<unset>}"
+echo "env:        EMU_TP=${EMU_TP} EMU_EP=${EMU_EP} EMU_PP=${EMU_PP} TRAIN_ITERS=${TRAIN_ITERS:-<unset>} QBLOCK=${QBLOCK:-<default>}"
 echo "raw argv:   $0 $@"
 echo "====================================================="
 
@@ -114,6 +122,14 @@ L_ROUTER_TOPK=${G_ROUTER_TOPK}
 if [ "${L_ROUTER_TOPK}" -gt "${L_EXPERTS}" ]; then
     echo "WARN: router top-k ${G_ROUTER_TOPK} > local experts ${L_EXPERTS}; clamping to ${L_EXPERTS}. (EP emulation reproduces per-GPU expert COUNT, not global routing.)"
     L_ROUTER_TOPK=${L_EXPERTS}
+fi
+
+# Megatron requires pre-softmax routing when top-k == 1 (happens when EP-emulation
+# leaves a single local expert, e.g. EMU_EP=512). Post-softmax over 1 expert is a
+# no-op it refuses to run; pre-softmax is well-defined there.
+PRESOFTMAX_ARG=""
+if [ "${L_ROUTER_TOPK}" -eq 1 ]; then
+    PRESOFTMAX_ARG="--moe-router-pre-softmax"
 fi
 
 # PP splits layers (floor division; representative interleaved mix regenerated below)
@@ -217,6 +233,7 @@ torchrun \
     --moe-ffn-hidden-size ${L_MOE_FFN} \
     --moe-shared-expert-intermediate-size ${L_MOE_SHARED} \
     --moe-router-topk ${L_ROUTER_TOPK} \
+    ${PRESOFTMAX_ARG} \
     --moe-latent-size ${L_MOE_LATENT} \
     --moe-grouped-gemm \
     --moe-token-dispatcher-type alltoall \
@@ -310,5 +327,6 @@ torchrun \
     --dsa-kernel-cache-indexer-k \
     --dsa-kernel-cache-selected-scores \
     --dsa-indexer-use-sparse-loss \
+    ${QBLOCK_ARG} \
     ${DSA_EXTRA} \
     --no-rope-fusion" )
