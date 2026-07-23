@@ -27,8 +27,10 @@ for BACKEND in "${BACKENDS[@]}"; do
 
         echo "=== Running: backend=${BACKEND} seq_len=${SEQ_LEN} ==="
 
-        SEQ_LEN=${SEQ_LEN} TRAIN_ITERS=${TRAIN_ITERS} \
-            bash "${SCRIPT_DIR}/train.sh" "${NAME}" 1 0 "${BACKEND}" \
+        # SEQ_LEN must be positional arg 5 -- train.sh reads it as ${5:-8192}, NOT
+        # from the env. Passing it only as env silently ran every combo at seq 8192.
+        TRAIN_ITERS=${TRAIN_ITERS} \
+            bash "${SCRIPT_DIR}/train.sh" "${NAME}" 1 0 "${BACKEND}" "${SEQ_LEN}" \
             &> "${LOG_FILE}"
 
         echo "    Done. Extracting CSV..."
