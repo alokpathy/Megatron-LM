@@ -1182,6 +1182,54 @@ def _cudnn_indexer_topk_full_k(
     return None, topk_indices
 
 
+def _cudnn_selected_indexer_scores(
+    q_index: torch.Tensor,
+    weights: torch.Tensor,
+    full_k_index: torch.Tensor,
+    topk_indices: torch.Tensor,
+    q_start: int,
+    index_n_heads: int,
+    profile: Optional[_DSATimingProfiler] = None,
+    profile_suffix: str = "bwd",
+) -> torch.Tensor:
+    """Student top-k softmax p via cuDNN sparse_indexer_score_recompute_wrapper.
+
+    Returns p = softmax_i(sum_h ReLU(q_h . k_topk[i]) * w_h), shape (B, q_len, topk)
+    FP32, with causally-invalid top-k slots zeroed (via topk_length). This is the
+    softmax DISTRIBUTION, not the raw logits. Validated against the masked
+    softmax(selected_scores) reference to ~5e-7
+    (see experiments/validate_cudnn_student.py).
+
+    q_index:      (q_len, B, H, D)
+    weights:      (q_len, B, H)
+    full_k_index: (S_k,   B, D)     single shared indexer-K head
+    topk_indices: (B, q_len, topk)  per-batch-local key positions in [0, S_k)
+    """
+    q_bf = q_index.permute(1, 0, 2, 3).contiguous()          # (B, q_len, H, D)
+    k_bf = full_k_index.permute(1, 0, 2).contiguous()        # (B, S_k, D) 3-D MQA
+    w_bf = weights.permute(1, 0, 2).contiguous()             # (B, q_len, H)
+    topk_i32 = topk_indices.to(torch.int32).contiguous()     # wrapper requires int32
+    # Per-query count of causally-valid top-k slots (invalid slots sort to the tail,
+    # so a length-based mask matches the reference's -inf masking of future keys).
+    valid = ~_selected_causal_invalid_mask(topk_indices, q_start)  # (B, q_len, topk)
+    topk_length = valid.sum(dim=-1).to(torch.int32).contiguous()  # (B, q_len)
+    with _profile_record(
+        profile, f"selected_index_scores_cudnn_{profile_suffix}", q_index.device
+    ):
+        with torch.cuda.nvtx.range("dsa_mm_sparse_indexer_score_recompute_cudnn"):
+            out = _DSA.sparse_indexer_score_recompute_wrapper(
+                q_bf,
+                k_bf,
+                w_bf,
+                topk_i32,
+                qhead_per_kv_head=index_n_heads,
+                topk_length=topk_length,
+                topk_indices_global=False,
+                stream=None,
+            )
+    return out["predict"]                                     # (B, q_len, topk) FP32
+
+
 def _topk_index_tile(
     hidden_states: torch.Tensor,
     q_start: int,
@@ -3572,6 +3620,16 @@ class DSAMinMemoryGQAFn(torch.autograd.Function):
                         if cached_selected_scores is not None
                         else None
                     )
+                    # cuDNN student score-recompute: gated on dsa_use_cudnn (via
+                    # _cudnn_available_for_indexer) and the cached full indexer-K.
+                    # When on, the student softmax p is computed by cuDNN and the
+                    # Triton selected_scores logits are skipped (the WGRAD uses the
+                    # precomputed grad, not the logits, when grad is non-None).
+                    use_cudnn_student = (
+                        _cudnn_available_for_indexer(ctx.use_cudnn, ctx.index_n_heads)
+                        and full_k_index is not None
+                        and hasattr(_DSA, "sparse_indexer_score_recompute_wrapper")
+                    )
 
                     with _profile_record(profile, "indexer_loss_bwd_prepare", query.device):
                         with torch.no_grad():
@@ -3635,6 +3693,7 @@ class DSAMinMemoryGQAFn(torch.autograd.Function):
                                 if (
                                     selected_scores is None
                                     and selected_k_index_for_native is not None
+                                    and not use_cudnn_student
                                 ):
                                     selected_scores = _selected_index_scores_from_projected(
                                         q_index,
@@ -3646,7 +3705,7 @@ class DSAMinMemoryGQAFn(torch.autograd.Function):
                                         profile_prefix="indexer_loss_bwd_prepare",
                                     )
                             else:
-                                if selected_scores is None:
+                                if selected_scores is None and not use_cudnn_student:
                                     selected_scores = _selected_index_scores_tile_chunked(
                                         hidden_states.detach(),
                                         q_start,
@@ -3686,18 +3745,35 @@ class DSAMinMemoryGQAFn(torch.autograd.Function):
                             with _profile_record(
                                 profile, "indexer_loss_bwd_score_kl_grad", query.device
                             ):
-                                grad_selected_scores = triton_indexer_loss_grad(
-                                    selected_scores, teacher, scale
-                                )
-                                if grad_selected_scores is None:
-                                    student = torch.nn.functional.softmax(
-                                        selected_scores, dim=-1, dtype=torch.float32
+                                if use_cudnn_student:
+                                    # cuDNN returns the student softmax p directly, so the
+                                    # KL gradient is (p - teacher) * scale (see p - t).
+                                    student = _cudnn_selected_indexer_scores(
+                                        q_index,
+                                        weights,
+                                        full_k_index,
+                                        topk_indices,
+                                        q_start,
+                                        ctx.index_n_heads,
+                                        profile=profile,
                                     )
-                                    teacher_over_student = teacher * student / (student + 1e-10)
-                                    grad_selected_scores = (
-                                        student * teacher_over_student.sum(dim=-1, keepdim=True)
-                                    ) - teacher_over_student
-                                    grad_selected_scores = grad_selected_scores * scale
+                                    grad_selected_scores = (student - teacher) * scale
+                                else:
+                                    grad_selected_scores = triton_indexer_loss_grad(
+                                        selected_scores, teacher, scale
+                                    )
+                                    if grad_selected_scores is None:
+                                        student = torch.nn.functional.softmax(
+                                            selected_scores, dim=-1, dtype=torch.float32
+                                        )
+                                        teacher_over_student = (
+                                            teacher * student / (student + 1e-10)
+                                        )
+                                        grad_selected_scores = (
+                                            student
+                                            * teacher_over_student.sum(dim=-1, keepdim=True)
+                                        ) - teacher_over_student
+                                        grad_selected_scores = grad_selected_scores * scale
 
                     q_index_for_grads = None
                     weights_for_grads = None
@@ -3760,7 +3836,10 @@ class DSAMinMemoryGQAFn(torch.autograd.Function):
                                 ),
                                 (
                                     selected_scores[..., topk_start:topk_end]
-                                    if grad_selected_scores is not None
+                                    if (
+                                        grad_selected_scores is not None
+                                        and selected_scores is not None
+                                    )
                                     else selected_scores
                                 ),
                                 (
