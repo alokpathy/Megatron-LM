@@ -1230,6 +1230,154 @@ def _cudnn_selected_indexer_scores(
     return out["predict"]                                     # (B, q_len, topk) FP32
 
 
+def _cudnn_indexer_backward_wgrad(
+    hidden_states: torch.Tensor,
+    q_start: int,
+    q_end: int,
+    topk_indices: torch.Tensor,
+    q_index: torch.Tensor,
+    weights: torch.Tensor,
+    full_k_index: torch.Tensor,
+    teacher: torch.Tensor,
+    student_p: torch.Tensor,
+    linear_k_weight: torch.Tensor,
+    k_norm_weight: torch.Tensor,
+    k_norm_bias: torch.Tensor,
+    has_k_norm_bias: bool,
+    k_norm_eps: float,
+    index_n_heads: int,
+    index_head_dim: int,
+    index_rotary_dim: int,
+    rotary_pos_emb,
+    rotary_interleaved: bool,
+    use_indexer_rope: bool,
+    use_hadamard: bool,
+    grad_linear_q_weight: Optional[torch.Tensor],
+    grad_linear_k_weight: Optional[torch.Tensor],
+    grad_k_norm_weight: Optional[torch.Tensor],
+    grad_k_norm_bias: Optional[torch.Tensor],
+    grad_linear_weights_weight: Optional[torch.Tensor],
+    loss_coeff: float,
+    grad_loss,
+    profile: Optional[_DSATimingProfiler] = None,
+) -> bool:
+    """Fused indexer WGRAD via cuDNN indexer_backward_wrapper + the transform tails.
+
+    Replaces the KL-grad step + triton_selected_index_scores_backward + the selected
+    K tail. The wrapper takes teacher/student DISTRIBUTIONS (t, p) and returns
+    activation grads d_index_q (B,q,H,D), d_weights (B,q,H), d_index_k (B,S_k,D full
+    scattered). Those feed the shared Q/weights tails and a full-sequence K tail.
+
+    Only the standard indexer (indexer_input_norm=None) is supported here; returns
+    False to fall back if the cuDNN kernel or the k-norm triton path is unavailable.
+
+    Validated:
+      - wrapper outputs: experiments/validate_cudnn_indexer_backward.py
+      - K-tail equivalence: experiments/validate_cudnn_ktail.py
+    """
+    if not hasattr(_DSA, "indexer_backward_wrapper"):
+        return False
+    seq_k = hidden_states.size(0)
+    batch = hidden_states.size(1)
+
+    q_bf = q_index.permute(1, 0, 2, 3).contiguous()          # (B, q, H, D)
+    k_bf = full_k_index.permute(1, 0, 2).contiguous()        # (B, S_k, D)
+    w_bf = weights.permute(1, 0, 2).contiguous()             # (B, q, H)
+    topk_i32 = topk_indices.to(torch.int32).contiguous()
+    attn_score = teacher.contiguous().clone()                # consumed in-place -> clone
+    index_score = student_p.contiguous().clone()             # consumed in-place -> clone
+
+    with _profile_record(profile, "indexer_loss_bwd_cudnn_wgrad", hidden_states.device):
+        with torch.cuda.nvtx.range("dsa_mm_indexer_backward_cudnn"):
+            out = _DSA.indexer_backward_wrapper(
+                q_bf,
+                w_bf,
+                k_bf,
+                attn_score,
+                index_score,
+                topk_i32,
+                sm_scale=1.0,
+                loss_coeff=loss_coeff,
+                grad_loss=grad_loss,
+                topk_indices_global=False,
+            )
+    d_index_q = out["d_index_q"]                             # (B, q, H, D)
+    d_weights = out["d_weights"]                             # (B, q, H)
+    d_index_k = out["d_index_k"]                             # (B, S_k, D) full-scattered
+
+    hidden_tile = hidden_states[q_start:q_end]
+
+    # ---- Q tail (shared with the selected path) ----
+    with _profile_record(profile, "indexer_loss_bwd_native_q_wgrad", hidden_states.device):
+        if grad_linear_q_weight is not None:
+            grad_q_index = d_index_q.permute(1, 0, 2, 3).contiguous()   # (q, B, H, D)
+            query_positions = torch.arange(
+                q_start, q_end, device=hidden_states.device, dtype=torch.long
+            )
+            grad_q_linear = _backward_indexer_transform(
+                grad_q_index, query_positions, index_head_dim, index_rotary_dim,
+                rotary_pos_emb, rotary_interleaved, use_indexer_rope, use_hadamard,
+            )
+            grad_q_linear = grad_q_linear.reshape(q_end - q_start, batch, -1)
+            _accumulate_linear_weight_grad(grad_linear_q_weight, grad_q_linear, hidden_tile)
+
+        # ---- weights tail ----
+        if grad_linear_weights_weight is not None:
+            grad_weights = d_weights.permute(1, 0, 2)                   # (q, B, H)
+            weights_scale = (index_n_heads ** -0.5) * (index_head_dim ** -0.5)
+            _accumulate_linear_weight_grad(
+                grad_linear_weights_weight, grad_weights * weights_scale, hidden_tile
+            )
+
+    # ---- full-sequence K tail (d_index_k already scattered to S_k) ----
+    if (
+        grad_linear_k_weight is not None
+        or grad_k_norm_weight is not None
+        or (has_k_norm_bias and grad_k_norm_bias is not None)
+    ):
+        with _profile_record(
+            profile, "indexer_loss_bwd_native_k_ln_wgrad", hidden_states.device
+        ):
+            grad_k_index = d_index_k.permute(1, 0, 2).contiguous()     # (S_k, B, D)
+            key_positions = torch.arange(
+                0, seq_k, device=hidden_states.device, dtype=torch.long
+            )
+            grad_k_norm = _backward_indexer_transform(
+                grad_k_index, key_positions, index_head_dim, index_rotary_dim,
+                rotary_pos_emb, rotary_interleaved, use_indexer_rope, use_hadamard,
+            )
+            k_linear_full = _linear(hidden_states, linear_k_weight)     # (S_k, B, D)
+            # triton_k_ln_backward_prepare needs 4-D (batch, query, topk, D); treat
+            # the full sequence as topk=1 -> (S_k, B, 1, D).
+            grad_k_norm_4d = grad_k_norm.reshape(seq_k, batch, 1, index_head_dim)
+            k_linear_4d = k_linear_full.reshape(seq_k, batch, 1, index_head_dim)
+            grad_k_linear_dtype = (
+                torch.float32 if hidden_states.dtype == torch.float32 else hidden_states.dtype
+            )
+            prepared = triton_k_ln_backward_prepare(
+                grad_k_norm_4d, k_linear_4d, k_norm_weight, k_norm_eps,
+                grad_k_norm_weight, grad_k_norm_bias if has_k_norm_bias else None,
+                grad_k_linear_dtype,
+            )
+            if prepared is None:
+                return False
+            grad_k_linear, partial_norm_weight, partial_norm_bias = prepared
+            grad_k_linear = grad_k_linear.reshape(seq_k, batch, index_head_dim)
+            if grad_linear_k_weight is not None:
+                _accumulate_linear_weight_grad(
+                    grad_linear_k_weight, grad_k_linear, hidden_states
+                )
+            # triton_k_ln_backward_prepare returns PARTIAL norm-weight/bias sums;
+            # reduce them into the final k-norm grads (mirrors :2197).
+            triton_k_ln_param_reduce(
+                partial_norm_weight,
+                partial_norm_bias,
+                grad_k_norm_weight,
+                grad_k_norm_bias if has_k_norm_bias else None,
+            )
+    return True
+
+
 def _topk_index_tile(
     hidden_states: torch.Tensor,
     q_start: int,
@@ -3630,6 +3778,15 @@ class DSAMinMemoryGQAFn(torch.autograd.Function):
                         and full_k_index is not None
                         and hasattr(_DSA, "sparse_indexer_score_recompute_wrapper")
                     )
+                    # cuDNN fused indexer backward: computes the KL grad AND the
+                    # score-backward on-device, producing the indexer WGRAD directly.
+                    # Supersedes the student grad_selected_scores + Triton WGRAD path.
+                    use_cudnn_indexer_backward = (
+                        use_cudnn_student
+                        and hasattr(_DSA, "indexer_backward_wrapper")
+                        and ctx.indexer_input_norm is None
+                    )
+                    indexer_backward_done = False
 
                     with _profile_record(profile, "indexer_loss_bwd_prepare", query.device):
                         with torch.no_grad():
@@ -3745,7 +3902,52 @@ class DSAMinMemoryGQAFn(torch.autograd.Function):
                             with _profile_record(
                                 profile, "indexer_loss_bwd_score_kl_grad", query.device
                             ):
-                                if use_cudnn_student:
+                                if use_cudnn_indexer_backward:
+                                    # cuDNN fuses the KL grad + score-backward, writing
+                                    # the indexer WGRAD directly (no grad_selected_scores).
+                                    student = _cudnn_selected_indexer_scores(
+                                        q_index,
+                                        weights,
+                                        full_k_index,
+                                        topk_indices,
+                                        q_start,
+                                        ctx.index_n_heads,
+                                        profile=profile,
+                                    )
+                                    indexer_backward_done = _cudnn_indexer_backward_wgrad(
+                                        hidden_states,
+                                        q_start,
+                                        q_end,
+                                        topk_indices,
+                                        q_index,
+                                        weights,
+                                        full_k_index,
+                                        teacher,
+                                        student,
+                                        linear_k_weight,
+                                        k_norm_weight,
+                                        k_norm_bias,
+                                        ctx.has_k_norm_bias,
+                                        ctx.k_norm_eps,
+                                        ctx.index_n_heads,
+                                        ctx.index_head_dim,
+                                        ctx.index_rotary_dim,
+                                        ctx.rotary_pos_emb,
+                                        ctx.rotary_interleaved,
+                                        ctx.use_indexer_rope,
+                                        ctx.use_hadamard,
+                                        grad_linear_q_weight,
+                                        grad_linear_k_weight,
+                                        grad_k_norm_weight,
+                                        grad_k_norm_bias,
+                                        grad_linear_weights_weight,
+                                        ctx.loss_coeff,
+                                        grad_indexer_loss,
+                                        profile=profile,
+                                    )
+                                if indexer_backward_done:
+                                    pass  # WGRAD written by the fused helper below
+                                elif use_cudnn_student:
                                     # cuDNN returns the student softmax p directly, so the
                                     # KL gradient is (p - teacher) * scale (see p - t).
                                     student = _cudnn_selected_indexer_scores(
@@ -3774,6 +3976,11 @@ class DSAMinMemoryGQAFn(torch.autograd.Function):
                                             * teacher_over_student.sum(dim=-1, keepdim=True)
                                         ) - teacher_over_student
                                         grad_selected_scores = grad_selected_scores * scale
+
+                    if indexer_backward_done:
+                        # The cuDNN fused indexer backward already accumulated the
+                        # indexer WGRAD for this tile; skip the Triton WGRAD loop.
+                        continue
 
                     q_index_for_grads = None
                     weights_for_grads = None
