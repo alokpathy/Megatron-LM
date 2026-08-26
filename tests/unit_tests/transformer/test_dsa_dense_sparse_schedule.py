@@ -9,9 +9,9 @@ import torch
 
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.training import (
-    _clear_dsa_optimizer_state,
+    _clear_dsa_indexer_optimizer_state,
     _dsa_dense_phase_active,
-    _reset_dsa_optimizer_group_steps,
+    _reset_dsa_indexer_optimizer_group_steps,
     apply_dsa_dense_sparse_schedule,
 )
 
@@ -148,14 +148,14 @@ class TestSelectorHelpers:
     def test_clear_selects_requested_half(self):
         model, optimizer, backbone, indexer = make_model_and_optimizer()
 
-        assert _clear_dsa_optimizer_state(model, optimizer, indexer=False) == 1
+        assert _clear_dsa_indexer_optimizer_state(model, optimizer, indexer=False) == 1
         assert backbone not in optimizer.optimizer.state
         assert indexer in optimizer.optimizer.state
 
     def test_reset_group_steps_selects_requested_half(self):
         model, optimizer, _, _ = make_model_and_optimizer(step=7)
 
-        assert _reset_dsa_optimizer_group_steps(optimizer, indexer=False) == 1
+        assert _reset_dsa_indexer_optimizer_group_steps(optimizer, indexer=False) == 1
         backbone_group, indexer_group = optimizer.param_groups
         assert backbone_group["step"] == 0
         assert indexer_group["step"] == 7, "indexer clock must not be disturbed"

@@ -1617,8 +1617,8 @@ def test_simplified_main_q_reset_handles_optimizer_load_modes(
     refresh_calls = []
     monkeypatch.setattr(
         training,
-        "_clear_dsa_optimizer_state",
-        lambda model, optimizer, indexer=True: clear_calls.append((model, optimizer)) or 1,
+        "_clear_dsa_indexer_optimizer_state",
+        lambda model, optimizer: clear_calls.append((model, optimizer)) or 1,
     )
     monkeypatch.setattr(
         training, "_apply_dsa_indexer_lr_warmup", lambda args, optimizer, scheduler: 0.0
@@ -1630,8 +1630,8 @@ def test_simplified_main_q_reset_handles_optimizer_load_modes(
     )
     monkeypatch.setattr(
         training,
-        "_reset_dsa_optimizer_group_steps",
-        lambda optimizer, indexer=True: group_step_reset_calls.append(optimizer) or 1,
+        "_reset_dsa_indexer_optimizer_group_steps",
+        lambda optimizer: group_step_reset_calls.append(optimizer) or 1,
     )
     monkeypatch.setattr(training, "_broadcast_dsa_indexer_params", lambda model: None)
     args = SimpleNamespace(
@@ -1823,7 +1823,7 @@ def test_dsa_indexer_optimizer_group_step_reset_preserves_backbone_clock():
         ),
     )
 
-    assert training._reset_dsa_optimizer_group_steps(optimizer) == 3
+    assert training._reset_dsa_indexer_optimizer_group_steps(optimizer) == 3
     assert backbone_group["step"] == 123
     assert indexer_weight_group["step"] == 0
     assert indexer_bias_group["step"] is indexer_bias_step
@@ -1939,7 +1939,7 @@ def test_dsa_indexer_optimizer_state_clear_preserves_backbone_state(monkeypatch)
         lambda _optimizer: {param: param for param in model.parameters()},
     )
 
-    assert training._clear_dsa_optimizer_state([model], optimizer) == 2
+    assert training._clear_dsa_indexer_optimizer_state([model], optimizer) == 2
     assert all(param not in torch_optimizer.state for param in model.indexer.parameters())
     for param, expected_state in backbone_state.items():
         assert param in torch_optimizer.state
