@@ -102,18 +102,18 @@ class TestScheduleConfig:
 class FakeOptimizer:
     """Minimal stand-in exposing what the schedule touches on a real MegatronOptimizer."""
 
-    def __init__(self, backbone, indexer, step=0):
+    def __init__(self, backbone, indexer, step=0, backbone_state=True):
+        state = {
+            indexer: {"exp_avg": torch.ones_like(indexer), "exp_avg_sq": torch.ones_like(indexer)}
+        }
+        if backbone_state:
+            # Stands in for a pretrained checkpoint: the backbone arrives with real Adam history.
+            state[backbone] = {
+                "exp_avg": torch.full_like(backbone, 3.0),
+                "exp_avg_sq": torch.full_like(backbone, 9.0),
+            }
         self.optimizer = types.SimpleNamespace(
-            state={
-                backbone: {
-                    "exp_avg": torch.ones_like(backbone),
-                    "exp_avg_sq": torch.ones_like(backbone),
-                },
-                indexer: {
-                    "exp_avg": torch.ones_like(indexer),
-                    "exp_avg_sq": torch.ones_like(indexer),
-                },
-            },
+            state=state,
             param_groups=[
                 {"params": [backbone], "lr": 0.1, "is_dsa_indexer": False, "step": step},
                 {"params": [indexer], "lr": 0.1, "is_dsa_indexer": True, "step": step},
@@ -129,7 +129,7 @@ class FakeOptimizer:
         return self._params
 
 
-def make_model_and_optimizer(dense_steps=100, step=7):
+def make_model_and_optimizer(dense_steps=100, step=7, backbone_state=True):
     backbone = torch.nn.Parameter(torch.zeros(4))
     indexer = torch.nn.Parameter(torch.zeros(4))
     config = make_config(dsa_indexer_dense_loss_steps=dense_steps)
@@ -138,7 +138,8 @@ def make_model_and_optimizer(dense_steps=100, step=7):
         ("decoder.layers.0.self_attention.core_attention.weight", backbone),
         ("decoder.layers.0.self_attention.indexer.linear_q.weight", indexer),
     ]
-    return [model_chunk], FakeOptimizer(backbone, indexer, step=step), backbone, indexer
+    optimizer = FakeOptimizer(backbone, indexer, step=step, backbone_state=backbone_state)
+    return [model_chunk], optimizer, backbone, indexer
 
 
 class TestSelectorHelpers:
@@ -198,23 +199,67 @@ class TestScheduleDriver:
 
         assert optimizer.param_groups[0]["lr"] == 0.0
 
-    def test_boundary_restores_sparse_config_and_clears_backbone_state(self):
+    def test_boundary_restores_pretrained_backbone_state(self):
+        """A pretrained backbone must come out of the dense phase as it went in."""
         model, optimizer, backbone, indexer = make_model_and_optimizer(dense_steps=10, step=10)
         args = self._args(dense_steps=10)
 
-        apply_dsa_dense_sparse_schedule(args, model, optimizer, iteration=9)
+        apply_dsa_dense_sparse_schedule(args, model, optimizer, iteration=0)
+        # The dense phase perturbs the backbone's moments and advances its clock, even at lr=0.
+        optimizer.optimizer.state[backbone]["exp_avg"].fill_(99.0)
+        optimizer.param_groups[0]["step"] = 15
         apply_dsa_dense_sparse_schedule(args, model, optimizer, iteration=10)
 
         config = model[0].config
         assert not config.dsa_fwd_use_dense_attn
         assert config.dsa_indexer_use_sparse_loss
         assert args._dsa_schedule_phase == "sparse"
-        # Both halves of the freeze equivalence: moments dropped and clock reset.
-        assert backbone not in optimizer.optimizer.state
-        assert optimizer.param_groups[0]["step"] == 0
-        # The indexer carries its history across the boundary untouched.
+        # Pretrained history is back, not zeroed, and the clock matches it.
+        assert torch.equal(optimizer.optimizer.state[backbone]["exp_avg"], torch.full((4,), 3.0))
+        assert torch.equal(optimizer.optimizer.state[backbone]["exp_avg_sq"], torch.full((4,), 9.0))
+        assert optimizer.param_groups[0]["step"] == 10
+        # The indexer trained throughout and carries its own history across untouched.
         assert indexer in optimizer.optimizer.state
         assert optimizer.param_groups[1]["step"] == 10
+
+    def test_boundary_from_scratch_leaves_backbone_cold(self):
+        """With no state entering the dense phase, restoring degenerates to clearing."""
+        model, optimizer, backbone, _ = make_model_and_optimizer(
+            dense_steps=10, step=0, backbone_state=False
+        )
+        args = self._args(dense_steps=10)
+
+        apply_dsa_dense_sparse_schedule(args, model, optimizer, iteration=0)
+        # FusedAdam allocates state on the first masked step.
+        optimizer.optimizer.state[backbone] = {
+            "exp_avg": torch.ones(4),
+            "exp_avg_sq": torch.ones(4),
+        }
+        optimizer.param_groups[0]["step"] = 10
+        apply_dsa_dense_sparse_schedule(args, model, optimizer, iteration=10)
+
+        assert backbone not in optimizer.optimizer.state
+        assert optimizer.param_groups[0]["step"] == 0
+
+    def test_snapshot_is_released_after_the_boundary(self):
+        model, optimizer, _, _ = make_model_and_optimizer(dense_steps=10)
+        args = self._args(dense_steps=10)
+
+        apply_dsa_dense_sparse_schedule(args, model, optimizer, iteration=0)
+        assert args._dsa_backbone_state_snapshot
+        apply_dsa_dense_sparse_schedule(args, model, optimizer, iteration=10)
+        assert args._dsa_backbone_state_snapshot is None
+
+    def test_snapshot_is_a_copy_not_an_alias(self):
+        """Restoring must survive in-place optimizer updates during the dense phase."""
+        model, optimizer, backbone, _ = make_model_and_optimizer(dense_steps=10)
+        args = self._args(dense_steps=10)
+
+        apply_dsa_dense_sparse_schedule(args, model, optimizer, iteration=0)
+        optimizer.optimizer.state[backbone]["exp_avg"].mul_(0.0)  # in-place, as FusedAdam does
+        apply_dsa_dense_sparse_schedule(args, model, optimizer, iteration=10)
+
+        assert torch.equal(optimizer.optimizer.state[backbone]["exp_avg"], torch.full((4,), 3.0))
 
     def test_transition_runs_once(self):
         model, optimizer, backbone, _ = make_model_and_optimizer(dense_steps=10)
@@ -230,8 +275,21 @@ class TestScheduleDriver:
         assert backbone in optimizer.optimizer.state
         assert optimizer.param_groups[0]["step"] == 3
 
+    def test_boundary_without_snapshot_falls_back_to_clearing(self):
+        """Resuming mid dense phase in a fresh process cannot recover the opening state."""
+        model, optimizer, backbone, _ = make_model_and_optimizer(dense_steps=10, step=10)
+        args = self._args(dense_steps=10)
+
+        # Simulate a process that observed the dense phase but holds no snapshot.
+        args._dsa_schedule_phase = "dense"
+        args._dsa_backbone_state_snapshot = None
+        apply_dsa_dense_sparse_schedule(args, model, optimizer, iteration=10)
+
+        assert backbone not in optimizer.optimizer.state
+        assert optimizer.param_groups[0]["step"] == 0
+
     def test_resume_past_boundary_preserves_optimizer_state(self):
-        """A run resuming past the boundary already cleared state before checkpointing."""
+        """A run resuming past the boundary already restored state before checkpointing."""
         model, optimizer, backbone, _ = make_model_and_optimizer(dense_steps=10, step=42)
         args = self._args(dense_steps=10)
 
