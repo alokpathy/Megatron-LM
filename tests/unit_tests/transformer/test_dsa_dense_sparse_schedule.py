@@ -8,12 +8,7 @@ import pytest
 import torch
 
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.training.training import (
-    _clear_dsa_indexer_optimizer_state,
-    _dsa_dense_phase_active,
-    _reset_dsa_indexer_optimizer_group_steps,
-    apply_dsa_dense_sparse_schedule,
-)
+from megatron.training.training import _dsa_dense_phase_active, apply_dsa_dense_sparse_schedule
 
 SPARSE_PHASE_CONFIG = dict(
     num_layers=2,
@@ -140,25 +135,6 @@ def make_model_and_optimizer(dense_steps=100, step=7, backbone_state=True):
     ]
     optimizer = FakeOptimizer(backbone, indexer, step=step, backbone_state=backbone_state)
     return [model_chunk], optimizer, backbone, indexer
-
-
-class TestSelectorHelpers:
-    """The clear/reset helpers select the backbone as the complement of the indexer."""
-
-    def test_clear_selects_requested_half(self):
-        model, optimizer, backbone, indexer = make_model_and_optimizer()
-
-        assert _clear_dsa_indexer_optimizer_state(model, optimizer, indexer=False) == 1
-        assert backbone not in optimizer.optimizer.state
-        assert indexer in optimizer.optimizer.state
-
-    def test_reset_group_steps_selects_requested_half(self):
-        model, optimizer, _, _ = make_model_and_optimizer(step=7)
-
-        assert _reset_dsa_indexer_optimizer_group_steps(optimizer, indexer=False) == 1
-        backbone_group, indexer_group = optimizer.param_groups
-        assert backbone_group["step"] == 0
-        assert indexer_group["step"] == 7, "indexer clock must not be disturbed"
 
 
 class TestScheduleDriver:
@@ -303,8 +279,13 @@ class TestScheduleDriver:
         assert backbone in optimizer.optimizer.state
         assert optimizer.param_groups[0]["step"] == 3
 
-    def test_boundary_without_snapshot_falls_back_to_clearing(self):
-        """Resuming mid dense phase in a fresh process cannot recover the opening state."""
+    def test_boundary_without_snapshot_leaves_state_alone(self):
+        """Resuming mid dense phase cannot recover the opening state, so do not guess.
+
+        Clearing would be correct had the run started from scratch and destructive had it started
+        from a pretrained checkpoint. From here the two are indistinguishable, so the
+        self-consistent state is preserved and the config still advances to the sparse phase.
+        """
         model, optimizer, backbone, _ = make_model_and_optimizer(dense_steps=10, step=10)
         args = self._args(dense_steps=10)
 
@@ -313,8 +294,9 @@ class TestScheduleDriver:
         args._dsa_backbone_state_snapshot = None
         apply_dsa_dense_sparse_schedule(args, model, optimizer, iteration=10)
 
-        assert backbone not in optimizer.optimizer.state
-        assert optimizer.param_groups[0]["step"] == 0
+        assert backbone in optimizer.optimizer.state, "must not destroy possibly-pretrained state"
+        assert optimizer.param_groups[0]["step"] == 10
+        assert not model[0].config.dsa_fwd_use_dense_attn, "phase must still advance"
 
     def test_resume_past_boundary_preserves_optimizer_state(self):
         """A run resuming past the boundary already restored state before checkpointing."""

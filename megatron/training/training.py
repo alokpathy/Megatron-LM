@@ -1795,20 +1795,15 @@ def _get_dsa_indexer_reset_seed(args) -> int:
     return seed
 
 
-def _clear_dsa_indexer_optimizer_state(model, optimizer, indexer: bool = True) -> int:
-    """Clear optimizer state for DSA indexer parameters, or for everything else.
-
-    ``indexer=False`` selects the complement -- the backbone -- which the dense-to-sparse
-    schedule uses at the phase boundary so the backbone enters the sparse phase with the same
-    cold Adam state it would have had if it had been frozen through the dense phase.
-    """
+def _clear_dsa_indexer_optimizer_state(model, optimizer) -> int:
+    """Clear optimizer state only for DSA indexer optimizer parameters."""
     if optimizer is None or getattr(optimizer, "is_stub_optimizer", False):
         return 0
     if not isinstance(model, list):
         model = [model]
     if hasattr(optimizer, "chained_optimizers"):
         return sum(
-            _clear_dsa_indexer_optimizer_state(model, child_optimizer, indexer)
+            _clear_dsa_indexer_optimizer_state(model, child_optimizer)
             for child_optimizer in optimizer.chained_optimizers
         )
 
@@ -1822,7 +1817,7 @@ def _clear_dsa_indexer_optimizer_state(model, optimizer, indexer: bool = True) -
     seen_param_ids = set()
     for model_chunk in model:
         for name, param in model_chunk.named_parameters():
-            if _is_dsa_indexer_param_name(name) is not indexer:
+            if not _is_dsa_indexer_param_name(name):
                 continue
             param_id = id(param)
             if param_id in seen_param_ids:
@@ -1835,24 +1830,19 @@ def _clear_dsa_indexer_optimizer_state(model, optimizer, indexer: bool = True) -
     return cleared
 
 
-def _reset_dsa_indexer_optimizer_group_steps(optimizer, indexer: bool = True) -> int:
+def _reset_dsa_indexer_optimizer_group_steps(optimizer) -> int:
     """Reset group-level optimizer clocks for freshly reset DSA indexers.
 
     TE and Apex FusedAdam keep ``step`` on parameter groups rather than in each
     parameter's state. Indexer groups are deliberately separate from backbone
     groups, so their clocks can be reset without changing backbone bias
     correction.
-
-    Both halves matter: clearing per-parameter moments without resetting this clock leaves bias
-    correction dividing fresh moments by a warm ``1 - beta**step``, which lands further from a
-    true freeze than doing nothing at all. ``indexer=False`` selects the backbone groups, which
-    the dense-to-sparse schedule resets alongside their moments at the phase boundary.
     """
     if optimizer is None or getattr(optimizer, "is_stub_optimizer", False):
         return 0
     if hasattr(optimizer, "chained_optimizers"):
         return sum(
-            _reset_dsa_indexer_optimizer_group_steps(child_optimizer, indexer)
+            _reset_dsa_indexer_optimizer_group_steps(child_optimizer)
             for child_optimizer in optimizer.chained_optimizers
         )
 
@@ -1870,7 +1860,7 @@ def _reset_dsa_indexer_optimizer_group_steps(optimizer, indexer: bool = True) ->
 
     reset = 0
     for param_group in param_groups:
-        if bool(param_group.get("is_dsa_indexer", False)) is not indexer:
+        if not param_group.get("is_dsa_indexer", False):
             continue
         step = param_group.get("step")
         if torch.is_tensor(step):
@@ -2090,14 +2080,15 @@ def _enter_dsa_sparse_phase(model, optimizer, snapshot, restore_backbone_state: 
         )
         return
 
-    # No snapshot: the dense phase did not start in this process, so its opening state is gone.
-    # Clearing matches a from-scratch run but discards any pretrained Adam history.
-    cleared = _clear_dsa_indexer_optimizer_state(model, optimizer, indexer=False)
-    groups = _reset_dsa_indexer_optimizer_group_steps(optimizer, indexer=False)
+    # No snapshot: a fresh process resumed mid dense phase, so the state the phase opened with is
+    # unrecoverable. Leave the backbone alone rather than clearing it. Clearing would be right had
+    # the run started from scratch and destructive had it started from a pretrained checkpoint,
+    # and from here the two are indistinguishable. What is left is self-consistent -- moments and
+    # clock of the same age -- and merely carries the dense phase's discarded gradients.
     print_rank_0(
-        f"  > DSA schedule: WARNING entered sparse phase without a dense-phase snapshot; cleared "
-        f"optimizer state for {cleared} backbone parameters across {groups} parameter groups. "
-        f"Any pretrained optimizer history for the backbone is lost."
+        "  > DSA schedule: WARNING entered sparse phase without a dense-phase snapshot; the "
+        "backbone keeps the optimizer state accumulated while it was masked, which a run that "
+        "reached this boundary in one process would have discarded."
     )
 
 
