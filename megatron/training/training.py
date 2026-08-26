@@ -1795,116 +1795,6 @@ def _get_dsa_indexer_reset_seed(args) -> int:
     return seed
 
 
-# ---------------------------------------------------------------------------------------------
-# TEMPORARY (verification only): side-channel for DSA indexer optimizer state.
-#
-# A two-phase baseline run freezes the backbone in phase 1, so its distributed-optimizer
-# checkpoint is indexer-shaped (one flat bucket over 8 tensors) while phase 2's is full-model
-# shaped. The load raises a shape mismatch, forcing --no-load-optim, which discards the indexer
-# momentum the dense phase exists to build -- making the baseline unfairly weak when comparing
-# it against --dsa-indexer-dense-loss-steps.
-#
-# This dumps and restores the indexer's optimizer state by parameter NAME, sidestepping the flat
-# buffer entirely. It exists so the baseline can be measured fairly. DELETE once the comparison
-# is done -- nothing in the schedule depends on it.
-# ---------------------------------------------------------------------------------------------
-def _dsa_debug_indexer_state_path(args):
-    return os.environ.get("DSA_DEBUG_INDEXER_OPTIM_STATE", "") or getattr(
-        args, "dsa_debug_indexer_optim_state", ""
-    )
-
-
-def _dsa_debug_iter_indexer_optim_params(model, optimizer):
-    """Yield (name, optimizer-owned param, torch_optimizer) for indexer params."""
-    if optimizer is None or getattr(optimizer, "is_stub_optimizer", False):
-        return
-    if not isinstance(model, list):
-        model = [model]
-    if hasattr(optimizer, "chained_optimizers"):
-        for child in optimizer.chained_optimizers:
-            yield from _dsa_debug_iter_indexer_optim_params(model, child)
-        return
-    param_to_optim_param = get_model_to_optimizer_param_map(optimizer)
-    torch_optimizer = getattr(optimizer, "optimizer", None)
-    if torch_optimizer is None:
-        return
-    seen = set()
-    for model_chunk in model:
-        for name, param in model_chunk.named_parameters():
-            if not _is_dsa_indexer_param_name(name) or id(param) in seen:
-                continue
-            seen.add(id(param))
-            optim_param = param_to_optim_param.get(param)
-            if optim_param is not None:
-                yield name, optim_param, torch_optimizer
-
-
-@torch.no_grad()
-def dsa_debug_dump_indexer_optimizer_state(model, optimizer, args) -> None:
-    """Write indexer moments, fp32 master weights and group clock to a side file."""
-    path = _dsa_debug_indexer_state_path(args)
-    if not path:
-        return
-    payload = {"params": {}, "steps": []}
-    for name, optim_param, torch_optimizer in _dsa_debug_iter_indexer_optim_params(
-        model, optimizer
-    ):
-        entry = torch_optimizer.state.get(optim_param, {})
-        payload["params"][name] = {
-            "master": optim_param.detach().float().cpu().clone(),
-            **{
-                k: v.detach().float().cpu().clone()
-                for k, v in entry.items()
-                if torch.is_tensor(v)
-            },
-        }
-        for group in torch_optimizer.param_groups:
-            if bool(group.get("is_dsa_indexer", False)) and "step" in group:
-                step = group["step"]
-                payload["steps"] = [int(step.item() if torch.is_tensor(step) else step)]
-    rank_path = f"{path}.rank{torch.distributed.get_rank()}.pt"
-    torch.save(payload, rank_path)
-    print_rank_0(
-        f"  > DSA debug: dumped indexer optimizer state for {len(payload['params'])} tensors "
-        f"to {path}.rank*.pt"
-    )
-
-
-@torch.no_grad()
-def dsa_debug_load_indexer_optimizer_state(model, optimizer, args) -> None:
-    """Inject a dumped indexer optimizer state after a --no-load-optim checkpoint load."""
-    path = _dsa_debug_indexer_state_path(args)
-    if not path:
-        return
-    rank_path = f"{path}.rank{torch.distributed.get_rank()}.pt"
-    if not os.path.exists(rank_path):
-        print_rank_0(f"  > DSA debug: no indexer optimizer state at {rank_path}; skipping")
-        return
-    payload = torch.load(rank_path, map_location="cpu", weights_only=False)
-    restored = 0
-    for name, optim_param, torch_optimizer in _dsa_debug_iter_indexer_optim_params(
-        model, optimizer
-    ):
-        entry = payload["params"].get(name)
-        if entry is None:
-            continue
-        optim_param.copy_(entry["master"].to(optim_param.device, optim_param.dtype))
-        state = {
-            k: v.to(optim_param.device, optim_param.dtype)
-            for k, v in entry.items()
-            if k != "master"
-        }
-        if state:
-            torch_optimizer.state[optim_param] = state
-        restored += 1
-        for group in torch_optimizer.param_groups:
-            if bool(group.get("is_dsa_indexer", False)) and payload["steps"]:
-                group["step"] = payload["steps"][0]
-    print_rank_0(
-        f"  > DSA debug: restored indexer optimizer state for {restored} tensors from {rank_path}"
-    )
-
-
 def _clear_dsa_indexer_optimizer_state(model, optimizer, indexer: bool = True) -> int:
     """Clear optimizer state for DSA indexer parameters, or for everything else.
 
@@ -3797,8 +3687,6 @@ def setup_model_and_optimizer(
                 expt_dp_group=ckpt_pgc.expt_dp if ckpt_pgc is not None else None,
                 rng_state_key_prefix=getattr(unwrapped_model[0], "rng_state_key_prefix", ""),
             )
-            # TEMPORARY (verification only) -- see dsa_debug_load_indexer_optimizer_state.
-            dsa_debug_load_indexer_optimizer_state(model, optimizer, args)
         # Barrier + min/max all-reduce right after the load. Unlike the checkpoint
         # SAVE (ragged writers -> cross-rank skew at timers.log), the fully-parallel
         # LOAD is uniform across ranks (~ms spread), so no meaningful skew
@@ -4897,9 +4785,6 @@ def save_checkpoint_and_time(
                 expt_dp_group=expt_dp_group,
                 rng_state_key_prefix=rng_state_key_prefix,
             )
-            # TEMPORARY (verification only) -- see dsa_debug_dump_indexer_optimizer_state.
-            # Placed here rather than at a call site so every save path is covered.
-            dsa_debug_dump_indexer_optimizer_state(model, optimizer, get_args())
 
             # Stop timer and compute time elapsed to save checkpoint. Stop timer before timers.log() call as it resets the timer.
             # Since timer.log() reports the min & max time, we do not need a barrier here.
