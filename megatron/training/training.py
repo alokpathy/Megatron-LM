@@ -1958,9 +1958,17 @@ def _apply_dsa_indexer_lr_warmup(args, optimizer, opt_param_scheduler) -> float 
 
 
 def _dsa_dense_phase_active(args, iteration: int) -> bool:
-    """Return true while the DSA dense-loss schedule is in its dense phase."""
+    """Return true while the DSA dense-loss schedule is in its dense phase.
+
+    The window is ``[start_iter, start_iter + dense_steps)``. ``start_iter`` is 0 when training
+    from scratch, and the checkpoint's iteration when warming a freshly reset indexer on top of
+    a pretrained model -- otherwise a run resuming past it would skip the dense phase entirely.
+    """
     dense_steps = getattr(args, "dsa_indexer_dense_loss_steps", None)
-    return dense_steps is not None and iteration < dense_steps
+    if dense_steps is None:
+        return False
+    start = getattr(args, "dsa_indexer_dense_loss_start_iter", 0) or 0
+    return start <= iteration < start + dense_steps
 
 
 def _snapshot_dsa_backbone_optimizer_state(model, optimizer) -> list:
@@ -2108,6 +2116,17 @@ def apply_dsa_dense_sparse_schedule(args, model, optimizer, iteration: int) -> N
 
     dense = _dsa_dense_phase_active(args, iteration)
     previous_phase = getattr(args, "_dsa_schedule_phase", None)
+    start = getattr(args, "dsa_indexer_dense_loss_start_iter", 0) or 0
+
+    if previous_phase is None and iteration < start:
+        # Before the window there is no defined phase: the config still holds the dense-phase
+        # values, but treating that as the dense phase would silently extend it backwards, and
+        # treating it as the sparse phase would flip the config with no way back. Refuse instead.
+        raise RuntimeError(
+            f"dsa_indexer_dense_loss_start_iter={start} is ahead of the starting iteration "
+            f"{iteration}. Set it to the iteration this run begins at (the checkpoint's iteration "
+            f"when warming a reset indexer, or 0 when training from scratch)."
+        )
 
     if dense:
         if previous_phase is None:
@@ -2116,15 +2135,16 @@ def apply_dsa_dense_sparse_schedule(args, model, optimizer, iteration: int) -> N
             args._dsa_backbone_state_snapshot = _snapshot_dsa_backbone_optimizer_state(
                 model, optimizer
             )
+            start = getattr(args, "dsa_indexer_dense_loss_start_iter", 0) or 0
             print_rank_0(
-                f"  > DSA schedule: dense phase for iterations 0-{dense_steps - 1}, "
-                f"sparse phase from iteration {dense_steps}"
+                f"  > DSA schedule: dense phase for iterations {start}-{start + dense_steps - 1}, "
+                f"sparse phase from iteration {start + dense_steps}"
             )
-            if iteration > 0:
+            if iteration > start:
                 print_rank_0(
                     f"  > DSA schedule: WARNING resumed mid dense phase at iteration {iteration}; "
-                    f"the snapshot captures optimizer state that {iteration} masked steps have "
-                    f"already perturbed, not the state the dense phase opened with"
+                    f"the snapshot captures optimizer state that {iteration - start} masked steps "
+                    f"have already perturbed, not the state the dense phase opened with"
                 )
         # Re-applied every iteration: the global scheduler rewrites lr on every step.
         for param_group in optimizer.param_groups:

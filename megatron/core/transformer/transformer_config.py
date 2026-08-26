@@ -430,6 +430,16 @@ class TransformerConfig(ModelParallelConfig):
     ``dsa_sparse_phase_overrides`` and the dense-phase values are installed in their place, so the
     run starts dense and the existing dense-phase validation below applies as written."""
 
+    dsa_indexer_dense_loss_start_iter: int = 0
+    """Iteration at which the dense phase begins; the dense phase spans
+    ``[start_iter, start_iter + dsa_indexer_dense_loss_steps)``.
+
+    Defaults to 0, which is right when training from scratch. When loading a pretrained
+    checkpoint and warming up a freshly reset indexer, set this to the checkpoint's iteration so
+    the dense phase runs *after* the load rather than being skipped because the run resumes past
+    it. It is deliberately explicit rather than inferred from the loaded iteration: inferring it
+    would silently restart the dense phase every time a run resumed in the middle of one."""
+
     dsa_sparse_phase_overrides: Optional[dict] = None
     """Field values restored at the dense-to-sparse boundary. Populated from the configured
     (sparse-phase) values by ``__post_init__``; not set by users."""
@@ -3718,6 +3728,9 @@ class TransformerConfig(ModelParallelConfig):
         dense-phase assertions in ``__post_init__`` then validate the live (dense) config as
         written, and the training loop restores the overrides at the boundary.
         """
+        assert (
+            self.dsa_indexer_dense_loss_start_iter >= 0
+        ), "dsa_indexer_dense_loss_start_iter must be non-negative."
         assert self.dsa_indexer_dense_loss_steps > 0, (
             "dsa_indexer_dense_loss_steps must be a positive iteration count; "
             "leave it unset to disable the schedule."

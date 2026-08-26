@@ -164,8 +164,36 @@ class TestSelectorHelpers:
 class TestScheduleDriver:
     """Phase transitions as driven from the training loop."""
 
-    def _args(self, dense_steps=100):
-        return types.SimpleNamespace(dsa_indexer_dense_loss_steps=dense_steps)
+    def _args(self, dense_steps=100, start_iter=0):
+        return types.SimpleNamespace(
+            dsa_indexer_dense_loss_steps=dense_steps, dsa_indexer_dense_loss_start_iter=start_iter
+        )
+
+    def test_dense_window_is_anchored_to_start_iter(self):
+        """Loading a pretrained checkpoint at iteration N must not skip the dense phase."""
+        args = self._args(dense_steps=15, start_iter=20)
+        assert not _dsa_dense_phase_active(args, 19)
+        assert _dsa_dense_phase_active(args, 20)
+        assert _dsa_dense_phase_active(args, 34)
+        assert not _dsa_dense_phase_active(args, 35)
+
+    def test_start_iter_ahead_of_run_start_is_rejected(self):
+        """Before the window there is no defined phase, so refuse rather than guess."""
+        model, optimizer, _, _ = make_model_and_optimizer()
+        args = self._args(dense_steps=15, start_iter=20)
+        with pytest.raises(RuntimeError, match="ahead of the starting iteration"):
+            apply_dsa_dense_sparse_schedule(args, model, optimizer, iteration=5)
+
+    def test_anchored_boundary_transitions(self):
+        model, optimizer, _, _ = make_model_and_optimizer(dense_steps=15)
+        args = self._args(dense_steps=15, start_iter=20)
+
+        apply_dsa_dense_sparse_schedule(args, model, optimizer, iteration=20)
+        assert args._dsa_schedule_phase == "dense"
+        assert optimizer.param_groups[0]["lr"] == 0.0
+        apply_dsa_dense_sparse_schedule(args, model, optimizer, iteration=35)
+        assert args._dsa_schedule_phase == "sparse"
+        assert not model[0].config.dsa_fwd_use_dense_attn
 
     def test_dense_phase_predicate(self):
         args = self._args(dense_steps=100)
