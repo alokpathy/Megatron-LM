@@ -3921,6 +3921,16 @@ def _add_experimental_attention_variant_args(parser):
         help='KL loss coefficient for training the DSA indexer.',
     )
     _maybe_add_argument(
+        '--dsa-indexer-dense-loss-steps',
+        type=int,
+        default=None,
+        help='Train the DSA indexer against a dense attention forward for this many iterations, '
+        'then switch to the sparse forward and sparse indexer loss for the rest of training. '
+        'The other --dsa-* flags describe the sparse phase. Replaces running one job with '
+        '--dsa-fwd-use-dense-attn --dsa-train-indexer-only and a second with '
+        '--dsa-indexer-use-sparse-loss.',
+    )
+    _maybe_add_argument(
         '--dsa-sparse-attention-use-gather',
         action='store_true',
         help='Use the gather-based sparse DSA attention backend instead of the dense-mask reference path.',

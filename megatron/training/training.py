@@ -1795,15 +1795,20 @@ def _get_dsa_indexer_reset_seed(args) -> int:
     return seed
 
 
-def _clear_dsa_indexer_optimizer_state(model, optimizer) -> int:
-    """Clear optimizer state only for DSA indexer optimizer parameters."""
+def _clear_dsa_indexer_optimizer_state(model, optimizer, indexer: bool = True) -> int:
+    """Clear optimizer state for DSA indexer parameters, or for everything else.
+
+    ``indexer=False`` selects the complement -- the backbone -- which the dense-to-sparse
+    schedule uses at the phase boundary so the backbone enters the sparse phase with the same
+    cold Adam state it would have had if it had been frozen through the dense phase.
+    """
     if optimizer is None or getattr(optimizer, "is_stub_optimizer", False):
         return 0
     if not isinstance(model, list):
         model = [model]
     if hasattr(optimizer, "chained_optimizers"):
         return sum(
-            _clear_dsa_indexer_optimizer_state(model, child_optimizer)
+            _clear_dsa_indexer_optimizer_state(model, child_optimizer, indexer)
             for child_optimizer in optimizer.chained_optimizers
         )
 
@@ -1817,7 +1822,7 @@ def _clear_dsa_indexer_optimizer_state(model, optimizer) -> int:
     seen_param_ids = set()
     for model_chunk in model:
         for name, param in model_chunk.named_parameters():
-            if not _is_dsa_indexer_param_name(name):
+            if _is_dsa_indexer_param_name(name) is not indexer:
                 continue
             param_id = id(param)
             if param_id in seen_param_ids:
@@ -1830,19 +1835,24 @@ def _clear_dsa_indexer_optimizer_state(model, optimizer) -> int:
     return cleared
 
 
-def _reset_dsa_indexer_optimizer_group_steps(optimizer) -> int:
+def _reset_dsa_indexer_optimizer_group_steps(optimizer, indexer: bool = True) -> int:
     """Reset group-level optimizer clocks for freshly reset DSA indexers.
 
     TE and Apex FusedAdam keep ``step`` on parameter groups rather than in each
     parameter's state. Indexer groups are deliberately separate from backbone
     groups, so their clocks can be reset without changing backbone bias
     correction.
+
+    Both halves matter: clearing per-parameter moments without resetting this clock leaves bias
+    correction dividing fresh moments by a warm ``1 - beta**step``, which lands further from a
+    true freeze than doing nothing at all. ``indexer=False`` selects the backbone groups, which
+    the dense-to-sparse schedule resets alongside their moments at the phase boundary.
     """
     if optimizer is None or getattr(optimizer, "is_stub_optimizer", False):
         return 0
     if hasattr(optimizer, "chained_optimizers"):
         return sum(
-            _reset_dsa_indexer_optimizer_group_steps(child_optimizer)
+            _reset_dsa_indexer_optimizer_group_steps(child_optimizer, indexer)
             for child_optimizer in optimizer.chained_optimizers
         )
 
@@ -1860,7 +1870,7 @@ def _reset_dsa_indexer_optimizer_group_steps(optimizer) -> int:
 
     reset = 0
     for param_group in param_groups:
-        if not param_group.get("is_dsa_indexer", False):
+        if bool(param_group.get("is_dsa_indexer", False)) is not indexer:
             continue
         step = param_group.get("step")
         if torch.is_tensor(step):
@@ -1945,6 +1955,80 @@ def _apply_dsa_indexer_lr_warmup(args, optimizer, opt_param_scheduler) -> float 
         if param_group.get("is_dsa_indexer", False):
             param_group["lr"] = opt_param_scheduler.get_lr(param_group) * scale
     return get_indexer_lr_for_logging(optimizer.param_groups)
+
+
+def _dsa_dense_phase_active(args, iteration: int) -> bool:
+    """Return true while the DSA dense-loss schedule is in its dense phase."""
+    dense_steps = getattr(args, "dsa_indexer_dense_loss_steps", None)
+    return dense_steps is not None and iteration < dense_steps
+
+
+def _enter_dsa_sparse_phase(model, optimizer, clear_backbone_state: bool) -> None:
+    """Switch every model chunk from the dense phase to the sparse phase.
+
+    ``dsa_fwd_use_dense_attn`` and ``dsa_indexer_use_sparse_loss`` are read from ``self.config``
+    on every forward (``dsa_gqa.py`` lines 832, 1026 and 1028), so restoring the captured
+    sparse-phase values is all the attention path needs -- no per-step plumbing.
+
+    ``clear_backbone_state`` is false when resuming from a checkpoint written after the boundary:
+    the state was cleared before that checkpoint, and clearing it again would discard genuine
+    sparse-phase optimizer history.
+    """
+    if not isinstance(model, list):
+        model = [model]
+
+    for model_chunk in model:
+        config = get_model_config(model_chunk)
+        overrides = getattr(config, "dsa_sparse_phase_overrides", None)
+        if not overrides:
+            continue
+        for field_name, value in overrides.items():
+            setattr(config, field_name, value)
+
+    if clear_backbone_state:
+        # A true freeze would have left the backbone with no optimizer state at all, so match it:
+        # drop the moments accumulated while it sat at lr=0, and reset the group clock that bias-
+        # corrects them. Doing only one of the two lands further off than doing neither.
+        cleared = _clear_dsa_indexer_optimizer_state(model, optimizer, indexer=False)
+        groups = _reset_dsa_indexer_optimizer_group_steps(optimizer, indexer=False)
+        print_rank_0(
+            f"  > DSA schedule: entered sparse phase; cleared optimizer state for {cleared} "
+            f"backbone parameters across {groups} parameter groups"
+        )
+    else:
+        print_rank_0("  > DSA schedule: resumed in sparse phase; optimizer state left intact")
+
+
+def apply_dsa_dense_sparse_schedule(args, model, optimizer, iteration: int) -> None:
+    """Drive ``--dsa-indexer-dense-loss-steps`` at the top of each training iteration.
+
+    The dense phase holds the backbone at ``lr=0`` rather than freezing it, because DDP and the
+    distributed optimizer capture ``requires_grad`` when they take the parameters -- a parameter
+    frozen at wrap time has no gradient bucket, no reduction hook, and no optimizer state, so it
+    cannot be unfrozen later. Masking keeps those structures alive, at the cost of computing and
+    reducing backbone gradients that the dense phase then discards.
+    """
+    dense_steps = getattr(args, "dsa_indexer_dense_loss_steps", None)
+    if dense_steps is None:
+        return
+
+    dense = _dsa_dense_phase_active(args, iteration)
+    previous_phase = getattr(args, "_dsa_schedule_phase", None)
+
+    if dense:
+        if previous_phase is None:
+            print_rank_0(
+                f"  > DSA schedule: dense phase for iterations 0-{dense_steps - 1}, "
+                f"sparse phase from iteration {dense_steps}"
+            )
+        # Re-applied every iteration: the global scheduler rewrites lr on every step.
+        for param_group in optimizer.param_groups:
+            if not param_group.get("is_dsa_indexer", False):
+                param_group["lr"] = 0.0
+    elif previous_phase != "sparse":
+        _enter_dsa_sparse_phase(model, optimizer, clear_backbone_state=previous_phase == "dense")
+
+    args._dsa_schedule_phase = "dense" if dense else "sparse"
 
 
 def _reset_dsa_indexer_after_load(model, optimizer, opt_param_scheduler, args, explicit_start: bool):
@@ -5343,6 +5427,9 @@ def train(
             continue
 
         args.curr_iteration = iteration
+        # Drive the DSA dense-to-sparse schedule before the forward pass reads the config, and
+        # before the optimizer step consumes the learning rates the global scheduler just set.
+        apply_dsa_dense_sparse_schedule(args, model, optimizer, iteration)
         # For GRPO, we keep the data for a few epochs. DeepSeekMath paper calls this number $\mu$.
         # It is similar to a PPO epoch.
 
