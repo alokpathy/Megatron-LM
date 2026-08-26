@@ -1795,7 +1795,7 @@ def _get_dsa_indexer_reset_seed(args) -> int:
     return seed
 
 
-def _clear_dsa_indexer_optimizer_state(model, optimizer, indexer: bool = True) -> int:
+def _clear_dsa_optimizer_state(model, optimizer, indexer: bool = True) -> int:
     """Clear optimizer state for DSA indexer parameters, or for everything else.
 
     ``indexer=False`` selects the complement -- the backbone -- which the dense-to-sparse
@@ -1808,7 +1808,7 @@ def _clear_dsa_indexer_optimizer_state(model, optimizer, indexer: bool = True) -
         model = [model]
     if hasattr(optimizer, "chained_optimizers"):
         return sum(
-            _clear_dsa_indexer_optimizer_state(model, child_optimizer, indexer)
+            _clear_dsa_optimizer_state(model, child_optimizer, indexer)
             for child_optimizer in optimizer.chained_optimizers
         )
 
@@ -1835,7 +1835,7 @@ def _clear_dsa_indexer_optimizer_state(model, optimizer, indexer: bool = True) -
     return cleared
 
 
-def _reset_dsa_indexer_optimizer_group_steps(optimizer, indexer: bool = True) -> int:
+def _reset_dsa_optimizer_group_steps(optimizer, indexer: bool = True) -> int:
     """Reset group-level optimizer clocks for freshly reset DSA indexers.
 
     TE and Apex FusedAdam keep ``step`` on parameter groups rather than in each
@@ -1852,7 +1852,7 @@ def _reset_dsa_indexer_optimizer_group_steps(optimizer, indexer: bool = True) ->
         return 0
     if hasattr(optimizer, "chained_optimizers"):
         return sum(
-            _reset_dsa_indexer_optimizer_group_steps(child_optimizer, indexer)
+            _reset_dsa_optimizer_group_steps(child_optimizer, indexer)
             for child_optimizer in optimizer.chained_optimizers
         )
 
@@ -2092,8 +2092,8 @@ def _enter_dsa_sparse_phase(model, optimizer, snapshot, restore_backbone_state: 
 
     # No snapshot: the dense phase did not start in this process, so its opening state is gone.
     # Clearing matches a from-scratch run but discards any pretrained Adam history.
-    cleared = _clear_dsa_indexer_optimizer_state(model, optimizer, indexer=False)
-    groups = _reset_dsa_indexer_optimizer_group_steps(optimizer, indexer=False)
+    cleared = _clear_dsa_optimizer_state(model, optimizer, indexer=False)
+    groups = _reset_dsa_optimizer_group_steps(optimizer, indexer=False)
     print_rank_0(
         f"  > DSA schedule: WARNING entered sparse phase without a dense-phase snapshot; cleared "
         f"optimizer state for {cleared} backbone parameters across {groups} parameter groups. "
@@ -2221,12 +2221,12 @@ def _reset_dsa_indexer_after_load(model, optimizer, opt_param_scheduler, args, e
     cleared_state_count = (
         0
         if not optimizer_state_loaded
-        else _clear_dsa_indexer_optimizer_state(model, optimizer)
+        else _clear_dsa_optimizer_state(model, optimizer)
     )
     reset_group_step_count = (
         0
         if not optimizer_state_loaded
-        else _reset_dsa_indexer_optimizer_group_steps(optimizer)
+        else _reset_dsa_optimizer_group_steps(optimizer)
     )
 
     if not explicit_start:
