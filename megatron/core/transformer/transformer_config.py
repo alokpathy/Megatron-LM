@@ -421,6 +421,29 @@ class TransformerConfig(ModelParallelConfig):
     dsa_indexer_loss_coeff: Optional[float] = None
     """Coefficient for the DSA indexer KL divergence loss. Set to 0 to disable indexer loss."""
 
+    dsa_indexer_dense_loss_steps: Optional[int] = None
+    """Train the indexer against a dense attention forward for this many iterations, then switch
+    to the sparse forward and sparse indexer loss for the rest of training.
+
+    The remaining ``dsa_*`` fields describe the *sparse* phase, exactly as they would be set for a
+    run without a schedule. When this is set, the sparse-phase values are captured into
+    ``dsa_sparse_phase_overrides`` and the dense-phase values are installed in their place, so the
+    run starts dense and the existing dense-phase validation below applies as written."""
+
+    dsa_indexer_dense_loss_start_iter: int = 0
+    """Iteration at which the dense phase begins; the dense phase spans
+    ``[start_iter, start_iter + dsa_indexer_dense_loss_steps)``.
+
+    Defaults to 0, which is right when training from scratch. When loading a pretrained
+    checkpoint and warming up a freshly reset indexer, set this to the checkpoint's iteration so
+    the dense phase runs *after* the load rather than being skipped because the run resumes past
+    it. It is deliberately explicit rather than inferred from the loaded iteration: inferring it
+    would silently restart the dense phase every time a run resumed in the middle of one."""
+
+    dsa_sparse_phase_overrides: Optional[dict] = None
+    """Field values restored at the dense-to-sparse boundary. Populated from the configured
+    (sparse-phase) values by ``__post_init__``; not set by users."""
+
     dsa_sparse_attention_use_gather: bool = False
     """Whether to use the gather-based sparse DSA attention backend instead of the dense-mask reference path."""
 
@@ -3480,6 +3503,8 @@ class TransformerConfig(ModelParallelConfig):
                 'triton-min-memory',
                 'torch-min-memory',
             )
+            if self.dsa_indexer_dense_loss_steps is not None:
+                self._install_dsa_dense_phase(min_memory_dsa_backend)
             skip_dsa = self.dsa_fwd_skip_dsa
             dense_dsa_warmup = self.dsa_fwd_use_dense_attn
             sparse_fwd_dense_loss = (
@@ -3692,6 +3717,70 @@ class TransformerConfig(ModelParallelConfig):
                     "Batch-invariant MoE supports dynamic dropless routing only. "
                     "Disable MoE capacity/expert padding."
                 )
+
+    def _install_dsa_dense_phase(self, min_memory_dsa_backend: bool) -> None:
+        """Capture the configured sparse-phase DSA settings and start the run in dense mode.
+
+        ``dsa_indexer_dense_loss_steps`` reproduces a two-phase run -- indexer trained against a
+        dense attention forward, then everything trained against the sparse forward -- from a
+        single configuration. The remaining ``dsa_*`` fields describe the sparse phase, so this
+        stashes them in ``dsa_sparse_phase_overrides`` and installs the dense-phase values. The
+        dense-phase assertions in ``__post_init__`` then validate the live (dense) config as
+        written, and the training loop restores the overrides at the boundary.
+        """
+        assert (
+            self.dsa_indexer_dense_loss_start_iter >= 0
+        ), "dsa_indexer_dense_loss_start_iter must be non-negative."
+        assert self.dsa_indexer_dense_loss_steps > 0, (
+            "dsa_indexer_dense_loss_steps must be a positive iteration count; "
+            "leave it unset to disable the schedule."
+        )
+        assert min_memory_dsa_backend, (
+            "dsa_indexer_dense_loss_steps requires a min-memory dsa_min_memory_backend, "
+            "because the dense phase uses the min-memory dense attention forward."
+        )
+        assert (
+            not self.dsa_fwd_skip_dsa
+        ), "dsa_indexer_dense_loss_steps is incompatible with dsa_fwd_skip_dsa."
+        assert (
+            not self.dsa_train_main_only
+        ), "dsa_indexer_dense_loss_steps is incompatible with dsa_train_main_only."
+        # The backbone must be trainable in the sparse phase, and requires_grad is captured when
+        # DDP and the optimizer take the parameters. Freezing here would make the sparse phase a
+        # silent no-op, so the dense phase holds the backbone at lr=0 instead.
+        assert not self.dsa_train_indexer_only, (
+            "dsa_indexer_dense_loss_steps replaces dsa_train_indexer_only: the schedule holds the "
+            "backbone at lr=0 during the dense phase so that it can train in the sparse phase."
+        )
+        assert not self.dsa_fwd_use_dense_attn, (
+            "dsa_indexer_dense_loss_steps configures the dense phase itself; the remaining dsa_* "
+            "fields describe the sparse phase, so leave dsa_fwd_use_dense_attn unset."
+        )
+        assert self.dsa_indexer_use_sparse_loss, (
+            "dsa_indexer_dense_loss_steps expects the sparse phase to use the sparse indexer "
+            "loss; set dsa_indexer_use_sparse_loss."
+        )
+        assert (
+            self.dsa_indexer_loss_coeff or 0.0
+        ) > 0.0, "dsa_indexer_dense_loss_steps requires dsa_indexer_loss_coeff > 0."
+
+        self.dsa_sparse_phase_overrides = {
+            "dsa_fwd_use_dense_attn": False,
+            "dsa_indexer_use_sparse_loss": True,
+            "dsa_indexer_sparse_loss_use_topk_only": self.dsa_indexer_sparse_loss_use_topk_only,
+            "dsa_kernel_cache_routing": self.dsa_kernel_cache_routing,
+            "dsa_kernel_cache_indexer_k": self.dsa_kernel_cache_indexer_k,
+            "dsa_kernel_cache_selected_scores": self.dsa_kernel_cache_selected_scores,
+        }
+        # Dense phase: dense forward, dense KL target, and no caching. The dense path recomputes
+        # indexer K and bypasses routing, so the cache flags are not merely useless there -- the
+        # dense-phase assertions below reject them.
+        self.dsa_fwd_use_dense_attn = True
+        self.dsa_indexer_use_sparse_loss = False
+        self.dsa_indexer_sparse_loss_use_topk_only = False
+        self.dsa_kernel_cache_routing = False
+        self.dsa_kernel_cache_indexer_k = False
+        self.dsa_kernel_cache_selected_scores = False
 
 
 @dataclass

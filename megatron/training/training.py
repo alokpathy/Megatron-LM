@@ -1947,6 +1947,213 @@ def _apply_dsa_indexer_lr_warmup(args, optimizer, opt_param_scheduler) -> float 
     return get_indexer_lr_for_logging(optimizer.param_groups)
 
 
+def _dsa_dense_phase_active(args, iteration: int) -> bool:
+    """Return true while the DSA dense-loss schedule is in its dense phase.
+
+    The window is ``[start_iter, start_iter + dense_steps)``. ``start_iter`` is 0 when training
+    from scratch, and the checkpoint's iteration when warming a freshly reset indexer on top of
+    a pretrained model -- otherwise a run resuming past it would skip the dense phase entirely.
+    """
+    dense_steps = getattr(args, "dsa_indexer_dense_loss_steps", None)
+    if dense_steps is None:
+        return False
+    start = getattr(args, "dsa_indexer_dense_loss_start_iter", 0) or 0
+    return start <= iteration < start + dense_steps
+
+
+def _snapshot_dsa_backbone_optimizer_state(model, optimizer) -> list:
+    """Capture the backbone's optimizer state as it stands entering the dense phase.
+
+    The dense-to-sparse boundary must leave the backbone exactly as a freeze would have: with the
+    state it had when the dense phase began. When pretraining from scratch that is nothing, and
+    restoring degenerates to clearing. When starting from a pretrained checkpoint it is real Adam
+    history -- warm moments and a clock at the checkpoint's step -- which clearing would destroy,
+    restarting bias correction from t=1 in the middle of training.
+
+    Returns one record per underlying torch optimizer: the cloned per-parameter state (``None``
+    marks a parameter that had no state yet) and the group clocks, which live on the group rather
+    than in per-parameter state.
+    """
+    if optimizer is None or getattr(optimizer, "is_stub_optimizer", False):
+        return []
+    if not isinstance(model, list):
+        model = [model]
+    if hasattr(optimizer, "chained_optimizers"):
+        snapshot = []
+        for child_optimizer in optimizer.chained_optimizers:
+            snapshot.extend(_snapshot_dsa_backbone_optimizer_state(model, child_optimizer))
+        return snapshot
+
+    param_to_optim_param = get_model_to_optimizer_param_map(optimizer)
+    torch_optimizer = getattr(optimizer, "optimizer", None)
+    optimizer_state = getattr(torch_optimizer, "state", None)
+    if optimizer_state is None:
+        return []
+
+    def _clone(value):
+        return value.detach().clone() if torch.is_tensor(value) else value
+
+    saved_state = {}
+    seen_param_ids = set()
+    for model_chunk in model:
+        for name, param in model_chunk.named_parameters():
+            if _is_dsa_indexer_param_name(name):
+                continue
+            if id(param) in seen_param_ids:
+                continue
+            seen_param_ids.add(id(param))
+            optim_param = param_to_optim_param.get(param)
+            if optim_param is None:
+                continue
+            entry = optimizer_state.get(optim_param)
+            saved_state[optim_param] = (
+                None if entry is None else {k: _clone(v) for k, v in entry.items()}
+            )
+
+    saved_steps = []
+    for param_group in getattr(torch_optimizer, "param_groups", None) or []:
+        if bool(param_group.get("is_dsa_indexer", False)):
+            continue
+        saved_steps.append((param_group, "step" in param_group, _clone(param_group.get("step"))))
+
+    return [(torch_optimizer, saved_state, saved_steps)]
+
+
+def _restore_dsa_backbone_optimizer_state(snapshot: list) -> int:
+    """Put the backbone's pre-dense-phase optimizer state back, discarding what lr=0 accumulated."""
+    restored = 0
+    for torch_optimizer, saved_state, saved_steps in snapshot:
+        optimizer_state = torch_optimizer.state
+        for optim_param, entry in saved_state.items():
+            if entry is None:
+                # No state entering the dense phase; FusedAdam reallocates zeros on the next step.
+                optimizer_state.pop(optim_param, None)
+            else:
+                optimizer_state[optim_param] = {
+                    k: (v.detach().clone() if torch.is_tensor(v) else v) for k, v in entry.items()
+                }
+            restored += 1
+        for param_group, had_step, step in saved_steps:
+            if not had_step:
+                param_group.pop("step", None)
+            elif torch.is_tensor(step) and torch.is_tensor(param_group.get("step")):
+                param_group["step"].copy_(step)
+            else:
+                param_group["step"] = step
+    return restored
+
+
+def _enter_dsa_sparse_phase(model, optimizer, snapshot, restore_backbone_state: bool) -> None:
+    """Switch every model chunk from the dense phase to the sparse phase.
+
+    ``dsa_fwd_use_dense_attn`` and ``dsa_indexer_use_sparse_loss`` are read from ``self.config``
+    on every forward (``dsa_gqa.py`` lines 832, 1026 and 1028), so restoring the captured
+    sparse-phase values is all the attention path needs -- no per-step plumbing.
+
+    ``restore_backbone_state`` is false when resuming from a checkpoint written after the boundary:
+    the backbone's state was already restored before that checkpoint, and touching it again would
+    discard genuine sparse-phase optimizer history.
+    """
+    if not isinstance(model, list):
+        model = [model]
+
+    for model_chunk in model:
+        config = get_model_config(model_chunk)
+        overrides = getattr(config, "dsa_sparse_phase_overrides", None)
+        if not overrides:
+            continue
+        for field_name, value in overrides.items():
+            setattr(config, field_name, value)
+
+    if not restore_backbone_state:
+        print_rank_0("  > DSA schedule: resumed in sparse phase; optimizer state left intact")
+        return
+
+    if snapshot:
+        # Freezing would have left the backbone exactly as it was entering the dense phase, so put
+        # that back: the moments and the group clock that bias-corrects them, both or neither.
+        # Restoring only one leaves the correction dividing state of one age by a clock of another.
+        restored = _restore_dsa_backbone_optimizer_state(snapshot)
+        print_rank_0(
+            f"  > DSA schedule: entered sparse phase; restored pre-dense-phase optimizer state "
+            f"for {restored} backbone parameters"
+        )
+        return
+
+    # No snapshot: a fresh process resumed mid dense phase, so the state the phase opened with is
+    # unrecoverable. Leave the backbone alone rather than clearing it. Clearing would be right had
+    # the run started from scratch and destructive had it started from a pretrained checkpoint,
+    # and from here the two are indistinguishable. What is left is self-consistent -- moments and
+    # clock of the same age -- and merely carries the dense phase's discarded gradients.
+    print_rank_0(
+        "  > DSA schedule: WARNING entered sparse phase without a dense-phase snapshot; the "
+        "backbone keeps the optimizer state accumulated while it was masked, which a run that "
+        "reached this boundary in one process would have discarded."
+    )
+
+
+def apply_dsa_dense_sparse_schedule(args, model, optimizer, iteration: int) -> None:
+    """Drive ``--dsa-indexer-dense-loss-steps`` at the top of each training iteration.
+
+    The dense phase holds the backbone at ``lr=0`` rather than freezing it, because DDP and the
+    distributed optimizer capture ``requires_grad`` when they take the parameters -- a parameter
+    frozen at wrap time has no gradient bucket, no reduction hook, and no optimizer state, so it
+    cannot be unfrozen later. Masking keeps those structures alive, at the cost of computing and
+    reducing backbone gradients that the dense phase then discards.
+    """
+    dense_steps = getattr(args, "dsa_indexer_dense_loss_steps", None)
+    if dense_steps is None:
+        return
+
+    dense = _dsa_dense_phase_active(args, iteration)
+    previous_phase = getattr(args, "_dsa_schedule_phase", None)
+    start = getattr(args, "dsa_indexer_dense_loss_start_iter", 0) or 0
+
+    if previous_phase is None and iteration < start:
+        # Before the window there is no defined phase: the config still holds the dense-phase
+        # values, but treating that as the dense phase would silently extend it backwards, and
+        # treating it as the sparse phase would flip the config with no way back. Refuse instead.
+        raise RuntimeError(
+            f"dsa_indexer_dense_loss_start_iter={start} is ahead of the starting iteration "
+            f"{iteration}. Set it to the iteration this run begins at (the checkpoint's iteration "
+            f"when warming a reset indexer, or 0 when training from scratch)."
+        )
+
+    if dense:
+        if previous_phase is None:
+            # Snapshot before the first masked step, so the boundary can restore the backbone to
+            # what a freeze would have preserved rather than to nothing.
+            args._dsa_backbone_state_snapshot = _snapshot_dsa_backbone_optimizer_state(
+                model, optimizer
+            )
+            start = getattr(args, "dsa_indexer_dense_loss_start_iter", 0) or 0
+            print_rank_0(
+                f"  > DSA schedule: dense phase for iterations {start}-{start + dense_steps - 1}, "
+                f"sparse phase from iteration {start + dense_steps}"
+            )
+            if iteration > start:
+                print_rank_0(
+                    f"  > DSA schedule: WARNING resumed mid dense phase at iteration {iteration}; "
+                    f"the snapshot captures optimizer state that {iteration - start} masked steps "
+                    f"have already perturbed, not the state the dense phase opened with"
+                )
+        # Re-applied every iteration: the global scheduler rewrites lr on every step.
+        for param_group in optimizer.param_groups:
+            if not param_group.get("is_dsa_indexer", False):
+                param_group["lr"] = 0.0
+    elif previous_phase != "sparse":
+        _enter_dsa_sparse_phase(
+            model,
+            optimizer,
+            getattr(args, "_dsa_backbone_state_snapshot", None),
+            restore_backbone_state=previous_phase == "dense",
+        )
+        # Release the clones; they are only needed up to the boundary.
+        args._dsa_backbone_state_snapshot = None
+
+    args._dsa_schedule_phase = "dense" if dense else "sparse"
+
+
 def _reset_dsa_indexer_after_load(model, optimizer, opt_param_scheduler, args, explicit_start: bool):
     """Reset DSA indexer params/state after checkpoint load and initialize activation warmup."""
     if getattr(args, "use_torch_fsdp2", False) or getattr(args, "use_megatron_fsdp", False):
@@ -5343,6 +5550,9 @@ def train(
             continue
 
         args.curr_iteration = iteration
+        # Drive the DSA dense-to-sparse schedule before the forward pass reads the config, and
+        # before the optimizer step consumes the learning rates the global scheduler just set.
+        apply_dsa_dense_sparse_schedule(args, model, optimizer, iteration)
         # For GRPO, we keep the data for a few epochs. DeepSeekMath paper calls this number $\mu$.
         # It is similar to a PPO epoch.
 
