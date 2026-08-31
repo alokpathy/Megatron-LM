@@ -781,6 +781,10 @@ class DSGQACoreAttention(MegatronModule):
         self.layer_number = layer_number
         # config.cp_comm_type may be a per-layer list; the spec resolves it to one value here.
         self.cp_comm_type = cp_comm_type
+        # Kept because the context-parallel K/V gather in _forward_min_memory needs the CP group.
+        # SelfAttention stores this too, but that is a different object; this core-attention
+        # submodule previously only forwarded pg_collection to the indexer and never kept it.
+        self.pg_collection = pg_collection
         self.indexer = build_module(submodules.indexer, config=config, pg_collection=pg_collection)
         self.dense_core_attention = None
         if (
@@ -1097,9 +1101,11 @@ class DSGQACoreAttention(MegatronModule):
         # Only the DSA path consumes gathered K/V. dense_core_attention below is a
         # TransformerEngine module with its own CP handling, so it keeps the local shards;
         # binding the gathered copies to separate names keeps the two from colliding.
-        # pg_collection is Optional in the constructor signature, so an absent or CP-less
-        # collection legitimately means a single context-parallel rank, which the helper no-ops on.
-        cp_group = getattr(getattr(self, "pg_collection", None), "cp", None)
+        # Read pg_collection directly: it is always assigned in __init__, so an AttributeError
+        # here is a wiring bug and should say so. A defensive getattr previously made a missing
+        # attribute indistinguishable from a deliberately CP-less config, which silently disabled
+        # the gather for every context-parallel run.
+        cp_group = getattr(self.pg_collection, "cp", None) if self.pg_collection else None
         cp_size = 1 if cp_group is None else cp_group.size()
         if cp_size > 1 and (dense_warmup or skip_dsa or sparse_fwd_dense_loss):
             # The dense-loss tiling loops in dsa_min_memory still derive positions from a local
@@ -1109,6 +1115,18 @@ class DSGQACoreAttention(MegatronModule):
                 "DSA over GQA context parallelism currently covers the sparse path only; "
                 "dsa_fwd_use_dense_attn, dsa_fwd_skip_dsa and the dense indexer loss are not "
                 "yet position-aware."
+            )
+        # The learned indexer K is projected per rank and all-gathered inside the min-memory
+        # path, which requires the full-sequence cache; without it K would be projected blockwise
+        # from the local hidden_states and cover only this rank's tokens.
+        if (
+            cp_size > 1
+            and getattr(self.config, "dsa_simplified_use_learned_k", False)
+            and not getattr(self.config, "dsa_kernel_cache_indexer_k", False)
+        ):
+            raise NotImplementedError(
+                "DSA over GQA context parallelism with --dsa-simplified-use-learned-k requires "
+                "--dsa-kernel-cache-indexer-k."
             )
         dsa_key, dsa_value, query_positions = _gather_kv_for_context_parallel(
             key, value, cp_group, getattr(self, "cp_comm_type", None)
