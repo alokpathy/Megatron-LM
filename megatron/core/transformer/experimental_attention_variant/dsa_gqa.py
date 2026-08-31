@@ -25,6 +25,10 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
     fused_qk_topk_chunked,
     fused_qk_topk_naive,
 )
+from megatron.core.transformer.experimental_attention_variant.dsa_layout import (
+    build_zigzag_allgather_cp_key_reorder,
+    normalize_cp_comm_type,
+)
 from megatron.core.transformer.experimental_attention_variant.dsa_min_memory import (
     dsa_dense_indexer_loss,
     dsa_min_memory_gqa,
@@ -120,6 +124,48 @@ def _simplified_indexer_uses_main_input_norm(config: TransformerConfig) -> bool:
     return getattr(config, "dsa_indexer_mode", "standard") == "simplified" and not getattr(
         config, "dsa_simplified_indexer_disable_main_input_norm", False
     )
+
+
+def _gather_kv_for_context_parallel(key, value, cp_group, cp_comm_type):
+    """All-gather K and V along the sequence dimension over the context-parallel group.
+
+    Context parallelism shards the sequence, so a rank holds only its slice of Q, K and V. The
+    simplified indexer selects top-k over the *global* key set, which a ring or striped exchange
+    would turn into a distributed top-k merge; all-gathering K and V instead lets each rank run
+    both the indexer and attention locally against complete keys. This mirrors the strategy
+    upstream uses for DSA over MLA, hence the ``cp_comm_type='allgather'`` gate.
+
+    The gather is deliberately outside ``DSASimplifiedMinMemoryGQAFn`` so that it is an ordinary
+    node in the autograd graph. ``gather_from_sequence_parallel_region`` reduce-scatters in
+    backward, which sums every rank's contribution to a shared key before scattering the gradient
+    home. Gathering inside the custom Function would make that reduction our responsibility, and
+    omitting it yields finite but wrong dK/dV with no error.
+
+    Gathered tensors arrive concatenated in *rank* order. Under the default zigzag layout rank r
+    holds chunks r and 2*cp-r-1, so rank order is not position order, while the causal masks
+    downstream compare raw offsets. The reorder restores global position order; it is an indexing
+    op rather than an in-place write, so autograd permutes the gradient back before the
+    reduce-scatter sees it.
+    """
+    cp_size = 1 if cp_group is None else cp_group.size()
+    if cp_size <= 1:
+        return key, value
+
+    if normalize_cp_comm_type(cp_comm_type) != "allgather":
+        raise NotImplementedError(
+            "DSA over GQA context parallelism supports cp_comm_type='allgather' only; "
+            f"got {cp_comm_type!r}."
+        )
+
+    sq_local = key.size(0)
+    gathered_key = gather_from_sequence_parallel_region(
+        key, tensor_parallel_output_grad=True, group=cp_group
+    )
+    gathered_value = gather_from_sequence_parallel_region(
+        value, tensor_parallel_output_grad=True, group=cp_group
+    )
+    reorder = build_zigzag_allgather_cp_key_reorder(sq_local, cp_size, key.device)
+    return gathered_key[reorder], gathered_value[reorder]
 
 
 def _split_topk_padding(topk_indices):
@@ -729,6 +775,8 @@ class DSGQACoreAttention(MegatronModule):
     ):
         super().__init__(config=config)
         self.layer_number = layer_number
+        # config.cp_comm_type may be a per-layer list; the spec resolves it to one value here.
+        self.cp_comm_type = cp_comm_type
         self.indexer = build_module(submodules.indexer, config=config, pg_collection=pg_collection)
         self.dense_core_attention = None
         if (
@@ -1042,6 +1090,15 @@ class DSGQACoreAttention(MegatronModule):
             raise NotImplementedError(
                 f"dsa_min_memory_backend='{dsa_min_memory_backend}' requires full-sequence self attention."
             )
+        # Only the DSA path consumes gathered K/V. dense_core_attention below is a
+        # TransformerEngine module with its own CP handling, so it keeps the local shards;
+        # binding the gathered copies to separate names keeps the two from colliding.
+        # pg_collection is Optional in the constructor signature, so an absent or CP-less
+        # collection legitimately means a single context-parallel rank, which the helper no-ops on.
+        cp_group = getattr(getattr(self, "pg_collection", None), "cp", None)
+        dsa_key, dsa_value = _gather_kv_for_context_parallel(
+            key, value, cp_group, getattr(self, "cp_comm_type", None)
+        )
         if skip_dsa:
             if self.dense_core_attention is None:
                 raise RuntimeError("DSA skip mode requires an original dense core attention spec.")
@@ -1161,7 +1218,7 @@ class DSGQACoreAttention(MegatronModule):
             )
             indexer_loss = dsa_dense_indexer_loss(
                 query=query.detach(),
-                key=key.detach(),
+                key=dsa_key.detach(),
                 hidden_states=hidden_states.detach(),
                 indexer=self.indexer,
                 softmax_scale=self.softmax_scale,
@@ -1187,8 +1244,8 @@ class DSGQACoreAttention(MegatronModule):
         if not torch.is_grad_enabled():
             return dsa_min_memory_gqa_forward_only(
                 query=query,
-                key=key,
-                value=value,
+                key=dsa_key,
+                value=dsa_value,
                 hidden_states=hidden_states.detach(),
                 indexer=self.indexer,
                 softmax_scale=self.softmax_scale,
@@ -1219,8 +1276,8 @@ class DSGQACoreAttention(MegatronModule):
         sparse_loss_coeff = indexer_loss_coeff if sparse_indexer_loss else 0.0
         output, indexer_loss = dsa_min_memory_gqa(
             query=query,
-            key=key,
-            value=value,
+            key=dsa_key,
+            value=dsa_value,
             hidden_states=hidden_states.detach(),
             indexer=self.indexer,
             softmax_scale=self.softmax_scale,
@@ -1241,7 +1298,7 @@ class DSGQACoreAttention(MegatronModule):
         if sparse_fwd_dense_loss:
             indexer_loss = dsa_dense_indexer_loss(
                 query=query.detach(),
-                key=key.detach(),
+                key=dsa_key.detach(),
                 hidden_states=hidden_states.detach(),
                 indexer=self.indexer,
                 softmax_scale=self.softmax_scale,
