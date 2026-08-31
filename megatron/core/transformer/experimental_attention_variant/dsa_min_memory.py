@@ -684,6 +684,52 @@ def _apply_indexer_input_norm_tile(
 _apply_simplified_input_norm_tile = _apply_indexer_input_norm_tile
 
 
+def _tile_global_start(query_positions: Optional[torch.Tensor], q_start: int) -> int:
+    """Global position of the first query row in a tile whose local offset is ``q_start``.
+
+    ``q_start`` indexes the *local* shard and must stay local for slicing. Causality and the
+    indexer's rotary embedding need the *global* position instead: under context parallelism a
+    rank's queries no longer begin at position 0, and under the default zigzag layout they are not
+    even one contiguous range. Returning a per-tile scalar keeps every downstream consumer on the
+    scalar arithmetic it already uses -- the kernels' ``q_start`` argument is a position, so
+    passing this value leaves their signatures untouched.
+
+    ``None`` means no context parallelism, where local and global positions coincide.
+    """
+    if query_positions is None:
+        return q_start
+    return int(query_positions[q_start].item())
+
+
+def _validate_query_positions(
+    query_positions: Optional[torch.Tensor], sq: int, query_chunk_size: int
+) -> None:
+    """Reject tilings whose tiles straddle disjoint global position ranges.
+
+    The zigzag layout gives a rank two chunks, and a tile spanning both cannot be described by a
+    single scalar start. Checked once up front rather than per tile, because the failure is
+    silently wrong masking rather than an error.
+    """
+    if query_positions is None:
+        return
+    if query_positions.numel() != sq:
+        raise ValueError(
+            f"query_positions has {query_positions.numel()} entries for a local sequence of {sq}."
+        )
+    for q_start in range(0, sq, query_chunk_size):
+        q_end = min(q_start + query_chunk_size, sq)
+        tile = query_positions[q_start:q_end]
+        expected = torch.arange(
+            int(tile[0].item()), int(tile[0].item()) + (q_end - q_start), device=tile.device
+        )
+        if not torch.equal(tile.to(expected.dtype), expected):
+            raise ValueError(
+                "Query tile spans a discontinuity in global positions "
+                f"(local rows {q_start}:{q_end}). Choose a dsa_kernel_query_block_size that "
+                "divides the context-parallel chunk length."
+            )
+
+
 def _project_simplified_q_index_tile(
     hidden_states: torch.Tensor,
     q_start: int,
@@ -695,7 +741,10 @@ def _project_simplified_q_index_tile(
     rotary_interleaved: bool,
     use_indexer_rope: bool,
     simplified_input_norm=None,
+    q_pos_start: Optional[int] = None,
 ) -> torch.Tensor:
+    # q_start slices the local shard; q_pos_start is the tile's global position for RoPE.
+    q_pos_start = q_start if q_pos_start is None else q_pos_start
     hidden_tile = _apply_simplified_input_norm_tile(
         hidden_states[q_start:q_end], simplified_input_norm
     )
@@ -703,7 +752,9 @@ def _project_simplified_q_index_tile(
         q_end - q_start, hidden_states.size(1), 1, index_head_dim
     )
     if use_indexer_rope:
-        positions = torch.arange(q_start, q_end, device=q_index.device, dtype=torch.long)
+        positions = torch.arange(
+            q_pos_start, q_pos_start + (q_end - q_start), device=q_index.device, dtype=torch.long
+        )
         q_index = _apply_rope_at_positions(
             q_index, positions, index_head_dim, index_rotary_dim, rotary_pos_emb, rotary_interleaved
         )
@@ -932,7 +983,10 @@ def _simplified_topk_index_tile(
     profile_suffix: str = "fwd",
     linear_k_weight: Optional[torch.Tensor] = None,
     full_k_index: Optional[torch.Tensor] = None,
+    q_pos_start: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    # q_start slices the local shard; q_pos_start is this tile's global position.
+    q_pos_start = q_start if q_pos_start is None else q_pos_start
     with _profile_record(profile, f"routing_q_project_{profile_suffix}", hidden_states.device):
         q_index = _project_simplified_q_index_tile(
             hidden_states,
@@ -945,8 +999,12 @@ def _simplified_topk_index_tile(
             rotary_interleaved,
             use_indexer_rope,
             simplified_input_norm,
+            q_pos_start=q_pos_start,
         )
-    causal_key_limit = min(q_end, key.size(0))
+    # Causal visibility is a property of the tile's *global* last position, not its local one.
+    # Under context parallelism the key set is the full gathered sequence, so clamping with the
+    # local q_end would hide every key beyond this rank's shard length.
+    causal_key_limit = min(q_pos_start + (q_end - q_start), key.size(0))
     topk = min(index_topk, causal_key_limit)
     running_scores = None
     running_indices = None
@@ -985,14 +1043,14 @@ def _simplified_topk_index_tile(
                 unit_weights,
                 key_block[:, :, 0, :],
                 block_topk,
-                q_start,
+                q_pos_start,
                 k_start,
                 apply_relu=False,
                 score_scale=score_scale,
             )
             if triton_topk is None:
                 block_scores = _simplified_index_scores_block(
-                    q_index, key_block, score_scale, q_start, k_start
+                    q_index, key_block, score_scale, q_pos_start, k_start
                 )
                 block_scores, block_indices = block_scores.topk(block_topk, dim=-1)
                 block_indices = block_indices + k_start
@@ -1033,19 +1091,25 @@ def _simplified_sparse_forward_impl(
     selected_scores_cache: Optional[list] = None,
     linear_k_weight: Optional[torch.Tensor] = None,
     full_k_index: Optional[torch.Tensor] = None,
+    query_positions: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     sq, batch_size, num_query_heads, _ = query.shape
     output = value.new_empty((sq, batch_size, num_query_heads, value.size(-1)))
     indexer_loss = query.new_zeros((), dtype=torch.float32)
     total_positions = batch_size * sq
-    for q_start in range(0, sq, query_chunk_size):
-        q_end = min(q_start + query_chunk_size, sq)
+    for q_lo in range(0, sq, query_chunk_size):
+        q_hi = min(q_lo + query_chunk_size, sq)
+        # q_lo/q_hi index the local shard and are used for slicing; q_start/q_end carry the
+        # tile's global positions, which is what causality and RoPE need under context
+        # parallelism. Their difference is the tile length either way.
+        q_start = _tile_global_start(query_positions, q_lo)
+        q_end = q_start + (q_hi - q_lo)
         with _profile_record(profile, "routing_topk_fwd", query.device):
             _, topk_indices, q_index = _simplified_topk_index_tile(
                 hidden_states,
                 key,
-                q_start,
-                q_end,
+                q_lo,
+                q_hi,
                 linear_q_weight,
                 index_topk,
                 index_head_dim,
@@ -1060,12 +1124,13 @@ def _simplified_sparse_forward_impl(
                 profile_suffix="fwd",
                 linear_k_weight=linear_k_weight,
                 full_k_index=full_k_index,
+                q_pos_start=q_start,
             )
         if routing_topk_cache is not None:
             routing_topk_cache.append(topk_indices)
-        query_tile = query[q_start:q_end]
+        query_tile = query[q_lo:q_hi]
         with _profile_record(profile, "sparse_attention_fwd", query.device):
-            output[q_start:q_end] = _sparse_attention_tile(
+            output[q_lo:q_hi] = _sparse_attention_tile(
                 query_tile, key, value, topk_indices, attention_softmax_scale, q_start
             )
         if loss_coeff > 0:
@@ -1154,9 +1219,11 @@ class DSASimplifiedMinMemoryGQAFn(torch.autograd.Function):
         cache_selected_scores: bool = False,
         cache_indexer_k: bool = False,
         use_triton: bool = True,
+        query_positions: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         profile = _DSATimingProfiler(profile_enabled, profile_rank, profile_label, query.device)
         key_chunk_size = _routing_key_chunk_size(key_chunk_size, key.size(0), use_triton)
+        _validate_query_positions(query_positions, query.size(0), query_chunk_size)
         routing_topk_cache = [] if cache_routing else None
         selected_scores_cache = [] if cache_selected_scores else None
         use_learned_k = linear_k_weight.numel() > 0
@@ -1202,6 +1269,7 @@ class DSASimplifiedMinMemoryGQAFn(torch.autograd.Function):
                         selected_scores_cache=selected_scores_cache,
                         linear_k_weight=linear_k_weight if use_learned_k else None,
                         full_k_index=full_k_index,
+                        query_positions=query_positions,
                     )
         profile.log("forward")
 
@@ -1233,6 +1301,7 @@ class DSASimplifiedMinMemoryGQAFn(torch.autograd.Function):
             tuple(selected_scores_cache) if selected_scores_cache is not None else None
         )
         ctx.use_triton = use_triton
+        ctx.query_positions = query_positions
         return output, indexer_loss
 
     @staticmethod
@@ -1294,8 +1363,11 @@ class DSASimplifiedMinMemoryGQAFn(torch.autograd.Function):
                         ctx.simplified_input_norm.eps,
                         ctx.simplified_input_norm.normalization,
                     )
-            for chunk_idx, q_start in enumerate(range(0, sq, ctx.query_chunk_size)):
-                q_end = min(q_start + ctx.query_chunk_size, sq)
+            for chunk_idx, q_lo in enumerate(range(0, sq, ctx.query_chunk_size)):
+                q_hi = min(q_lo + ctx.query_chunk_size, sq)
+                # See the forward loop: q_lo/q_hi slice locally, q_start/q_end are global.
+                q_start = _tile_global_start(ctx.query_positions, q_lo)
+                q_end = q_start + (q_hi - q_lo)
                 q_index = None
                 if ctx.routing_topk_cache is not None:
                     with _profile_record(profile, "routing_topk_bwd_cached", query.device):
@@ -1306,8 +1378,8 @@ class DSASimplifiedMinMemoryGQAFn(torch.autograd.Function):
                             _, topk_indices, q_index = _simplified_topk_index_tile(
                                 hidden_states,
                                 key,
-                                q_start,
-                                q_end,
+                                q_lo,
+                                q_hi,
                                 linear_q_weight,
                                 ctx.index_topk,
                                 ctx.index_head_dim,
@@ -1322,13 +1394,14 @@ class DSASimplifiedMinMemoryGQAFn(torch.autograd.Function):
                                 profile_suffix="bwd",
                                 linear_k_weight=(linear_k_weight if ctx.use_learned_k else None),
                                 full_k_index=full_k_index,
+                                q_pos_start=q_start,
                             )
 
                 triton_attention_done = False
                 if use_triton_attention_backward:
-                    query_tile = query[q_start:q_end]
-                    grad_output_tile = grad_output[q_start:q_end]
-                    grad_query_tile = grad_query[q_start:q_end]
+                    query_tile = query[q_lo:q_hi]
+                    grad_output_tile = grad_output[q_lo:q_hi]
+                    grad_query_tile = grad_query[q_lo:q_hi]
                     if grad_key_accum is None and triton_sparse_attention_backward_supported(
                         query_tile, key, value, topk_indices, grad_output_tile, grad_query_tile
                     ):
@@ -1366,9 +1439,7 @@ class DSASimplifiedMinMemoryGQAFn(torch.autograd.Function):
 
                 if not triton_attention_done:
                     attention_inputs = []
-                    query_tile = (
-                        query[q_start:q_end].detach().requires_grad_(ctx.needs_input_grad[0])
-                    )
+                    query_tile = query[q_lo:q_hi].detach().requires_grad_(ctx.needs_input_grad[0])
                     key_leaf = key.detach().requires_grad_(ctx.needs_input_grad[1])
                     value_leaf = value.detach().requires_grad_(ctx.needs_input_grad[2])
                     if ctx.needs_input_grad[0]:
@@ -1393,7 +1464,7 @@ class DSASimplifiedMinMemoryGQAFn(torch.autograd.Function):
                             attention_grads = torch.autograd.grad(
                                 output_tile,
                                 attention_inputs,
-                                grad_outputs=grad_output[q_start:q_end],
+                                grad_outputs=grad_output[q_lo:q_hi],
                                 retain_graph=False,
                                 allow_unused=True,
                             )
@@ -1401,7 +1472,7 @@ class DSASimplifiedMinMemoryGQAFn(torch.autograd.Function):
                             if ctx.needs_input_grad[0]:
                                 grad = next(grad_iter)
                                 if grad is not None:
-                                    grad_query[q_start:q_end] = grad
+                                    grad_query[q_lo:q_hi] = grad
                             if ctx.needs_input_grad[1]:
                                 grad = next(grad_iter)
                                 if grad is not None:
@@ -1482,7 +1553,7 @@ class DSASimplifiedMinMemoryGQAFn(torch.autograd.Function):
                                     )
                                 )
                             teacher = _teacher_scores_tile(
-                                query[q_start:q_end].detach(),
+                                query[q_lo:q_hi].detach(),
                                 key.detach(),
                                 topk_indices,
                                 ctx.attention_softmax_scale,
@@ -1624,6 +1695,7 @@ class DSASimplifiedMinMemoryGQAFn(torch.autograd.Function):
             None,
             None,
             None,
+            None,  # query_positions
         )
 
 
@@ -2129,6 +2201,7 @@ def dsa_min_memory_gqa_forward_only(
     profile_label: str = "",
     use_triton: bool = True,
     use_cudnn: bool = False,
+    query_positions: Optional[torch.Tensor] = None,
     simplified_input_norm=None,
 ) -> torch.Tensor:
     """Run min-memory DSA-GQA for no-grad validation/eval forward passes."""
@@ -2181,6 +2254,7 @@ def dsa_min_memory_gqa_forward_only(
                     profile=profile,
                     linear_k_weight=linear_k_weight if use_learned_k else None,
                     full_k_index=full_k_index,
+                    query_positions=query_positions,
                 )
         profile.log("forward")
         return output
@@ -2330,6 +2404,7 @@ def dsa_min_memory_gqa(
     profile_label: str = "",
     use_triton: bool = True,
     use_cudnn: bool = False,
+    query_positions: Optional[torch.Tensor] = None,
     simplified_input_norm=None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Run the minimum-activation DSA-GQA training backend."""
@@ -2366,4 +2441,5 @@ def dsa_min_memory_gqa(
             cache_selected_scores,
             cache_indexer_k,
             use_triton,
+            query_positions,
         )

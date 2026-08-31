@@ -1096,6 +1096,16 @@ class DSGQACoreAttention(MegatronModule):
         # pg_collection is Optional in the constructor signature, so an absent or CP-less
         # collection legitimately means a single context-parallel rank, which the helper no-ops on.
         cp_group = getattr(getattr(self, "pg_collection", None), "cp", None)
+        cp_size = 1 if cp_group is None else cp_group.size()
+        if cp_size > 1 and (dense_warmup or skip_dsa or sparse_fwd_dense_loss):
+            # The dense-loss tiling loops in dsa_min_memory still derive positions from a local
+            # q_start, so their causal masks would be wrong under context parallelism. Refuse
+            # rather than produce a plausible loss curve from incorrect masking.
+            raise NotImplementedError(
+                "DSA over GQA context parallelism currently covers the sparse path only; "
+                "dsa_fwd_use_dense_attn, dsa_fwd_skip_dsa and the dense indexer loss are not "
+                "yet position-aware."
+            )
         dsa_key, dsa_value = _gather_kv_for_context_parallel(
             key, value, cp_group, getattr(self, "cp_comm_type", None)
         )
