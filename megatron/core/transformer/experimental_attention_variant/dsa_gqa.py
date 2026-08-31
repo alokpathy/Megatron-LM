@@ -27,6 +27,7 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
 )
 from megatron.core.transformer.experimental_attention_variant.dsa_layout import (
     build_zigzag_allgather_cp_key_reorder,
+    build_zigzag_cp_local_positions,
     normalize_cp_comm_type,
 )
 from megatron.core.transformer.experimental_attention_variant.dsa_min_memory import (
@@ -149,7 +150,7 @@ def _gather_kv_for_context_parallel(key, value, cp_group, cp_comm_type):
     """
     cp_size = 1 if cp_group is None else cp_group.size()
     if cp_size <= 1:
-        return key, value
+        return key, value, None
 
     if normalize_cp_comm_type(cp_comm_type) != "allgather":
         raise NotImplementedError(
@@ -165,7 +166,10 @@ def _gather_kv_for_context_parallel(key, value, cp_group, cp_comm_type):
         value, tensor_parallel_output_grad=True, group=cp_group
     )
     reorder = build_zigzag_allgather_cp_key_reorder(sq_local, cp_size, key.device)
-    return gathered_key[reorder], gathered_value[reorder]
+    query_positions = build_zigzag_cp_local_positions(
+        sq_local * cp_size, cp_size, cp_group.rank(), key.device
+    )
+    return gathered_key[reorder], gathered_value[reorder], query_positions
 
 
 def _split_topk_padding(topk_indices):
@@ -1106,7 +1110,7 @@ class DSGQACoreAttention(MegatronModule):
                 "dsa_fwd_use_dense_attn, dsa_fwd_skip_dsa and the dense indexer loss are not "
                 "yet position-aware."
             )
-        dsa_key, dsa_value = _gather_kv_for_context_parallel(
+        dsa_key, dsa_value, query_positions = _gather_kv_for_context_parallel(
             key, value, cp_group, getattr(self, "cp_comm_type", None)
         )
         if skip_dsa:
@@ -1269,6 +1273,7 @@ class DSGQACoreAttention(MegatronModule):
                 profile_label=f"layer={self.layer_number}",
                 use_triton=dsa_min_memory_backend == "triton-min-memory",
                 use_cudnn=getattr(self.config, "dsa_use_cudnn", False),
+                query_positions=query_positions,
             )
         if not self.training:
             raise NotImplementedError(
@@ -1304,6 +1309,7 @@ class DSGQACoreAttention(MegatronModule):
             profile_label=f"layer={self.layer_number}",
             use_triton=dsa_min_memory_backend == "triton-min-memory",
             use_cudnn=getattr(self.config, "dsa_use_cudnn", False),
+            query_positions=query_positions,
         )
         if sparse_fwd_dense_loss:
             indexer_loss = dsa_dense_indexer_loss(
