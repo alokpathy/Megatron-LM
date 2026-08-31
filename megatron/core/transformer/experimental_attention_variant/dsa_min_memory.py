@@ -1645,8 +1645,10 @@ class DSASimplifiedMinMemoryGQAFn(torch.autograd.Function):
                         # Match BF16/FP16 linear backward: round the activation-gradient operand,
                         # then accumulate the WGRAD reduction in FP32.
                         grad_q_linear = grad_q_linear.to(dtype=hidden_states.dtype)
+                        # hidden_states is the local shard: slice with q_lo/q_hi, not the
+                        # global q_start/q_end used for causality and rotary positions.
                         q_input_tile = _apply_simplified_input_norm_tile(
-                            hidden_states[q_start:q_end], ctx.simplified_input_norm
+                            hidden_states[q_lo:q_hi], ctx.simplified_input_norm
                         )
                         _accumulate_linear_weight_grad(
                             grad_linear_q_weight, grad_q_linear, q_input_tile
