@@ -1436,9 +1436,14 @@ class DSASimplifiedMinMemoryGQAFn(torch.autograd.Function):
             and ctx.loss_coeff > 0
             and (grad_linear_q_weight is not None or grad_linear_k_weight is not None)
         )
+        # topk_indices address the gathered global key set, so this accumulator must span it.
+        # Sizing it at the local sq would put every index past this rank's shard out of bounds.
+        grad_k_seq_len = sq if ctx.query_positions is None else key.size(0)
         grad_k_linear_sequence = (
             torch.zeros(
-                (sq, batch_size, ctx.index_head_dim), device=query.device, dtype=torch.float32
+                (grad_k_seq_len, batch_size, ctx.index_head_dim),
+                device=query.device,
+                dtype=torch.float32,
             )
             if compute_loss_grad and grad_linear_k_weight is not None
             else None
@@ -1772,6 +1777,12 @@ class DSASimplifiedMinMemoryGQAFn(torch.autograd.Function):
                         )
 
             if grad_k_linear_sequence is not None:
+                if ctx.query_positions is not None:
+                    # Accumulated over the global key set; the wgrad pairs each row with the
+                    # activation that produced it, and this rank only holds its own. Megatron
+                    # reduces weight gradients over dp_cp, so each rank contributing its own
+                    # tokens reconstructs the full gradient.
+                    grad_k_linear_sequence = grad_k_linear_sequence[ctx.query_positions]
                 with _profile_record(profile, "indexer_loss_bwd_simplified_k_wgrad", query.device):
                     _accumulate_simplified_learned_k_wgrad(
                         grad_k_linear_sequence,
