@@ -127,7 +127,7 @@ def _simplified_indexer_uses_main_input_norm(config: TransformerConfig) -> bool:
     )
 
 
-def _gather_kv_for_context_parallel(key, value, cp_group, cp_comm_type):
+def _gather_kv_for_context_parallel(key, value, cp_group, cp_comm_type, contiguous=False):
     """All-gather K and V along the sequence dimension over the context-parallel group.
 
     Context parallelism shards the sequence, so a rank holds only its slice of Q, K and V. The
@@ -146,7 +146,8 @@ def _gather_kv_for_context_parallel(key, value, cp_group, cp_comm_type):
     holds chunks r and 2*cp-r-1, so rank order is not position order, while the causal masks
     downstream compare raw offsets. The reorder restores global position order; it is an indexing
     op rather than an in-place write, so autograd permutes the gradient back before the
-    reduce-scatter sees it.
+    reduce-scatter sees it. ``contiguous=True`` (attention_cp_layout='contiguous') is the case
+    where rank order already is position order and neither step is needed.
     """
     cp_size = 1 if cp_group is None else cp_group.size()
     if cp_size <= 1:
@@ -165,6 +166,18 @@ def _gather_kv_for_context_parallel(key, value, cp_group, cp_comm_type):
     gathered_value = gather_from_sequence_parallel_region(
         value, tensor_parallel_output_grad=True, group=cp_group
     )
+    if contiguous:
+        # attention_cp_layout='contiguous' shards the sequence in rank order, so the all-gather
+        # already lands in global position order and a rank's queries are one contiguous span:
+        # no reorder, no zigzag mapping. Setting it alongside linear_cp_layout='contiguous' --
+        # the layout the Mamba mixers want for their scan -- also removes the per-layer layout
+        # conversion a hybrid stack would otherwise run around every attention layer.
+        cp_rank = cp_group.rank()
+        query_positions = torch.arange(
+            cp_rank * sq_local, (cp_rank + 1) * sq_local, device=key.device, dtype=torch.int64
+        )
+        return gathered_key, gathered_value, query_positions
+
     reorder = build_zigzag_allgather_cp_key_reorder(sq_local, cp_size, key.device)
     query_positions = build_zigzag_cp_local_positions(
         sq_local * cp_size, cp_size, cp_group.rank(), key.device
@@ -1129,7 +1142,11 @@ class DSGQACoreAttention(MegatronModule):
                 "--dsa-kernel-cache-indexer-k."
             )
         dsa_key, dsa_value, query_positions = _gather_kv_for_context_parallel(
-            key, value, cp_group, getattr(self, "cp_comm_type", None)
+            key,
+            value,
+            cp_group,
+            getattr(self, "cp_comm_type", None),
+            contiguous=getattr(self.config, "attention_cp_layout", "zigzag") == "contiguous",
         )
         if skip_dsa:
             if self.dense_core_attention is None:

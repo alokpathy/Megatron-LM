@@ -129,6 +129,25 @@ class HybridStack(MegatronModule):
                 )
                 for layer_type in self.layer_type_list
             )
+            if self.config.attention_cp_layout == "contiguous":
+                # TransformerConfig permits this only for DSA over GQA, which all-gathers K and V
+                # and so does not need the zigzag load balance. A pattern that also holds dense or
+                # MLA attention layers would run those under ring/striped CP in a layout their
+                # masks do not describe, and the config cannot see the pattern to catch it.
+                non_dsa_attention = sorted(
+                    {
+                        layer_type
+                        for layer_type in self.layer_type_list
+                        if layer_type in LayerSymbols.ATTENTION_LAYERS
+                        and layer_type != LayerSymbols.DS_ATTENTION
+                    }
+                )
+                if non_dsa_attention:
+                    raise ValueError(
+                        "attention_cp_layout='contiguous' with context parallelism is supported "
+                        "for DSA attention layers ('D') only, but the layer pattern also contains "
+                        f"{non_dsa_attention}."
+                    )
             self._cp_layout_manager = ContextParallelLayoutManager(
                 layer_layouts=layer_layouts,
                 boundary_layout=self.config.linear_cp_layout,

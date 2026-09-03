@@ -200,6 +200,57 @@ class TestForwardParity:
             torch.testing.assert_close(out, ref_out[pos], atol=1e-5, rtol=1e-5)
 
 
+class TestContiguousLayoutParity:
+    """attention_cp_layout='contiguous': a rank's queries are one span of global positions.
+
+    Under this layout the all-gather already lands in position order, so the gather helper skips
+    the reorder and hands the sparse path an arange. What still has to hold is that the tiling
+    loops mask against those global positions rather than local ones, which is what these check.
+    """
+
+    def test_output_matches_cp1(self):
+        q, k, v, h = _inputs()
+        indexer = _simplified_test_indexer(HIDDEN, HEAD_DIM, TOPK)
+        ref_out, _ = _run(q, k, v, h, indexer)
+
+        sq_local = SEQLEN // CP_SIZE
+        for rank in range(CP_SIZE):
+            pos = torch.arange(rank * sq_local, (rank + 1) * sq_local)
+            out, _ = _run(q[pos], k, v, h[pos], indexer, query_positions=pos)
+            torch.testing.assert_close(out, ref_out[pos], atol=1e-5, rtol=1e-5)
+
+    def test_key_and_value_gradients_sum_to_the_cp1_gradient(self):
+        q, k, v, h = _inputs(requires_grad=True)
+        indexer = _simplified_test_indexer(HIDDEN, HEAD_DIM, TOPK)
+        torch.manual_seed(7)
+        norm = _input_norm()
+        ref_out, ref_loss = _run(q, k, v, h, indexer, input_norm=norm)
+        ref_dk, ref_dv = torch.autograd.grad(ref_out.float().sum() + ref_loss, (k, v))
+
+        sq_local = SEQLEN // CP_SIZE
+        summed_dk = torch.zeros_like(k)
+        summed_dv = torch.zeros_like(v)
+        for rank in range(CP_SIZE):
+            pos = torch.arange(rank * sq_local, (rank + 1) * sq_local)
+            k_local = k.detach().requires_grad_(True)
+            v_local = v.detach().requires_grad_(True)
+            out, loss = _run(
+                q.detach()[pos],
+                k_local,
+                v_local,
+                h[pos],
+                indexer,
+                query_positions=pos,
+                input_norm=norm,
+            )
+            dk, dv = torch.autograd.grad(out.float().sum() + loss, (k_local, v_local))
+            summed_dk += dk
+            summed_dv += dv
+
+        torch.testing.assert_close(summed_dk, ref_dk, atol=1e-5, rtol=1e-5)
+        torch.testing.assert_close(summed_dv, ref_dv, atol=1e-5, rtol=1e-5)
+
+
 class TestGradientParity:
     """Gradients are where a wrong-but-plausible CP implementation shows itself."""
 
