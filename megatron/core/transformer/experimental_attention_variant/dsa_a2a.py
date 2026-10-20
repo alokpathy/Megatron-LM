@@ -111,6 +111,56 @@ def plan_tile_exchange(
     )
 
 
+def exchange_rows(local_rows: torch.Tensor, plan: TileExchangePlan, cp_group) -> torch.Tensor:
+    """Serve peers the rows they asked for and collect the rows this rank asked for.
+
+    The plain forward half, with no autograd. The min-memory backend recomputes tiles inside a
+    hand-written ``backward``, where building graph nodes would be dead weight, so the exchange
+    has to be callable without one. :class:`_AllToAllSelectedRows` wraps this for callers that
+    do want autograd.
+    """
+    served = local_rows.index_select(0, plan.requested_local)
+    received = torch.empty(
+        (plan.total_recv, *local_rows.shape[1:]), dtype=local_rows.dtype, device=local_rows.device
+    )
+    torch.distributed.all_to_all_single(
+        received,
+        served.contiguous(),
+        output_split_sizes=plan.send_counts.tolist(),
+        input_split_sizes=plan.recv_counts.tolist(),
+        group=cp_group,
+    )
+    return received
+
+
+def return_row_grads(
+    grad_received: torch.Tensor, plan: TileExchangePlan, cp_group, local_shape
+) -> torch.Tensor:
+    """Route each received row's gradient home and accumulate it into the owner's shard.
+
+    The plain backward half. Accumulation is an ``index_add_`` rather than an assignment
+    because one key is typically selected by many queries on many ranks, and every one of them
+    contributes. The all-gather path inherits this from the reduce-scatter in
+    ``gather_from_sequence_parallel_region``; here it is explicit, and an assignment would give
+    finite but wrong dK with no error.
+    """
+    grad_served = torch.empty(
+        (plan.requested_local.numel(), *grad_received.shape[1:]),
+        dtype=grad_received.dtype,
+        device=grad_received.device,
+    )
+    torch.distributed.all_to_all_single(
+        grad_served,
+        grad_received.contiguous(),
+        output_split_sizes=plan.recv_counts.tolist(),
+        input_split_sizes=plan.send_counts.tolist(),
+        group=cp_group,
+    )
+    grad_local = torch.zeros(local_shape, dtype=grad_received.dtype, device=grad_received.device)
+    grad_local.index_add_(0, plan.requested_local, grad_served)
+    return grad_local
+
+
 class _AllToAllSelectedRows(torch.autograd.Function):
     """Serve peers the K (or V) rows they asked for, and route the gradient back.
 
@@ -126,54 +176,15 @@ class _AllToAllSelectedRows(torch.autograd.Function):
     @staticmethod
     def forward(ctx, local_rows: torch.Tensor, plan: TileExchangePlan, cp_group):
         """Exchange the selected rows, returning this rank's received buffer."""
-        send_split = plan.recv_counts.tolist()
-        recv_split = plan.send_counts.tolist()
-
-        served = local_rows.index_select(0, plan.requested_local)
-        received = torch.empty(
-            (plan.total_recv, *local_rows.shape[1:]),
-            dtype=local_rows.dtype,
-            device=local_rows.device,
-        )
-        torch.distributed.all_to_all_single(
-            received,
-            served.contiguous(),
-            output_split_sizes=recv_split,
-            input_split_sizes=send_split,
-            group=cp_group,
-        )
-
         ctx.plan = plan
         ctx.cp_group = cp_group
         ctx.local_shape = local_rows.shape
-        return received
+        return exchange_rows(local_rows, plan, cp_group)
 
     @staticmethod
     def backward(ctx, grad_received: torch.Tensor):
         """Return the gradient to each requesting rank and accumulate it at the owner."""
-        plan = ctx.plan
-        # Mirror of forward: what was an output split is now an input split.
-        send_split = plan.send_counts.tolist()
-        recv_split = plan.recv_counts.tolist()
-
-        grad_served = torch.empty(
-            (plan.requested_local.numel(), *grad_received.shape[1:]),
-            dtype=grad_received.dtype,
-            device=grad_received.device,
-        )
-        torch.distributed.all_to_all_single(
-            grad_served,
-            grad_received.contiguous(),
-            output_split_sizes=recv_split,
-            input_split_sizes=send_split,
-            group=ctx.cp_group,
-        )
-
-        grad_local = torch.zeros(
-            ctx.local_shape, dtype=grad_received.dtype, device=grad_received.device
-        )
-        grad_local.index_add_(0, plan.requested_local, grad_served)
-        return grad_local, None, None
+        return return_row_grads(grad_received, ctx.plan, ctx.cp_group, ctx.local_shape), None, None
 
 
 def exchange_selected_kv(
