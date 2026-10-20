@@ -41,25 +41,34 @@ from tests.unit_tests.test_utilities import Utils
 SEQLEN, BATCH, HIDDEN = 16, 2, 12
 HEADS, HEAD_DIM, TOPK = 2, 4, 3
 
+# The shapes the fixtures below build. SMALL keeps every existing test at the sizes it was
+# written for; LARGE is production-shaped, where a tile selects far more keys than it has
+# queries and a rank spans many tiles. The exchange is planned per tile and dedupes within
+# one, so neither behaviour is exercised at SMALL -- there the plan is nearly an identity.
+_SMALL = SimpleNamespace(
+    seqlen=SEQLEN, batch=BATCH, hidden=HIDDEN, heads=HEADS, head_dim=HEAD_DIM, topk=TOPK
+)
+_LARGE = SimpleNamespace(seqlen=2048, batch=1, hidden=256, heads=4, head_dim=64, topk=128)
+
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="context-parallel groups need CUDA"
 )
 
 
-def _global_inputs(device):
+def _global_inputs(device, shape=_SMALL):
     """Inputs every rank agrees on. Same seed everywhere, so no broadcast is needed."""
     torch.manual_seed(0)
-    q = torch.randn(SEQLEN, BATCH, HEADS, HEAD_DIM, device=device)
-    k = torch.randn(SEQLEN, BATCH, 1, HEAD_DIM, device=device)
-    v = torch.randn(SEQLEN, BATCH, 1, HEAD_DIM, device=device)
-    h = torch.randn(SEQLEN, BATCH, HIDDEN, device=device)
+    q = torch.randn(shape.seqlen, shape.batch, shape.heads, shape.head_dim, device=device)
+    k = torch.randn(shape.seqlen, shape.batch, 1, shape.head_dim, device=device)
+    v = torch.randn(shape.seqlen, shape.batch, 1, shape.head_dim, device=device)
+    h = torch.randn(shape.seqlen, shape.batch, shape.hidden, device=device)
     return q, k, v, h
 
 
-def _input_norm(device):
+def _input_norm(device, shape=_SMALL):
     torch.manual_seed(11)
     linear_qkv = SimpleNamespace(
-        layer_norm_weight=torch.randn(HIDDEN, device=device),
+        layer_norm_weight=torch.randn(shape.hidden, device=device),
         layer_norm_bias=None,
         eps=1.0e-5,
         skip_norm_and_all_gather=False,
@@ -87,20 +96,20 @@ class _UnitGroup:
         return 1
 
 
-def _indexer(device, cp_group):
+def _indexer(device, cp_group, shape=_SMALL):
     """A simplified indexer whose weights are identical on every rank.
 
     ``pg_collection.cp`` is the live group: the learned-K projection reads it to all-gather K
     across the context-parallel ranks, which is what makes the cached K span the global sequence.
     """
     torch.manual_seed(3)
-    linear_q = torch.nn.Linear(HIDDEN, HEAD_DIM, bias=False).to(device)
-    linear_k = torch.nn.Linear(HIDDEN, HEAD_DIM, bias=False).to(device)
+    linear_q = torch.nn.Linear(shape.hidden, shape.head_dim, bias=False).to(device)
+    linear_k = torch.nn.Linear(shape.hidden, shape.head_dim, bias=False).to(device)
     return SimpleNamespace(
         index_n_heads=1,
-        index_head_dim=HEAD_DIM,
-        index_topk=TOPK,
-        softmax_scale=HEAD_DIM**-0.5,
+        index_head_dim=shape.head_dim,
+        index_topk=shape.topk,
+        softmax_scale=shape.head_dim**-0.5,
         index_rotary_dim=0,
         rotary_pos_emb=None,
         pg_collection=SimpleNamespace(tp=_UnitGroup(), cp=cp_group),
@@ -121,6 +130,8 @@ def _run(
     input_norm=None,
     cache_indexer_k=True,
     kv_exchange=None,
+    shape=_SMALL,
+    key_chunk=None,
 ):
     """Call the kernel the way _forward_min_memory does once K and V are gathered."""
     return dsa_min_memory_gqa(
@@ -129,11 +140,11 @@ def _run(
         value,
         hidden.detach(),
         indexer,
-        HEAD_DIM**-0.5,
+        shape.head_dim**-0.5,
         0.1,
         False,
         query_chunk_size=q_chunk,
-        key_chunk_size=SEQLEN,
+        key_chunk_size=shape.seqlen if key_chunk is None else key_chunk,
         # Caching projects the learned indexer K once for the whole sequence and all-gathers it.
         # With cache_indexer_k=False the backward rebuilds it instead, which has to perform the
         # same gather and zigzag reorder -- see the recompute test below.
@@ -159,14 +170,16 @@ def _reference(device, q_chunk):
     return out.detach(), grads
 
 
-def _sharded(device, cp_group, positions, q_chunk, cache_indexer_k=True):
+def _sharded(
+    device, cp_group, positions, q_chunk, cache_indexer_k=True, shape=_SMALL, key_chunk=None
+):
     """This rank's result, with the gather run over the live group."""
-    q, k, v, h = _global_inputs(device)
+    q, k, v, h = _global_inputs(device, shape)
     q_local = q[positions].detach().requires_grad_(True)
     k_local = k[positions].detach().requires_grad_(True)
     v_local = v[positions].detach().requires_grad_(True)
     h_local = h[positions]
-    indexer = _indexer(device, cp_group)
+    indexer = _indexer(device, cp_group, shape)
     dsa_key, dsa_value, query_positions, _ = _gather_kv_for_context_parallel(
         k_local, v_local, cp_group, "all_gather"
     )
@@ -178,8 +191,10 @@ def _sharded(device, cp_group, positions, q_chunk, cache_indexer_k=True):
         indexer,
         q_chunk,
         query_positions=query_positions,
-        input_norm=_input_norm(device),
+        input_norm=_input_norm(device, shape),
         cache_indexer_k=cache_indexer_k,
+        shape=shape,
+        key_chunk=key_chunk,
     )
     grads = torch.autograd.grad(
         out.float().sum() + loss,
@@ -188,18 +203,20 @@ def _sharded(device, cp_group, positions, q_chunk, cache_indexer_k=True):
     return out.detach(), grads
 
 
-def _sharded_a2a(device, cp_group, positions, q_chunk, cache_indexer_k=True):
+def _sharded_a2a(
+    device, cp_group, positions, q_chunk, cache_indexer_k=True, shape=_SMALL, key_chunk=None
+):
     """This rank's result with the sparse exchange instead of the gather.
 
     Deliberately identical to _sharded apart from the comm type, so a difference between the
     two is the exchange and nothing else.
     """
-    q, k, v, h = _global_inputs(device)
+    q, k, v, h = _global_inputs(device, shape)
     q_local = q[positions].detach().requires_grad_(True)
     k_local = k[positions].detach().requires_grad_(True)
     v_local = v[positions].detach().requires_grad_(True)
     h_local = h[positions]
-    indexer = _indexer(device, cp_group)
+    indexer = _indexer(device, cp_group, shape)
     dsa_key, dsa_value, query_positions, kv_exchange = _gather_kv_for_context_parallel(
         k_local, v_local, cp_group, "a2a"
     )
@@ -212,9 +229,11 @@ def _sharded_a2a(device, cp_group, positions, q_chunk, cache_indexer_k=True):
         indexer,
         q_chunk,
         query_positions=query_positions,
-        input_norm=_input_norm(device),
+        input_norm=_input_norm(device, shape),
         cache_indexer_k=cache_indexer_k,
         kv_exchange=kv_exchange,
+        shape=shape,
+        key_chunk=key_chunk,
     )
     grads = torch.autograd.grad(
         out.float().sum() + loss,
@@ -277,6 +296,47 @@ class TestAllToAllExchange:
                 pytest.skip("tiling too fine for this sequence length")
             ag_out, ag_grads = _sharded(device, cp_group, positions, q_chunk)
             a2a_out, a2a_grads = _sharded_a2a(device, cp_group, positions, q_chunk)
+
+            torch.testing.assert_close(a2a_out, ag_out)
+            names = ("dQ", "dK", "dV", "d_linear_k", "d_linear_q")
+            for name, got, want in zip(names, a2a_grads, ag_grads):
+                torch.testing.assert_close(got, want, msg=lambda m, n=name: f"{n}: {m}")
+        finally:
+            Utils.destroy_model_parallel()
+
+    def test_matches_the_all_gather_path_at_scale(self, cp_size):
+        """The same parity check at production-shaped sizes.
+
+        The small case cannot exercise what the exchange is actually for. There a tile selects
+        three keys out of sixteen and a rank holds one or two tiles, so the dedupe is nearly an
+        identity and the all-to-all splits are uniform. Here a tile selects 128 keys for 128
+        queries across a 2048-token sequence, ranks span several tiles, and routing runs over
+        more than one key chunk -- which is where a plan leaking between tiles, a ragged split,
+        or a global length inferred from a local shard would show up.
+        """
+        if _launched_world_size() < cp_size:
+            pytest.skip(f"cp={cp_size} needs {cp_size} ranks")
+        Utils.initialize_model_parallel(1, 1, context_parallel_size=cp_size)
+        try:
+            import megatron.core.parallel_state as ps
+
+            cp_group = ps.get_context_parallel_group()
+            device = torch.cuda.current_device()
+            positions = build_zigzag_cp_local_positions(
+                _LARGE.seqlen, cp_size, cp_group.rank(), torch.device(device)
+            )
+            # A tile must stay inside one zigzag chunk; this divides it several times over.
+            chunk_len = _LARGE.seqlen // (2 * cp_size)
+            q_chunk = chunk_len // 4
+            # Smaller than the sequence so routing streams the keys in several blocks.
+            key_chunk = _LARGE.seqlen // 4
+
+            ag_out, ag_grads = _sharded(
+                device, cp_group, positions, q_chunk, shape=_LARGE, key_chunk=key_chunk
+            )
+            a2a_out, a2a_grads = _sharded_a2a(
+                device, cp_group, positions, q_chunk, shape=_LARGE, key_chunk=key_chunk
+            )
 
             torch.testing.assert_close(a2a_out, ag_out)
             names = ("dQ", "dK", "dV", "d_linear_k", "d_linear_q")
