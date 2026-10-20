@@ -1,0 +1,205 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+
+"""Sparse all-to-all key/value exchange for DSA-over-GQA context parallelism.
+
+The all-gather path moves every rank's K and V to every other rank, so a rank can run the
+indexer and attention against complete keys. That is simple and makes the top-k a genuinely
+global selection, but it moves the whole sequence regardless of how little of it the top-k
+actually selects.
+
+This module moves only the selected keys. After routing picks ``topk_indices`` for a query
+tile, a rank knows exactly which global key positions it needs; it asks each owner for that
+owner's share and receives just those rows. The result is a drop-in substitution for the pair
+the downstream code already consumes:
+
+    (full key, global topk_indices)  ->  (received rows, remapped topk_indices)
+
+Both the PyTorch and Triton backends gather ``key[index]`` internally and neither cares that
+``key`` spans the whole sequence, so they work unchanged once the indices address the received
+buffer instead. Causality is the exception: masks compare indices against global positions, so
+the *global* indices must be kept for that and only the gather may use the remapped ones.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Tuple
+
+import torch
+
+from megatron.core.transformer.experimental_attention_variant.dsa_layout import (
+    zigzag_cp_owner_and_local_index,
+)
+
+
+@dataclass(frozen=True)
+class TileExchangePlan:
+    """Addressing for one query tile's key exchange.
+
+    Attributes:
+        send_counts: Rows this rank requests from each owner, indexed by rank.
+        recv_counts: Rows each rank requests from this one, indexed by rank.
+        requested_local: Local row indices into this rank's K/V that peers asked for,
+            concatenated in rank order and split by ``recv_counts``.
+        remap: Lookup from global key position to its row in the received buffer. Shaped
+            ``[seq_len]``; only the positions this tile selected are meaningful.
+        total_recv: Number of rows this rank receives, i.e. the size of the exchanged buffer.
+    """
+
+    send_counts: torch.Tensor
+    recv_counts: torch.Tensor
+    requested_local: torch.Tensor
+    remap: torch.Tensor
+    total_recv: int
+
+
+def plan_tile_exchange(
+    topk_indices: torch.Tensor, seq_len: int, cp_size: int, cp_group
+) -> TileExchangePlan:
+    """Work out who holds this tile's selected keys and arrange the swap.
+
+    Deduplicates across the whole tile -- every batch row and every query in it -- because one
+    key selected by many queries only has to cross the wire once.
+
+    Args:
+        topk_indices: Global key positions selected for this tile, ``[batch, query, topk]``.
+        seq_len: Global sequence length.
+        cp_size: Context-parallel world size.
+        cp_group: The context-parallel process group.
+
+    Returns:
+        The plan the exchange and the index remapping both read.
+    """
+    device = topk_indices.device
+    wanted = torch.unique(topk_indices.reshape(-1))
+    owner, local_index = zigzag_cp_owner_and_local_index(wanted, seq_len, cp_size)
+
+    # Group the requests by owner. unique() returns position order, which zigzag does not keep
+    # aligned with rank order, so this permutation is what makes the counts describe contiguous
+    # blocks the collective can split on.
+    order = torch.argsort(owner, stable=True)
+    wanted_by_owner = wanted[order]
+    local_by_owner = local_index[order]
+    send_counts = torch.bincount(owner, minlength=cp_size).to(torch.int64)
+
+    # Tell each owner how much to expect before sending indices of unknown length.
+    recv_counts = torch.empty_like(send_counts)
+    torch.distributed.all_to_all_single(recv_counts, send_counts, group=cp_group)
+
+    send_split = send_counts.tolist()
+    recv_split = recv_counts.tolist()
+    requested_local = torch.empty(int(sum(recv_split)), dtype=torch.int64, device=device)
+    torch.distributed.all_to_all_single(
+        requested_local,
+        local_by_owner.contiguous(),
+        output_split_sizes=recv_split,
+        input_split_sizes=send_split,
+        group=cp_group,
+    )
+
+    # Replies arrive in the order the requests left, so row i of the received buffer is
+    # wanted_by_owner[i]. Inverting that gives the remap the gather needs.
+    remap = torch.zeros(seq_len, dtype=torch.int64, device=device)
+    remap[wanted_by_owner] = torch.arange(wanted_by_owner.numel(), dtype=torch.int64, device=device)
+
+    return TileExchangePlan(
+        send_counts=send_counts,
+        recv_counts=recv_counts,
+        requested_local=requested_local,
+        remap=remap,
+        total_recv=int(wanted_by_owner.numel()),
+    )
+
+
+class _AllToAllSelectedRows(torch.autograd.Function):
+    """Serve peers the K (or V) rows they asked for, and route the gradient back.
+
+    Forward gathers the requested rows out of the local shard and exchanges them. Backward has
+    to undo both halves: send each received row's gradient back to the rank that asked for it,
+    then accumulate into the local shard. Accumulation has to be an ``index_add_`` rather than
+    an assignment because a single key is typically selected by many queries on many ranks, and
+    every one of those contributes to its gradient. The all-gather path gets this for free from
+    ``gather_from_sequence_parallel_region``'s reduce-scatter; here it is ours to do, and
+    getting it wrong yields finite but wrong dK with no error.
+    """
+
+    @staticmethod
+    def forward(ctx, local_rows: torch.Tensor, plan: TileExchangePlan, cp_group):
+        """Exchange the selected rows, returning this rank's received buffer."""
+        send_split = plan.recv_counts.tolist()
+        recv_split = plan.send_counts.tolist()
+
+        served = local_rows.index_select(0, plan.requested_local)
+        received = torch.empty(
+            (plan.total_recv, *local_rows.shape[1:]),
+            dtype=local_rows.dtype,
+            device=local_rows.device,
+        )
+        torch.distributed.all_to_all_single(
+            received,
+            served.contiguous(),
+            output_split_sizes=recv_split,
+            input_split_sizes=send_split,
+            group=cp_group,
+        )
+
+        ctx.plan = plan
+        ctx.cp_group = cp_group
+        ctx.local_shape = local_rows.shape
+        return received
+
+    @staticmethod
+    def backward(ctx, grad_received: torch.Tensor):
+        """Return the gradient to each requesting rank and accumulate it at the owner."""
+        plan = ctx.plan
+        # Mirror of forward: what was an output split is now an input split.
+        send_split = plan.send_counts.tolist()
+        recv_split = plan.recv_counts.tolist()
+
+        grad_served = torch.empty(
+            (plan.requested_local.numel(), *grad_received.shape[1:]),
+            dtype=grad_received.dtype,
+            device=grad_received.device,
+        )
+        torch.distributed.all_to_all_single(
+            grad_served,
+            grad_received.contiguous(),
+            output_split_sizes=recv_split,
+            input_split_sizes=send_split,
+            group=ctx.cp_group,
+        )
+
+        grad_local = torch.zeros(
+            ctx.local_shape, dtype=grad_received.dtype, device=grad_received.device
+        )
+        grad_local.index_add_(0, plan.requested_local, grad_served)
+        return grad_local, None, None
+
+
+def exchange_selected_kv(
+    key: torch.Tensor,
+    value: torch.Tensor,
+    topk_indices: torch.Tensor,
+    seq_len: int,
+    cp_size: int,
+    cp_group,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fetch this tile's selected keys and values from their owners.
+
+    Args:
+        key: This rank's key shard, ``[local_seq, batch, groups, head_dim]``.
+        value: This rank's value shard, same shape.
+        topk_indices: Global key positions selected for the tile, ``[batch, query, topk]``.
+        seq_len: Global sequence length.
+        cp_size: Context-parallel world size.
+        cp_group: The context-parallel process group.
+
+    Returns:
+        ``(received_key, received_value, remapped_indices)``. The first two are indexed by the
+        third exactly as the full key and global indices were. The caller must keep the original
+        ``topk_indices`` for causal masking, which compares against global positions.
+    """
+    plan = plan_tile_exchange(topk_indices, seq_len, cp_size, cp_group)
+    received_key = _AllToAllSelectedRows.apply(key, plan, cp_group)
+    received_value = _AllToAllSelectedRows.apply(value, plan, cp_group)
+    return received_key, received_value, plan.remap[topk_indices]

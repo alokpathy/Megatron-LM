@@ -25,6 +25,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from megatron.core.transformer.experimental_attention_variant.dsa_a2a import exchange_selected_kv
 from megatron.core.transformer.experimental_attention_variant.dsa_gqa import (
     _gather_kv_for_context_parallel,
     _simplified_indexer_norm_spec,
@@ -183,6 +184,104 @@ def _sharded(device, cp_group, positions, q_chunk, cache_indexer_k=True):
         (q_local, k_local, v_local, indexer.linear_k.weight, indexer.linear_q.weight),
     )
     return out.detach(), grads
+
+
+@pytest.mark.parametrize("cp_size", [2, 4])
+class TestAllToAllExchange:
+    """The sparse exchange must be interchangeable with the dense all-gather."""
+
+    def _setup(self, cp_size):
+        Utils.initialize_model_parallel(1, 1, context_parallel_size=cp_size)
+        import megatron.core.parallel_state as ps
+
+        cp_group = ps.get_context_parallel_group()
+        device = torch.cuda.current_device()
+        positions = build_zigzag_cp_local_positions(
+            SEQLEN, cp_size, cp_group.rank(), torch.device(device)
+        )
+        return cp_group, device, positions
+
+    @staticmethod
+    def _topk_for(device, positions):
+        """Causal top-k for this rank's queries, as routing would produce."""
+        torch.manual_seed(7 + int(positions[0].item()))
+        selected = torch.stack(
+            [
+                torch.stack(
+                    [
+                        (
+                            torch.randperm(int(p.item()) + 1, device=device)[:TOPK]
+                            if int(p.item()) + 1 >= TOPK
+                            else torch.zeros(TOPK, dtype=torch.int64, device=device)
+                        )
+                        for p in positions
+                    ]
+                )
+                for _ in range(BATCH)
+            ]
+        )
+        return selected
+
+    def test_received_rows_match_the_dense_gather(self, cp_size):
+        """Isolates the exchange from attention.
+
+        If this fails, the owner map, the request routing, or the remap is wrong, and every
+        numeric result built on it inherits the error. Compared against indexing the full key
+        directly, which is what the all-gather path hands downstream.
+        """
+        if _launched_world_size() < cp_size:
+            pytest.skip(f"cp={cp_size} needs {cp_size} ranks")
+        cp_group, device, positions = self._setup(cp_size)
+        try:
+            _, k, v, _ = _global_inputs(device)
+            topk = self._topk_for(device, positions)
+
+            recv_k, recv_v, remapped = exchange_selected_kv(
+                k[positions], v[positions], topk, SEQLEN, cp_size, cp_group
+            )
+
+            # Indexing the received buffer with the remapped indices must equal indexing the
+            # full key with the original global ones.
+            torch.testing.assert_close(recv_k[remapped], k[topk], atol=0, rtol=0)
+            torch.testing.assert_close(recv_v[remapped], v[topk], atol=0, rtol=0)
+        finally:
+            Utils.destroy_model_parallel()
+
+    def test_gradient_returns_to_the_owner_and_accumulates(self, cp_size):
+        """A key selected by several queries must collect every contribution.
+
+        The dense path gets this from the all-gather's reduce-scatter. Here the backward
+        all-to-all and the index_add_ have to reproduce it, and an assignment in place of the
+        accumulation would pass the forward test above while silently dropping gradient.
+        """
+        if _launched_world_size() < cp_size:
+            pytest.skip(f"cp={cp_size} needs {cp_size} ranks")
+        cp_group, device, positions = self._setup(cp_size)
+        try:
+            _, k, v, _ = _global_inputs(device)
+            topk = self._topk_for(device, positions)
+
+            sharded_k = k[positions].clone().requires_grad_(True)
+            sharded_v = v[positions].clone().requires_grad_(True)
+            recv_k, recv_v, remapped = exchange_selected_kv(
+                sharded_k, sharded_v, topk, SEQLEN, cp_size, cp_group
+            )
+            (recv_k[remapped].square().sum() + recv_v[remapped].square().sum()).backward()
+
+            # Reference: every rank's selection scattered onto the global key, then sharded.
+            full_k = k.clone().requires_grad_(True)
+            full_v = v.clone().requires_grad_(True)
+            loss = full_k[topk].square().sum() + full_v[topk].square().sum()
+            loss.backward()
+            expected_k = full_k.grad.clone()
+            expected_v = full_v.grad.clone()
+            torch.distributed.all_reduce(expected_k, group=cp_group)
+            torch.distributed.all_reduce(expected_v, group=cp_group)
+
+            torch.testing.assert_close(sharded_k.grad, expected_k[positions])
+            torch.testing.assert_close(sharded_v.grad, expected_v[positions])
+        finally:
+            Utils.destroy_model_parallel()
 
 
 @pytest.mark.parametrize("cp_size", [2, 4])

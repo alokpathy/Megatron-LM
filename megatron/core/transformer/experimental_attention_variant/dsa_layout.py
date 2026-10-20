@@ -162,6 +162,46 @@ def build_zigzag_cp_local_positions(
     )
 
 
+def zigzag_cp_owner_and_local_index(
+    positions: torch.Tensor, seq_len: int, cp_size: int
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Map global token positions to the rank that owns them and their index on that rank.
+
+    The exact inverse of :func:`build_zigzag_cp_local_positions`: that function answers "which
+    global positions does rank r hold", this one answers "who holds global position p, and where
+    in their shard". An all-to-all exchange needs the inverse direction, because a rank discovers
+    the *global* key indices its queries selected and has to address them to owners.
+
+    Zigzag splits the sequence into ``2 * cp_size`` chunks and gives rank ``r`` chunks ``r`` and
+    ``2 * cp_size - r - 1``, so a rank's shard is two disjoint ranges and ownership is not
+    ``position // shard_len``. Rank ``r``'s shard holds its front chunk first, so a position in
+    the back chunk sits at ``chunk_len +`` its offset.
+
+    Args:
+        positions: Global token positions, any shape.
+        seq_len: Global sequence length.
+        cp_size: Context-parallel world size.
+
+    Returns:
+        ``(owner, local_index)``, both shaped like ``positions``.
+    """
+    if cp_size <= 1:
+        return torch.zeros_like(positions), positions
+    if seq_len % (2 * cp_size) != 0:
+        raise ValueError(
+            "Zigzag CP expects the global sequence length to be divisible by 2 * cp_size, got "
+            f"seq_len={seq_len}, cp_size={cp_size}"
+        )
+
+    chunk_len = seq_len // (2 * cp_size)
+    chunk = positions // chunk_len
+    offset = positions - chunk * chunk_len
+    is_front = chunk < cp_size
+    owner = torch.where(chunk < cp_size, chunk, 2 * cp_size - chunk - 1)
+    local_index = torch.where(is_front, offset, chunk_len + offset)
+    return owner, local_index
+
+
 def build_zigzag_allgather_cp_key_reorder(
     sq: int, cp_size: int, device: torch.device
 ) -> torch.Tensor:

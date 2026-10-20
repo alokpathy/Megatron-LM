@@ -24,6 +24,7 @@ from megatron.core.transformer.experimental_attention_variant.dsa_gqa import (
 from megatron.core.transformer.experimental_attention_variant.dsa_layout import (
     build_zigzag_allgather_cp_key_reorder,
     build_zigzag_cp_local_positions,
+    zigzag_cp_owner_and_local_index,
 )
 from megatron.core.transformer.experimental_attention_variant.dsa_min_memory import (
     _tile_global_start,
@@ -71,6 +72,41 @@ class TestPositionHelpers:
 
     def test_validate_is_a_noop_without_cp(self):
         _validate_query_positions(None, SEQLEN, 8)
+
+
+class TestZigzagOwnerMap:
+    """The inverse direction the all-to-all exchange needs: position -> (owner, local index)."""
+
+    @pytest.mark.parametrize("cp_size", [2, 4])
+    def test_round_trips_through_build_zigzag_cp_local_positions(self, cp_size):
+        """For every rank and slot, the owner map must land back on the same global position."""
+        seq_len = 8 * cp_size
+        device = torch.device("cpu")
+        for rank in range(cp_size):
+            positions = build_zigzag_cp_local_positions(seq_len, cp_size, rank, device)
+            owner, local = zigzag_cp_owner_and_local_index(positions, seq_len, cp_size)
+            assert torch.equal(owner, torch.full_like(owner, rank))
+            assert torch.equal(local, torch.arange(positions.numel()))
+
+    def test_every_global_position_is_owned_exactly_once(self):
+        """A dropped or duplicated owner silently loses or double-counts a key."""
+        cp_size, seq_len = 4, 32
+        positions = torch.arange(seq_len)
+        owner, local = zigzag_cp_owner_and_local_index(positions, seq_len, cp_size)
+        shard_len = seq_len // cp_size
+        seen = torch.zeros(cp_size, shard_len, dtype=torch.bool)
+        seen[owner, local] = True
+        assert bool(seen.all())
+
+    def test_is_identity_without_cp(self):
+        positions = torch.arange(SEQLEN)
+        owner, local = zigzag_cp_owner_and_local_index(positions, SEQLEN, 1)
+        assert torch.equal(owner, torch.zeros_like(positions))
+        assert torch.equal(local, positions)
+
+    def test_rejects_a_sequence_the_layout_cannot_split(self):
+        with pytest.raises(ValueError, match="divisible by 2 \\* cp_size"):
+            zigzag_cp_owner_and_local_index(torch.arange(6), 6, 4)
 
 
 class TestGatherHelper:
