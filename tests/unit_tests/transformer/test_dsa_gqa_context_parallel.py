@@ -29,6 +29,7 @@ from megatron.core.transformer.experimental_attention_variant.dsa_layout import 
 from megatron.core.transformer.experimental_attention_variant.dsa_min_memory import (
     _tile_global_start,
     _validate_query_positions,
+    _zigzag_tile_bound,
 )
 
 SEQLEN, BATCH, HIDDEN = 16, 2, 12
@@ -72,6 +73,44 @@ class TestPositionHelpers:
 
     def test_validate_is_a_noop_without_cp(self):
         _validate_query_positions(None, SEQLEN, 8)
+
+
+class TestZigzagTileBound:
+    """Every rank must agree on how a shard is tiled, because the tile loop talks."""
+
+    @pytest.mark.parametrize("cp_size", [2, 4, 8])
+    def test_all_ranks_get_the_same_bound(self, cp_size):
+        """Disagreement here is a hang, not a wrong answer.
+
+        Rank r holds chunks r and 2*cp-r-1, and for the last rank those are adjacent: at cp=2
+        rank 1 holds chunks 1 and 2, whose global positions run unbroken. A bound measured from
+        the positions therefore comes out twice as large there as on rank 0, the ranks tile
+        their shards differently, and the all-to-all exchange in the tile loop deadlocks waiting
+        for a collective that another rank never issues.
+        """
+        seq_len = 64 * cp_size
+        device = torch.device("cpu")
+        bounds = {
+            rank: _zigzag_tile_bound(
+                build_zigzag_cp_local_positions(seq_len, cp_size, rank, device)
+            )
+            for rank in range(cp_size)
+        }
+        assert len(set(bounds.values())) == 1, f"ranks disagree on the tile bound: {bounds}"
+
+    @pytest.mark.parametrize("cp_size", [2, 4])
+    def test_bound_is_the_chunk_length(self, cp_size):
+        """A tile at the bound must fit inside one chunk, which is what the validator checks."""
+        seq_len = 64 * cp_size
+        device = torch.device("cpu")
+        positions = build_zigzag_cp_local_positions(seq_len, cp_size, 0, device)
+        bound = _zigzag_tile_bound(positions)
+        assert bound == seq_len // (2 * cp_size)
+        # The validator is the authority on whether a tiling is legal; agree with it.
+        _validate_query_positions(positions, positions.numel(), bound)
+
+    def test_no_bound_without_context_parallelism(self):
+        assert _zigzag_tile_bound(None) is None
 
 
 class TestZigzagOwnerMap:

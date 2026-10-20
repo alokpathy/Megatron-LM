@@ -176,6 +176,36 @@ def _plan_dense_warmup(
     return _DenseWarmupPlan(query_chunk=query_chunk, key_chunk=key_chunk)
 
 
+def _zigzag_tile_bound(query_positions: Optional[torch.Tensor]) -> Optional[int]:
+    """Largest tile a rank may use so that no tile straddles two zigzag chunks.
+
+    Every rank holds exactly two chunks under zigzag, so the chunk length is half the local
+    shard -- a property of the layout, identical on every rank.
+
+    Deliberately NOT measured from query_positions. Rank r holds chunks r and 2*cp-r-1, and for
+    the middle ranks those are adjacent: at cp=2 rank 1 holds chunks 1 and 2, whose positions
+    run 1024..3071 unbroken. Measuring the run there yields twice what rank 0 measures, so the
+    ranks would disagree on how many tiles the shard has -- and the tile loop issues
+    collectives, so disagreeing means a hang rather than a wrong answer.
+    """
+    if query_positions is None:
+        return None
+    return max(1, int(query_positions.numel()) // 2)
+
+
+def _largest_divisor_at_most(n: int, limit: int) -> int:
+    """Largest divisor of ``n`` not exceeding ``limit``.
+
+    Clamping with a plain ``min`` is not enough: a tile size that merely fits inside a run
+    still has to tile it evenly, or a later tile straddles the end of one run and the start of
+    the next. Terminates because 1 divides everything.
+    """
+    limit = max(1, min(limit, n))
+    while n % limit:
+        limit -= 1
+    return limit
+
+
 def _plan_execution(
     batch_size: int,
     query_length: int,
@@ -183,6 +213,7 @@ def _plan_execution(
     use_triton: bool,
     query_chunk_override: Optional[int] = None,
     key_chunk_override: Optional[int] = None,
+    max_query_chunk: Optional[int] = None,
 ) -> _DSAExecutionPlan:
     """Choose streaming chunk sizes for the given shapes and backend.
 
@@ -223,6 +254,13 @@ def _plan_execution(
         if query_chunk_override is not None and query_chunk_override > 0:
             query_chunk = min(query_chunk_override, query_length)
 
+    if max_query_chunk is not None:
+        # The planner sizes against the local shard, which under context parallelism is two
+        # disjoint chunks. A tile spanning both cannot be described by a single global start,
+        # so bound it by one run and make it divide that run evenly. Applied after the
+        # override too: an override that straddles a run is rejected downstream regardless,
+        # and failing there rather than here would be no kinder.
+        query_chunk = _largest_divisor_at_most(max_query_chunk, query_chunk)
     return _DSAExecutionPlan(query_chunk=query_chunk, routing_key_chunk=routing_key_chunk)
 
 
@@ -2410,6 +2448,7 @@ def dsa_min_memory_gqa(
         use_triton,
         query_chunk_override=query_chunk_size,
         key_chunk_override=key_chunk_size,
+        max_query_chunk=_zigzag_tile_bound(query_positions),
     )
     if getattr(indexer.config, "dsa_indexer_mode", "standard") == "simplified":
         return DSASimplifiedMinMemoryGQAFn.apply(
