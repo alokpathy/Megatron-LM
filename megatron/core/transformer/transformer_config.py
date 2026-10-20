@@ -3894,7 +3894,11 @@ class TransformerConfig(ModelParallelConfig):
                     "min-memory dsa_kernel_backend requires dsa_indexer_rotate_activation for "
                     "the standard DeepSeek indexer."
                 )
-            if self.context_parallel_size > 1:
+            # DSA over GQA is gated above and admits the sparse exchange as well, so this
+            # applies to the MLA path only. Without the exclusion a GQA configuration meets
+            # both gates and the stricter one wins, rejecting a comm type the path supports.
+            dsa_over_gqa = not self.multi_latent_attention and self.dsa_indexer_mode == 'simplified'
+            if self.context_parallel_size > 1 and not dsa_over_gqa:
                 cp_comm_types = (
                     self.cp_comm_type
                     if isinstance(self.cp_comm_type, list)
