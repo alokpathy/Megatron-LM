@@ -1491,7 +1491,13 @@ class DSASimplifiedMinMemoryGQAFn(torch.autograd.Function):
                 f"value or none, got query={needs_query_grad}, key={needs_key_grad}, "
                 f"value={needs_value_grad}. Partial Q/K/V gradients are not supported."
             )
-        use_triton_attention_backward = needs_query_grad and needs_key_grad and needs_value_grad
+        # An exchanged tile cannot use the Triton backward: like the forward kernels it reads
+        # topk_indices as both gather offsets and global positions, and it accumulates into a
+        # tensor shaped like the local shard while the gradients it produces describe the
+        # received buffer. The PyTorch recompute below handles both, so route around it.
+        use_triton_attention_backward = (
+            needs_query_grad and needs_key_grad and needs_value_grad and kv_exchange is None
+        )
         grad_key_accum = None
         grad_value_accum = None
 
@@ -1678,13 +1684,17 @@ class DSASimplifiedMinMemoryGQAFn(torch.autograd.Function):
                                         q_start,
                                     )
                                 )
+                        # The teacher is a detached target, so no gradient reaches K through
+                        # it and the exchanged rows need no routing back -- only the right
+                        # tensor to read, which under an exchange is the tile's buffer.
                         teacher = _teacher_scores_tile(
                             query[q_lo:q_hi].detach(),
-                            key.detach(),
+                            tile_key.detach(),
                             topk_indices,
                             ctx.attention_softmax_scale,
                             q_start,
                             ctx.pg_collection,
+                            gather_indices,
                         )
                         scale = grad_indexer_loss * (ctx.loss_coeff / total_positions)
                         grad_scores = triton_indexer_loss_grad(selected_scores, teacher, scale)
@@ -2381,6 +2391,7 @@ def dsa_min_memory_gqa(
     use_triton: bool = True,
     simplified_input_norm=None,
     query_positions: Optional[torch.Tensor] = None,
+    kv_exchange: Optional[KVExchangeContext] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Run the minimum-activation DSA-GQA training backend."""
     _plan = _plan_execution(
@@ -2417,4 +2428,5 @@ def dsa_min_memory_gqa(
             cache_indexer_k,
             use_triton,
             query_positions,
+            kv_exchange,
         )

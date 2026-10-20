@@ -375,9 +375,7 @@ class TransformerConfig(ModelParallelConfig):
     top-k indices."""
 
     dsa_kernel_backend: (
-        Literal[
-            "none", "tilelang", "cudnn", "min-memory-triton", "min-memory-torch", "reference"
-        ]
+        Literal["none", "tilelang", "cudnn", "min-memory-triton", "min-memory-torch", "reference"]
         | None
     ) = None
     """Which DSA implementation to run. This is the only backend selector.
@@ -3867,9 +3865,12 @@ class TransformerConfig(ModelParallelConfig):
                     )
                     assert all(
                         cp_comm_type is not None
-                        and cp_comm_type.replace("_", "").lower() == "allgather"
+                        and cp_comm_type.replace("_", "").lower() in ("allgather", "a2a")
                         for cp_comm_type in cp_comm_types
-                    ), "DSA over GQA context parallelism supports cp_comm_type=allgather only."
+                    ), (
+                        "DSA over GQA context parallelism supports cp_comm_type in "
+                        "(allgather, a2a)."
+                    )
                 # Sequence parallelism remains unsupported: the min-memory path has no
                 # sequence-parallel gather for the attention tensors.
                 assert (

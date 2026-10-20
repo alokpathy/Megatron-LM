@@ -26,6 +26,7 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
     fused_qk_topk_chunked,
     fused_qk_topk_naive,
 )
+from megatron.core.transformer.experimental_attention_variant.dsa_a2a import KVExchangeContext
 from megatron.core.transformer.experimental_attention_variant.dsa_layout import (
     build_zigzag_allgather_cp_key_reorder,
     build_zigzag_cp_local_positions,
@@ -67,15 +68,30 @@ def _gather_kv_for_context_parallel(key, value, cp_group, cp_comm_type):
     """
     cp_size = 1 if cp_group is None else cp_group.size()
     if cp_size <= 1:
-        return key, value, None
+        return key, value, None, None
 
-    if normalize_cp_comm_type(cp_comm_type) != "allgather":
+    comm_type = normalize_cp_comm_type(cp_comm_type)
+    if comm_type not in ("allgather", "a2a"):
         raise NotImplementedError(
-            "DSA over GQA context parallelism supports cp_comm_type='allgather' only; "
+            "DSA over GQA context parallelism supports cp_comm_type in ('allgather', 'a2a'); "
             f"got {cp_comm_type!r}."
         )
 
     sq_local = key.size(0)
+    if comm_type == "a2a":
+        # Nothing is gathered here. Routing has to pick a tile's keys before a rank can know
+        # which to ask for, so the exchange happens per tile inside the kernel; this returns the
+        # local shards and the context the tile loop needs to swap with.
+        query_positions = build_zigzag_cp_local_positions(
+            sq_local * cp_size, cp_size, cp_group.rank(), key.device
+        )
+        return (
+            key,
+            value,
+            query_positions,
+            KVExchangeContext(cp_group=cp_group, cp_size=cp_size, seq_len=sq_local * cp_size),
+        )
+
     gathered_key = gather_from_sequence_parallel_region(
         key, tensor_parallel_output_grad=True, group=cp_group
     )
@@ -86,7 +102,8 @@ def _gather_kv_for_context_parallel(key, value, cp_group, cp_comm_type):
     query_positions = build_zigzag_cp_local_positions(
         sq_local * cp_size, cp_size, cp_group.rank(), key.device
     )
-    return gathered_key[reorder], gathered_value[reorder], query_positions
+    # None: the all-gather hands the tile loop complete keys, so there is nothing to swap.
+    return gathered_key[reorder], gathered_value[reorder], query_positions, None
 
 
 def _repeat_grouped_key_value(key: torch.Tensor, value: torch.Tensor, num_query_heads: int):
@@ -1011,7 +1028,7 @@ class DSGQACoreAttention(MegatronModule):
                 "DSA over GQA context parallelism currently covers the sparse path only; "
                 "dsa_fwd_use_dense_attn and the dense indexer loss are not yet position-aware."
             )
-        dsa_key, dsa_value, query_positions = _gather_kv_for_context_parallel(
+        dsa_key, dsa_value, query_positions, kv_exchange = _gather_kv_for_context_parallel(
             key,
             value,
             cp_group,
@@ -1142,6 +1159,7 @@ class DSGQACoreAttention(MegatronModule):
             cache_selected_scores=_dsa_caches_selected_scores(self.config),
             use_triton=dsa_kernel_backend == "min-memory-triton",
             query_positions=query_positions,
+            kv_exchange=kv_exchange,
         )
         if sparse_fwd_dense_loss:
             indexer_loss = dsa_dense_indexer_loss(

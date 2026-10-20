@@ -165,7 +165,7 @@ def _sharded(device, cp_group, positions, q_chunk, cache_indexer_k=True):
     v_local = v[positions].detach().requires_grad_(True)
     h_local = h[positions]
     indexer = _indexer(device, cp_group)
-    dsa_key, dsa_value, query_positions = _gather_kv_for_context_parallel(
+    dsa_key, dsa_value, query_positions, _ = _gather_kv_for_context_parallel(
         k_local, v_local, cp_group, "all_gather"
     )
     out, loss = _run(
@@ -313,7 +313,7 @@ class TestContextParallelParity:
         cp_group, device, _, positions = self._setup(cp_size)
         try:
             q, k, v, _ = _global_inputs(device)
-            dsa_key, dsa_value, query_positions = _gather_kv_for_context_parallel(
+            dsa_key, dsa_value, query_positions, _ = _gather_kv_for_context_parallel(
                 k[positions], v[positions], cp_group, "all_gather"
             )
             torch.testing.assert_close(dsa_key, k, atol=0, rtol=0)

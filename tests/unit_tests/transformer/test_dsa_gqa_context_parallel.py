@@ -114,14 +114,30 @@ class TestGatherHelper:
 
     def test_single_rank_is_a_noop(self):
         q, k, v, _ = _inputs()
-        gk, gv, pos = _gather_kv_for_context_parallel(k, v, None, "allgather")
+        gk, gv, pos, exchange = _gather_kv_for_context_parallel(k, v, None, "allgather")
         assert gk is k and gv is v and pos is None
+        # No context parallelism means nothing to exchange either.
+        assert exchange is None
 
     def test_non_allgather_comm_type_is_rejected(self):
         q, k, v, _ = _inputs()
         fake_group = SimpleNamespace(size=lambda: 2, rank=lambda: 0)
         with pytest.raises(NotImplementedError, match="allgather"):
             _gather_kv_for_context_parallel(k, v, fake_group, "p2p")
+
+    def test_a2a_skips_the_gather_and_returns_an_exchange_context(self):
+        """a2a leaves K and V local; the tile loop swaps only what routing selects."""
+        q, k, v, _ = _inputs()
+        fake_group = SimpleNamespace(size=lambda: CP_SIZE, rank=lambda: 0)
+        gk, gv, pos, exchange = _gather_kv_for_context_parallel(k, v, fake_group, "a2a")
+
+        assert gk is k and gv is v
+        assert exchange is not None
+        # The global length has to be stated, not inferred from the local shard, or routing
+        # would clamp causal visibility to one rank's slice.
+        assert exchange.seq_len == SEQLEN * CP_SIZE
+        assert exchange.cp_size == CP_SIZE
+        assert pos is not None and pos.numel() == SEQLEN
 
     def test_reorder_restores_global_position_order(self):
         """Gathered tensors arrive in rank order; the reorder must sort them by position."""
