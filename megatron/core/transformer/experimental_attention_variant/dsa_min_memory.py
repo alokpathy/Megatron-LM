@@ -536,12 +536,26 @@ def _sparse_attention_tile(
     topk_indices: torch.Tensor,
     softmax_scale: float,
     q_start: int,
+    gather_indices: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    triton_output = triton_sparse_attention_tile(
-        query_tile, key, value, topk_indices, softmax_scale, q_start
-    )
-    if triton_output is not None:
-        return triton_output
+    """Attention for one query tile over its selected keys.
+
+    ``gather_indices`` separates the two jobs ``topk_indices`` normally does at once. The
+    all-to-all exchange hands back a buffer holding only the rows this tile selected, so the
+    gather addresses that buffer while causality still has to compare global positions. When it
+    is None the two coincide, which is every non-exchanged case.
+
+    The Triton kernels cannot take the pair: they test ``selected <= q_start + query_idx`` on
+    the same values they gather with, so a remapped index would be compared against a buffer row
+    number. Until they carry positions separately, an exchanged tile takes the PyTorch path.
+    """
+    if gather_indices is None:
+        triton_output = triton_sparse_attention_tile(
+            query_tile, key, value, topk_indices, softmax_scale, q_start
+        )
+        if triton_output is not None:
+            return triton_output
+        gather_indices = topk_indices
 
     query_length, batch_size, num_query_heads, head_dim = query_tile.shape
     num_query_groups = key.size(2)
@@ -556,8 +570,8 @@ def _sparse_attention_tile(
         head_start = group_idx * repeat_factor
         head_end = head_start + repeat_factor
         query_group = query_tile[:, :, head_start:head_end, :].permute(1, 2, 0, 3)
-        selected_key = _gather_selected_kv(key, group_idx, topk_indices)
-        selected_value = _gather_selected_kv(value, group_idx, topk_indices)
+        selected_key = _gather_selected_kv(key, group_idx, gather_indices)
+        selected_value = _gather_selected_kv(value, group_idx, gather_indices)
         scores = (
             torch.einsum("brqd,bqkd->brqk", query_group.float(), selected_key.float())
             * softmax_scale
@@ -709,6 +723,7 @@ def _build_full_indexer_k(
         # concatenating: a cat would hold every block and the joined tensor at the same time.
         full_k_index[start:end] = block
     return full_k_index
+
 
 def _cp_group_size(pg_collection) -> int:
     """Size of the context-parallel group, or 1 when there is none."""
@@ -1496,9 +1511,7 @@ class DSASimplifiedMinMemoryGQAFn(torch.autograd.Function):
 
                 if not triton_attention_done:
                     attention_inputs = []
-                    query_tile = (
-                        query[q_lo:q_hi].detach().requires_grad_(ctx.needs_input_grad[0])
-                    )
+                    query_tile = query[q_lo:q_hi].detach().requires_grad_(ctx.needs_input_grad[0])
                     key_leaf = key.detach().requires_grad_(ctx.needs_input_grad[1])
                     value_leaf = value.detach().requires_grad_(ctx.needs_input_grad[2])
                     if ctx.needs_input_grad[0]:
