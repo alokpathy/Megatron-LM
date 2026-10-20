@@ -76,23 +76,25 @@ def exchange_tile_kv(
     value: torch.Tensor,
     topk_indices: torch.Tensor,
     context: Optional[KVExchangeContext],
-) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[TileExchangePlan]]:
     """Fetch a tile's selected keys and values, or pass through when there is no exchange.
 
-    Returns ``(key, value, gather_indices)`` where ``gather_indices`` addresses the returned
-    tensors and is None when they are the originals. Callers keep ``topk_indices`` for causal
-    masking either way.
+    Returns ``(key, value, gather_indices, plan)``. ``gather_indices`` addresses the returned
+    tensors and is None when they are the originals; callers keep ``topk_indices`` for causal
+    masking either way. The plan comes back so a backward can hand gradients on the returned
+    buffers to :func:`return_row_grads`.
 
     Runs without autograd. The min-memory backward recomputes tiles and routes dK and dV by
     hand, so a graph here would be dead weight; see :func:`exchange_rows`.
     """
     if context is None:
-        return key, value, None
+        return key, value, None, None
     plan = plan_tile_exchange(topk_indices, context.seq_len, context.cp_size, context.cp_group)
     return (
         exchange_rows(key, plan, context.cp_group),
         exchange_rows(value, plan, context.cp_group),
         plan.remap[topk_indices],
+        plan,
     )
 
 

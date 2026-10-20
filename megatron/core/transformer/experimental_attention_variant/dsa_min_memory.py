@@ -33,6 +33,7 @@ from megatron.core.transformer.experimental_attention_variant.dsa import rotate_
 from megatron.core.transformer.experimental_attention_variant.dsa_a2a import (
     KVExchangeContext,
     exchange_tile_kv,
+    return_row_grads,
 )
 from megatron.core.transformer.experimental_attention_variant.dsa_layout import (
     build_zigzag_allgather_cp_key_reorder,
@@ -531,6 +532,20 @@ def _gather_selected_kv(
         2,
         gather_index,
     )
+
+
+def _route_exchanged_grad(grad, exchange_plan, kv_exchange, local_shape):
+    """Send a gradient on exchanged rows back to the ranks that own those keys.
+
+    Without an exchange the gradient already describes the local tensor and passes through. With
+    one it describes the tile's received buffer, and every row has to return to its owner and
+    accumulate there, because a key selected by queries on several ranks collects a contribution
+    from each. The all-gather path gets this from its reduce-scatter; here the recomputing
+    backward owns it, like it already owns dK and dV.
+    """
+    if exchange_plan is None or kv_exchange is None:
+        return grad
+    return return_row_grads(grad, exchange_plan, kv_exchange.cp_group, local_shape)
 
 
 def _sparse_attention_tile(
@@ -1241,7 +1256,7 @@ def _simplified_sparse_forward_impl(
         query_tile = query[q_lo:q_hi]
         # With an exchange the tile's keys arrive now, after routing has said which it wants.
         # Attention and the indexer loss below share one plan: they select the same keys.
-        tile_key, tile_value, gather_indices = exchange_tile_kv(
+        tile_key, tile_value, gather_indices, _ = exchange_tile_kv(
             key, value, topk_indices, kv_exchange
         )
         output[q_lo:q_hi] = _sparse_attention_tile(
@@ -1312,6 +1327,7 @@ class DSASimplifiedMinMemoryGQAFn(torch.autograd.Function):
         cache_indexer_k: bool = False,
         use_triton: bool = True,
         query_positions: Optional[torch.Tensor] = None,
+        kv_exchange: Optional[KVExchangeContext] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Run the sparse forward, streaming index scores so the full score matrix is never held."""
         key_chunk_size = _plan_execution(
@@ -1367,6 +1383,7 @@ class DSASimplifiedMinMemoryGQAFn(torch.autograd.Function):
                     linear_k_weight=linear_k_weight,
                     full_k_index=full_k_index,
                     query_positions=query_positions,
+                    kv_exchange=kv_exchange,
                 )
 
         # Retaining it costs seq * batch * index_head_dim for the whole span between this
@@ -1397,11 +1414,13 @@ class DSASimplifiedMinMemoryGQAFn(torch.autograd.Function):
         ctx.use_triton = use_triton
         ctx.query_positions = query_positions
         ctx.cp_group = getattr(pg_collection, "cp", None) if pg_collection else None
+        ctx.kv_exchange = kv_exchange
         return output, indexer_loss
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor, grad_indexer_loss: torch.Tensor):
         """Recompute the tiles the forward streamed, and accumulate their gradients."""
+        kv_exchange = ctx.kv_exchange
         query, key, value, hidden_states, linear_q_weight, linear_k_weight, cached_k = (
             ctx.saved_tensors
         )
@@ -1519,7 +1538,14 @@ class DSASimplifiedMinMemoryGQAFn(torch.autograd.Function):
                             linear_k_weight=linear_k_weight,
                             full_k_index=full_k_index,
                             q_pos_start=q_start,
+                            key_seq_len=None if kv_exchange is None else kv_exchange.seq_len,
                         )
+
+                # Rebuilt rather than stashed: the plan is a function of topk_indices, and
+                # keeping one per tile would cost the memory this backend exists to save.
+                tile_key, tile_value, gather_indices, exchange_plan = exchange_tile_kv(
+                    key, value, topk_indices, kv_exchange
+                )
 
                 triton_attention_done = False
                 if use_triton_attention_backward:
@@ -1555,8 +1581,11 @@ class DSASimplifiedMinMemoryGQAFn(torch.autograd.Function):
                 if not triton_attention_done:
                     attention_inputs = []
                     query_tile = query[q_lo:q_hi].detach().requires_grad_(ctx.needs_input_grad[0])
-                    key_leaf = key.detach().requires_grad_(ctx.needs_input_grad[1])
-                    value_leaf = value.detach().requires_grad_(ctx.needs_input_grad[2])
+                    # With an exchange these are the tile's received rows, so the gradients
+                    # autograd produces below are gradients on that buffer and still have to be
+                    # routed back to the ranks that own the keys.
+                    key_leaf = tile_key.detach().requires_grad_(ctx.needs_input_grad[1])
+                    value_leaf = tile_value.detach().requires_grad_(ctx.needs_input_grad[2])
                     if ctx.needs_input_grad[0]:
                         attention_inputs.append(query_tile)
                     if ctx.needs_input_grad[1]:
@@ -1572,6 +1601,7 @@ class DSASimplifiedMinMemoryGQAFn(torch.autograd.Function):
                                 topk_indices,
                                 ctx.attention_softmax_scale,
                                 q_start,
+                                gather_indices,
                             )
                         attention_grads = torch.autograd.grad(
                             output_tile,
@@ -1588,11 +1618,19 @@ class DSASimplifiedMinMemoryGQAFn(torch.autograd.Function):
                         if ctx.needs_input_grad[1]:
                             grad = next(grad_iter)
                             if grad is not None:
-                                grad_key.add_(grad)
+                                grad_key.add_(
+                                    _route_exchanged_grad(
+                                        grad, exchange_plan, kv_exchange, key.shape
+                                    )
+                                )
                         if ctx.needs_input_grad[2]:
                             grad = next(grad_iter)
                             if grad is not None:
-                                grad_value.add_(grad)
+                                grad_value.add_(
+                                    _route_exchanged_grad(
+                                        grad, exchange_plan, kv_exchange, value.shape
+                                    )
+                                )
 
                 if compute_loss_grad:
                     with torch.no_grad():
