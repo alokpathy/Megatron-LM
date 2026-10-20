@@ -23,7 +23,7 @@ the *global* indices must be kept for that and only the gather may use the remap
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Tuple
+from typing import Optional, Tuple
 
 import torch
 
@@ -51,6 +51,49 @@ class TileExchangePlan:
     requested_local: torch.Tensor
     remap: torch.Tensor
     total_recv: int
+
+
+@dataclass(frozen=True)
+class KVExchangeContext:
+    """What a tile loop needs to swap keys instead of having been handed all of them.
+
+    Carrying the global ``seq_len`` explicitly matters: with an exchange the key tensor is this
+    rank's shard, so routing can no longer infer the sequence length from ``key.size(0)``.
+
+    Attributes:
+        cp_group: The context-parallel process group.
+        cp_size: Its size.
+        seq_len: Global sequence length.
+    """
+
+    cp_group: object
+    cp_size: int
+    seq_len: int
+
+
+def exchange_tile_kv(
+    key: torch.Tensor,
+    value: torch.Tensor,
+    topk_indices: torch.Tensor,
+    context: Optional[KVExchangeContext],
+) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    """Fetch a tile's selected keys and values, or pass through when there is no exchange.
+
+    Returns ``(key, value, gather_indices)`` where ``gather_indices`` addresses the returned
+    tensors and is None when they are the originals. Callers keep ``topk_indices`` for causal
+    masking either way.
+
+    Runs without autograd. The min-memory backward recomputes tiles and routes dK and dV by
+    hand, so a graph here would be dead weight; see :func:`exchange_rows`.
+    """
+    if context is None:
+        return key, value, None
+    plan = plan_tile_exchange(topk_indices, context.seq_len, context.cp_size, context.cp_group)
+    return (
+        exchange_rows(key, plan, context.cp_group),
+        exchange_rows(value, plan, context.cp_group),
+        plan.remap[topk_indices],
+    )
 
 
 def plan_tile_exchange(

@@ -30,6 +30,10 @@ from megatron.core.tensor_parallel.mappings import (
     reduce_from_tensor_model_parallel_region,
 )
 from megatron.core.transformer.experimental_attention_variant.dsa import rotate_activation
+from megatron.core.transformer.experimental_attention_variant.dsa_a2a import (
+    KVExchangeContext,
+    exchange_tile_kv,
+)
 from megatron.core.transformer.experimental_attention_variant.dsa_layout import (
     build_zigzag_allgather_cp_key_reorder,
 )
@@ -593,11 +597,24 @@ def _teacher_scores_tile(
     softmax_scale: float,
     q_start: int,
     pg_collection: ProcessGroupCollection,
+    gather_indices: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    """Main-attention scores over a tile's selected keys, the target the indexer learns.
+
+    ``gather_indices`` addresses an exchanged key buffer while ``topk_indices`` stays global for
+    the causal mask; see :func:`_sparse_attention_tile` for why the two have to be separable and
+    why an exchanged tile cannot use the Triton kernel.
+    """
     _, batch_size, num_query_heads, _ = query_tile.shape
     num_query_groups = key.size(2)
     repeat_factor = num_query_heads // num_query_groups
-    teacher = triton_teacher_scores_tile(query_tile, key, topk_indices, softmax_scale, q_start)
+    teacher = (
+        triton_teacher_scores_tile(query_tile, key, topk_indices, softmax_scale, q_start)
+        if gather_indices is None
+        else None
+    )
+    if gather_indices is None:
+        gather_indices = topk_indices
     if teacher is None:
         teacher = query_tile.new_zeros(
             (batch_size, topk_indices.size(1), topk_indices.size(2)), dtype=torch.float32
@@ -608,7 +625,7 @@ def _teacher_scores_tile(
             head_start = group_idx * repeat_factor
             head_end = head_start + repeat_factor
             query_group = query_tile[:, :, head_start:head_end, :].permute(1, 2, 0, 3)
-            selected_key = _gather_selected_kv(key, group_idx, topk_indices)
+            selected_key = _gather_selected_kv(key, group_idx, gather_indices)
             scores = (
                 torch.einsum("brqd,bqkd->brqk", query_group.float(), selected_key.float())
                 * softmax_scale
@@ -633,9 +650,16 @@ def _indexer_loss_tile(
     total_positions: int,
     q_start: int,
     pg_collection: ProcessGroupCollection,
+    gather_indices: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     teacher = _teacher_scores_tile(
-        query_tile.detach(), key.detach(), topk_indices, softmax_scale, q_start, pg_collection
+        query_tile.detach(),
+        key.detach(),
+        topk_indices,
+        softmax_scale,
+        q_start,
+        pg_collection,
+        gather_indices,
     )
     student = torch.nn.functional.softmax(selected_index_scores, dim=-1, dtype=torch.float32)
     kl = teacher * (torch.log(teacher + 1e-10) - torch.log(student + 1e-10))
@@ -1086,6 +1110,7 @@ def _simplified_topk_index_tile(
     linear_k_weight: Optional[torch.Tensor] = None,
     full_k_index: Optional[torch.Tensor] = None,
     q_pos_start: Optional[int] = None,
+    key_seq_len: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     # q_start slices the local shard; q_pos_start is this tile's global position.
     q_pos_start = q_start if q_pos_start is None else q_pos_start
@@ -1104,8 +1129,12 @@ def _simplified_topk_index_tile(
     )
     # Causal visibility is a property of the tile's *global* last position, not its local one.
     # Under context parallelism the key set is the full gathered sequence, so clamping with the
-    # local q_end would hide every key beyond this rank's shard length.
-    causal_key_limit = min(q_pos_start + (q_end - q_start), key.size(0))
+    # local q_end would hide every key beyond this rank's shard length. key.size(0) is that
+    # global length only while the caller gathers K; the all-to-all path leaves K local and has
+    # to say the global length outright, or routing would clamp to one shard and never select
+    # anything past it.
+    key_seq_len = key.size(0) if key_seq_len is None else key_seq_len
+    causal_key_limit = min(q_pos_start + (q_end - q_start), key_seq_len)
     topk = min(index_topk, causal_key_limit)
     running_scores = None
     running_indices = None
@@ -1170,6 +1199,7 @@ def _simplified_sparse_forward_impl(
     linear_k_weight: Optional[torch.Tensor] = None,
     full_k_index: Optional[torch.Tensor] = None,
     query_positions: Optional[torch.Tensor] = None,
+    kv_exchange: Optional[KVExchangeContext] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     sq, batch_size, num_query_heads, _ = query.shape
     output = value.new_empty((sq, batch_size, num_query_heads, value.size(-1)))
@@ -1204,12 +1234,24 @@ def _simplified_sparse_forward_impl(
             linear_k_weight=linear_k_weight,
             full_k_index=full_k_index,
             q_pos_start=q_start,
+            key_seq_len=None if kv_exchange is None else kv_exchange.seq_len,
         )
         if routing_topk_cache is not None:
             routing_topk_cache.append(topk_indices)
         query_tile = query[q_lo:q_hi]
+        # With an exchange the tile's keys arrive now, after routing has said which it wants.
+        # Attention and the indexer loss below share one plan: they select the same keys.
+        tile_key, tile_value, gather_indices = exchange_tile_kv(
+            key, value, topk_indices, kv_exchange
+        )
         output[q_lo:q_hi] = _sparse_attention_tile(
-            query_tile, key, value, topk_indices, attention_softmax_scale, q_start
+            query_tile,
+            tile_key,
+            tile_value,
+            topk_indices,
+            attention_softmax_scale,
+            q_start,
+            gather_indices,
         )
         if loss_coeff > 0:
             # FP32 for the KL below.
@@ -1219,13 +1261,14 @@ def _simplified_sparse_forward_impl(
             indexer_loss = indexer_loss + _indexer_loss_tile(
                 selected_scores,
                 query_tile,
-                key,
+                tile_key,
                 topk_indices,
                 attention_softmax_scale,
                 loss_coeff,
                 total_positions,
                 q_start,
                 pg_collection,
+                gather_indices,
             )
     if cp_size > 1:
         # Each rank's KL covers only its own queries. The loss is a mean over the full sequence,
