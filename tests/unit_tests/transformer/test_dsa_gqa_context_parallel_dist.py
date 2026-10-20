@@ -120,6 +120,7 @@ def _run(
     query_positions=None,
     input_norm=None,
     cache_indexer_k=True,
+    kv_exchange=None,
 ):
     """Call the kernel the way _forward_min_memory does once K and V are gathered."""
     return dsa_min_memory_gqa(
@@ -140,6 +141,7 @@ def _run(
         use_triton=False,
         simplified_input_norm=input_norm,
         query_positions=query_positions,
+        kv_exchange=kv_exchange,
     )
 
 
@@ -186,6 +188,41 @@ def _sharded(device, cp_group, positions, q_chunk, cache_indexer_k=True):
     return out.detach(), grads
 
 
+def _sharded_a2a(device, cp_group, positions, q_chunk, cache_indexer_k=True):
+    """This rank's result with the sparse exchange instead of the gather.
+
+    Deliberately identical to _sharded apart from the comm type, so a difference between the
+    two is the exchange and nothing else.
+    """
+    q, k, v, h = _global_inputs(device)
+    q_local = q[positions].detach().requires_grad_(True)
+    k_local = k[positions].detach().requires_grad_(True)
+    v_local = v[positions].detach().requires_grad_(True)
+    h_local = h[positions]
+    indexer = _indexer(device, cp_group)
+    dsa_key, dsa_value, query_positions, kv_exchange = _gather_kv_for_context_parallel(
+        k_local, v_local, cp_group, "a2a"
+    )
+    assert kv_exchange is not None, "a2a must produce an exchange context"
+    out, loss = _run(
+        q_local,
+        dsa_key,
+        dsa_value,
+        h_local,
+        indexer,
+        q_chunk,
+        query_positions=query_positions,
+        input_norm=_input_norm(device),
+        cache_indexer_k=cache_indexer_k,
+        kv_exchange=kv_exchange,
+    )
+    grads = torch.autograd.grad(
+        out.float().sum() + loss,
+        (q_local, k_local, v_local, indexer.linear_k.weight, indexer.linear_q.weight),
+    )
+    return out.detach(), grads
+
+
 @pytest.mark.parametrize("cp_size", [2, 4])
 class TestAllToAllExchange:
     """The sparse exchange must be interchangeable with the dense all-gather."""
@@ -221,6 +258,32 @@ class TestAllToAllExchange:
             ]
         )
         return selected
+
+    @pytest.mark.parametrize("q_chunk_divisor", [1, 2])
+    def test_matches_the_all_gather_path(self, cp_size, q_chunk_divisor):
+        """The whole point: a2a and allgather must agree on output and every gradient.
+
+        Parametrised over the tiling because the exchange is planned per tile. A single tile
+        hides any error in how a tile's remap addresses its own buffer; more than one tile is
+        what catches a plan leaking across tiles.
+        """
+        if _launched_world_size() < cp_size:
+            pytest.skip(f"cp={cp_size} needs {cp_size} ranks")
+        cp_group, device, positions = self._setup(cp_size)
+        try:
+            # One tile per zigzag chunk is always legal; dividing further stays inside a chunk.
+            q_chunk = SEQLEN // (2 * cp_size * q_chunk_divisor)
+            if q_chunk < 1:
+                pytest.skip("tiling too fine for this sequence length")
+            ag_out, ag_grads = _sharded(device, cp_group, positions, q_chunk)
+            a2a_out, a2a_grads = _sharded_a2a(device, cp_group, positions, q_chunk)
+
+            torch.testing.assert_close(a2a_out, ag_out)
+            names = ("dQ", "dK", "dV", "d_linear_k", "d_linear_q")
+            for name, got, want in zip(names, a2a_grads, ag_grads):
+                torch.testing.assert_close(got, want, msg=lambda m, n=name: f"{n}: {m}")
+        finally:
+            Utils.destroy_model_parallel()
 
     def test_received_rows_match_the_dense_gather(self, cp_size):
         """Isolates the exchange from attention.

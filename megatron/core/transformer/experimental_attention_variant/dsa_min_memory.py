@@ -1472,7 +1472,16 @@ class DSASimplifiedMinMemoryGQAFn(torch.autograd.Function):
         )
         # topk_indices address the gathered global key set, so this accumulator must span it.
         # Sizing it at the local sq would put every index past this rank's shard out of bounds.
-        grad_k_seq_len = sq if ctx.query_positions is None else key.size(0)
+        # The learned-K gradient is scattered by topk_indices, which are global positions, so
+        # this buffer has to span the whole sequence. key.size(0) is that length only while the
+        # caller gathers K; with an exchange it is one shard, and the scatter would run off the
+        # end. It is sliced back down to this rank's positions further below.
+        if ctx.query_positions is None:
+            grad_k_seq_len = sq
+        elif kv_exchange is not None:
+            grad_k_seq_len = kv_exchange.seq_len
+        else:
+            grad_k_seq_len = key.size(0)
         grad_k_linear_sequence = (
             torch.zeros(
                 (grad_k_seq_len, batch_size, ctx.index_head_dim),

@@ -117,7 +117,22 @@ def plan_tile_exchange(
     """
     device = topk_indices.device
     wanted = torch.unique(topk_indices.reshape(-1))
+    # Checked rather than trusted: a position outside the sequence turns into a negative owner
+    # or a local index past the shard, and the first thing that notices is a device-side assert
+    # inside a scatter, which reports no useful context.
+    if wanted.numel():
+        lo, hi = int(wanted[0].item()), int(wanted[-1].item())
+        if lo < 0 or hi >= seq_len:
+            raise ValueError(
+                f"selected key positions must lie in [0, {seq_len}); got [{lo}, {hi}]."
+            )
     owner, local_index = zigzag_cp_owner_and_local_index(wanted, seq_len, cp_size)
+    shard_len = seq_len // cp_size
+    if local_index.numel() and int(local_index.max().item()) >= shard_len:
+        raise ValueError(
+            f"owner map produced local index {int(local_index.max().item())} for a shard of "
+            f"{shard_len} rows (seq_len={seq_len}, cp_size={cp_size})."
+        )
 
     # Group the requests by owner. unique() returns position order, which zigzag does not keep
     # aligned with rank order, so this permutation is what makes the counts describe contiguous
@@ -202,6 +217,13 @@ def return_row_grads(
         group=cp_group,
     )
     grad_local = torch.zeros(local_shape, dtype=grad_received.dtype, device=grad_received.device)
+    if plan.requested_local.numel():
+        worst = int(plan.requested_local.max().item())
+        if worst >= local_shape[0]:
+            raise ValueError(
+                f"a peer asked for local row {worst} of a {local_shape[0]}-row shard; the "
+                "exchange plan and the tensor being scattered into disagree."
+            )
     grad_local.index_add_(0, plan.requested_local, grad_served)
     return grad_local
 
