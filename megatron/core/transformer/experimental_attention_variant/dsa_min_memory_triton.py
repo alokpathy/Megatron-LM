@@ -1473,6 +1473,7 @@ def _dsa_sparse_attention_backward_pair_kernel(
     key_ptr,
     value_ptr,
     topk_indices_ptr,
+    key_positions_ptr,
     grad_output_ptr,
     grad_query_ptr,
     grad_key_ptr,
@@ -1520,6 +1521,7 @@ def _dsa_sparse_attention_backward_pair_kernel(
     BLOCK_DV: tl.constexpr,
     BLOCK_K: tl.constexpr,
     VALUE_DTYPE: tl.constexpr,
+    HAS_KEY_POSITIONS: tl.constexpr,
 ):
     query_idx = tl.program_id(0)
     batch_idx = tl.program_id(1)
@@ -1603,7 +1605,13 @@ def _dsa_sparse_attention_backward_pair_kernel(
             mask=support_mask,
             other=0,
         )
-        valid = support_mask & (selected <= q_start + query_idx)
+        # selected addresses the key tensor; with an exchanged buffer that row number is
+        # not the global position, so causality reads the position from a parallel array.
+        if HAS_KEY_POSITIONS:
+            selected_pos = tl.load(key_positions_ptr + selected, mask=support_mask, other=0)
+        else:
+            selected_pos = selected
+        valid = support_mask & (selected_pos <= q_start + query_idx)
         k = tl.load(
             key_ptr
             + selected[:, None] * k_stride_s
@@ -1661,7 +1669,13 @@ def _dsa_sparse_attention_backward_pair_kernel(
             mask=support_mask,
             other=0,
         )
-        valid = support_mask & (selected <= q_start + query_idx)
+        # selected addresses the key tensor; with an exchanged buffer that row number is
+        # not the global position, so causality reads the position from a parallel array.
+        if HAS_KEY_POSITIONS:
+            selected_pos = tl.load(key_positions_ptr + selected, mask=support_mask, other=0)
+        else:
+            selected_pos = selected
+        valid = support_mask & (selected_pos <= q_start + query_idx)
         k = tl.load(
             key_ptr
             + selected[:, None] * k_stride_s
@@ -1978,6 +1992,7 @@ def _triton_sparse_attention_backward(
                 key,
                 value,
                 topk_indices,
+                key_positions if key_positions is not None else topk_indices,
                 grad_output,
                 grad_query,
                 grad_key_accum,
@@ -2001,6 +2016,7 @@ def _triton_sparse_attention_backward(
                 BLOCK_D=block_d,
                 BLOCK_DV=block_dv,
                 VALUE_DTYPE=_value_dtype_tag(value.dtype),
+                HAS_KEY_POSITIONS=key_positions is not None,
             )
             return
         except _TRITON_RESOURCE_ERRORS:
