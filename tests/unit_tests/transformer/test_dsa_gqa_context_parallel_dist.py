@@ -132,6 +132,7 @@ def _run(
     kv_exchange=None,
     shape=_SMALL,
     key_chunk=None,
+    use_triton=False,
 ):
     """Call the kernel the way _forward_min_memory does once K and V are gathered."""
     return dsa_min_memory_gqa(
@@ -149,7 +150,7 @@ def _run(
         # With cache_indexer_k=False the backward rebuilds it instead, which has to perform the
         # same gather and zigzag reorder -- see the recompute test below.
         cache_indexer_k=cache_indexer_k,
-        use_triton=False,
+        use_triton=use_triton,
         simplified_input_norm=input_norm,
         query_positions=query_positions,
         kv_exchange=kv_exchange,
@@ -171,7 +172,14 @@ def _reference(device, q_chunk):
 
 
 def _sharded(
-    device, cp_group, positions, q_chunk, cache_indexer_k=True, shape=_SMALL, key_chunk=None
+    device,
+    cp_group,
+    positions,
+    q_chunk,
+    cache_indexer_k=True,
+    shape=_SMALL,
+    key_chunk=None,
+    use_triton=False,
 ):
     """This rank's result, with the gather run over the live group."""
     q, k, v, h = _global_inputs(device, shape)
@@ -195,6 +203,7 @@ def _sharded(
         cache_indexer_k=cache_indexer_k,
         shape=shape,
         key_chunk=key_chunk,
+        use_triton=use_triton,
     )
     grads = torch.autograd.grad(
         out.float().sum() + loss,
@@ -204,7 +213,14 @@ def _sharded(
 
 
 def _sharded_a2a(
-    device, cp_group, positions, q_chunk, cache_indexer_k=True, shape=_SMALL, key_chunk=None
+    device,
+    cp_group,
+    positions,
+    q_chunk,
+    cache_indexer_k=True,
+    shape=_SMALL,
+    key_chunk=None,
+    use_triton=False,
 ):
     """This rank's result with the sparse exchange instead of the gather.
 
@@ -234,6 +250,7 @@ def _sharded_a2a(
         kv_exchange=kv_exchange,
         shape=shape,
         key_chunk=key_chunk,
+        use_triton=use_triton,
     )
     grads = torch.autograd.grad(
         out.float().sum() + loss,
@@ -277,6 +294,34 @@ class TestAllToAllExchange:
             ]
         )
         return selected
+
+    @pytest.mark.parametrize("use_triton", [False, True])
+    def test_matches_the_all_gather_path_on_triton(self, cp_size, use_triton):
+        """Both backends must agree, and the Triton one is the whole point of the exchange.
+
+        Parametrised rather than assumed: with use_triton=False the kernels never run, so a
+        test suite that only ever passes False is blind to the entire Triton path -- which is
+        exactly how the kernels went unexercised while being wired up.
+
+        Under an exchange the kernels gather by remapped indices and read causality from a
+        positions array, and the backward writes into a per-tile accumulator whose rows belong
+        to other ranks. A mistake in any of that shows up here as a gradient mismatch.
+        """
+        if _launched_world_size() < cp_size:
+            pytest.skip(f"cp={cp_size} needs {cp_size} ranks")
+        cp_group, device, positions = self._setup(cp_size)
+        try:
+            q_chunk = SEQLEN // (2 * cp_size)
+            ag_out, ag_grads = _sharded(device, cp_group, positions, q_chunk, use_triton=use_triton)
+            a2a_out, a2a_grads = _sharded_a2a(
+                device, cp_group, positions, q_chunk, use_triton=use_triton
+            )
+            torch.testing.assert_close(a2a_out, ag_out)
+            names = ("dQ", "dK", "dV", "d_linear_k", "d_linear_q")
+            for name, got, want in zip(names, a2a_grads, ag_grads):
+                torch.testing.assert_close(got, want, msg=lambda m, n=name: f"{n}: {m}")
+        finally:
+            Utils.destroy_model_parallel()
 
     @pytest.mark.parametrize("q_chunk_divisor", [1, 2])
     def test_matches_the_all_gather_path(self, cp_size, q_chunk_divisor):

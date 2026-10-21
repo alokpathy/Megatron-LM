@@ -601,6 +601,7 @@ def _sparse_attention_tile(
     softmax_scale: float,
     q_start: int,
     gather_indices: Optional[torch.Tensor] = None,
+    key_positions: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Attention for one query tile over its selected keys.
 
@@ -613,12 +614,23 @@ def _sparse_attention_tile(
     the same values they gather with, so a remapped index would be compared against a buffer row
     number. Until they carry positions separately, an exchanged tile takes the PyTorch path.
     """
-    if gather_indices is None:
+    # With an exchange the kernel gathers by gather_indices and reads causality out of
+    # key_positions; without one the two coincide and it behaves as before. Only a tile with
+    # gather indices but no positions must avoid Triton, since the kernel would then compare a
+    # buffer row number against a global position.
+    if gather_indices is None or key_positions is not None:
         triton_output = triton_sparse_attention_tile(
-            query_tile, key, value, topk_indices, softmax_scale, q_start
+            query_tile,
+            key,
+            value,
+            topk_indices if gather_indices is None else gather_indices,
+            softmax_scale,
+            q_start,
+            key_positions,
         )
         if triton_output is not None:
             return triton_output
+    if gather_indices is None:
         gather_indices = topk_indices
 
     query_length, batch_size, num_query_heads, head_dim = query_tile.shape
@@ -1301,7 +1313,7 @@ def _simplified_sparse_forward_impl(
         query_tile = query[q_lo:q_hi]
         # With an exchange the tile's keys arrive now, after routing has said which it wants.
         # Attention and the indexer loss below share one plan: they select the same keys.
-        tile_key, tile_value, gather_indices, _ = exchange_tile_kv(
+        tile_key, tile_value, gather_indices, exchange_plan = exchange_tile_kv(
             key, value, topk_indices, kv_exchange
         )
         output[q_lo:q_hi] = _sparse_attention_tile(
@@ -1312,6 +1324,7 @@ def _simplified_sparse_forward_impl(
             attention_softmax_scale,
             q_start,
             gather_indices,
+            None if exchange_plan is None else exchange_plan.key_positions,
         )
         if loss_coeff > 0:
             # FP32 for the KL below.
@@ -1549,9 +1562,7 @@ class DSASimplifiedMinMemoryGQAFn(torch.autograd.Function):
         # topk_indices as both gather offsets and global positions, and it accumulates into a
         # tensor shaped like the local shard while the gradients it produces describe the
         # received buffer. The PyTorch recompute below handles both, so route around it.
-        use_triton_attention_backward = (
-            needs_query_grad and needs_key_grad and needs_value_grad and kv_exchange is None
-        )
+        use_triton_attention_backward = needs_query_grad and needs_key_grad and needs_value_grad
         grad_key_accum = None
         grad_value_accum = None
 
@@ -1612,31 +1623,75 @@ class DSASimplifiedMinMemoryGQAFn(torch.autograd.Function):
                     query_tile = query[q_lo:q_hi]
                     grad_output_tile = grad_output[q_lo:q_hi]
                     grad_query_tile = grad_query[q_lo:q_hi]
-                    if grad_key_accum is None and triton_sparse_attention_backward_supported(
-                        query_tile, key, value, topk_indices, grad_output_tile, grad_query_tile
-                    ):
-                        grad_key_accum = torch.zeros(
-                            key.shape, device=key.device, dtype=torch.float32
-                        )
-                        grad_value_accum = torch.zeros(
-                            value.shape, device=value.device, dtype=torch.float32
-                        )
-                    if grad_key_accum is not None and grad_value_accum is not None:
+                    # Without an exchange every tile indexes the same full-sequence key, so one
+                    # accumulator is allocated once and reduced at the end. With one, each tile
+                    # has its own buffer of a different length, and its rows belong to other
+                    # ranks, so the accumulator is per tile and goes home before touching dK.
+                    if kv_exchange is None:
+                        tri_key, tri_value = key, value
+                        tri_indices = topk_indices
+                        tri_positions = None
+                        if grad_key_accum is None and triton_sparse_attention_backward_supported(
+                            query_tile, key, value, topk_indices, grad_output_tile, grad_query_tile
+                        ):
+                            grad_key_accum = torch.zeros(
+                                key.shape, device=key.device, dtype=torch.float32
+                            )
+                            grad_value_accum = torch.zeros(
+                                value.shape, device=value.device, dtype=torch.float32
+                            )
+                        tile_grad_key, tile_grad_value = grad_key_accum, grad_value_accum
+                    else:
+                        tri_key, tri_value = tile_key, tile_value
+                        # The kernel gathers with these and tests causality with the positions.
+                        tri_indices = gather_indices
+                        tri_positions = exchange_plan.key_positions
+                        if triton_sparse_attention_backward_supported(
+                            query_tile,
+                            tri_key,
+                            tri_value,
+                            tri_indices,
+                            grad_output_tile,
+                            grad_query_tile,
+                        ):
+                            tile_grad_key = torch.zeros(
+                                tri_key.shape, device=tri_key.device, dtype=torch.float32
+                            )
+                            tile_grad_value = torch.zeros(
+                                tri_value.shape, device=tri_value.device, dtype=torch.float32
+                            )
+                        else:
+                            tile_grad_key = tile_grad_value = None
+                    if tile_grad_key is not None and tile_grad_value is not None:
                         attention_path = triton_sparse_attention_backward_path(
-                            query_tile, key, value, topk_indices
+                            query_tile, tri_key, tri_value, tri_indices
                         )
                         triton_attention_done = triton_sparse_attention_backward_accumulate(
                             query_tile,
-                            key,
-                            value,
-                            topk_indices,
+                            tri_key,
+                            tri_value,
+                            tri_indices,
                             grad_output_tile,
                             grad_query_tile,
-                            grad_key_accum,
-                            grad_value_accum,
+                            tile_grad_key,
+                            tile_grad_value,
                             ctx.attention_softmax_scale,
                             q_start,
+                            tri_positions,
                         )
+                        if triton_attention_done and kv_exchange is not None:
+                            # Reduced here rather than at the end: the next tile's buffer is a
+                            # different length, so there is nothing to keep accumulating into.
+                            grad_key.add_(
+                                _route_exchanged_grad(
+                                    tile_grad_key, exchange_plan, kv_exchange, key.shape
+                                ).to(grad_key.dtype)
+                            )
+                            grad_value.add_(
+                                _route_exchanged_grad(
+                                    tile_grad_value, exchange_plan, kv_exchange, value.shape
+                                ).to(grad_value.dtype)
+                            )
 
                 if not triton_attention_done:
                     attention_inputs = []
@@ -1654,6 +1709,8 @@ class DSASimplifiedMinMemoryGQAFn(torch.autograd.Function):
                         attention_inputs.append(value_leaf)
                     if attention_inputs:
                         with torch.enable_grad():
+                            # No positions here on purpose: this recompute exists to be
+                            # differentiated, and a Triton tile carries no autograd graph.
                             output_tile = _sparse_attention_tile(
                                 query_tile,
                                 key_leaf,
