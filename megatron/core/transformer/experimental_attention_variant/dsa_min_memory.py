@@ -560,16 +560,23 @@ def _sort_topk_support_by_position(
 def _gather_selected_kv(
     tensor: torch.Tensor, group_idx: int, topk_indices: torch.Tensor
 ) -> torch.Tensor:
+    """Select each query's keys (or values), as ``[batch, query, topk, head_dim]``.
+
+    Advanced indexing rather than expand-and-gather, because of the backward. Expanding a
+    ``[batch, seq, head_dim]`` tensor to ``[batch, query, seq, head_dim]`` is free going
+    forward -- it is a stride-0 view -- but autograd materializes that full shape before
+    summing it back down. At a query chunk of 8192 over 57k keys that single allocation is
+    224 GiB. Indexing scatters into ``[batch, seq, head_dim]`` instead, which is the size of
+    the thing being differentiated.
+
+    Only the PyTorch path reaches this; the Triton kernels have their own gather. That is why
+    the cost stayed hidden: the fallback ran at test sizes until the all-to-all exchange, which
+    cannot use those kernels, sent production shapes through it.
+    """
     tensor = tensor[:, :, group_idx, :].permute(1, 0, 2)
-    batch_size, query_length, topk = topk_indices.shape
-    gather_index = topk_indices[:, :, :, None].expand(
-        batch_size, query_length, topk, tensor.size(-1)
-    )
-    return torch.gather(
-        tensor[:, None, :, :].expand(batch_size, query_length, tensor.size(1), tensor.size(2)),
-        2,
-        gather_index,
-    )
+    batch_size = topk_indices.size(0)
+    batch_index = torch.arange(batch_size, device=topk_indices.device).view(batch_size, 1, 1)
+    return tensor[batch_index, topk_indices]
 
 
 def _route_exchanged_grad(grad, exchange_plan, kv_exchange, local_shape):
