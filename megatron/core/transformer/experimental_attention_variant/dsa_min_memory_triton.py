@@ -1053,6 +1053,7 @@ def _dsa_sparse_attention_forward_kernel(
     key_ptr,
     value_ptr,
     topk_indices_ptr,
+    key_positions_ptr,
     output_ptr,
     softmax_scale: tl.constexpr,
     q_start,
@@ -1085,6 +1086,7 @@ def _dsa_sparse_attention_forward_kernel(
     BLOCK_K: tl.constexpr,
     VALUE_DTYPE: tl.constexpr,
     USE_DOT_MMA: tl.constexpr,
+    HAS_KEY_POSITIONS: tl.constexpr,
 ):
     query_idx = tl.program_id(0)
     batch_idx = tl.program_id(1)
@@ -1120,7 +1122,14 @@ def _dsa_sparse_attention_forward_kernel(
             mask=support_mask,
             other=0,
         )
-        valid = support_mask & (selected <= q_start + query_idx)
+        # selected addresses the key tensor. Under an all-to-all exchange that tensor holds
+        # only this tile's selected rows, so the row number is not the global position and
+        # causality has to read the position out of a parallel array.
+        if HAS_KEY_POSITIONS:
+            selected_pos = tl.load(key_positions_ptr + selected, mask=support_mask, other=0)
+        else:
+            selected_pos = selected
+        valid = support_mask & (selected_pos <= q_start + query_idx)
         k = tl.load(
             key_ptr
             + selected[:, None] * k_stride_s
@@ -1152,7 +1161,14 @@ def _dsa_sparse_attention_forward_kernel(
             mask=support_mask,
             other=0,
         )
-        valid = support_mask & (selected <= q_start + query_idx)
+        # selected addresses the key tensor. Under an all-to-all exchange that tensor holds
+        # only this tile's selected rows, so the row number is not the global position and
+        # causality has to read the position out of a parallel array.
+        if HAS_KEY_POSITIONS:
+            selected_pos = tl.load(key_positions_ptr + selected, mask=support_mask, other=0)
+        else:
+            selected_pos = selected
+        valid = support_mask & (selected_pos <= q_start + query_idx)
         k = tl.load(
             key_ptr
             + selected[:, None] * k_stride_s
@@ -1867,7 +1883,15 @@ def _triton_sparse_attention_forward(
     topk_indices: torch.Tensor,
     softmax_scale: float,
     q_start: int,
+    key_positions: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    """Attention over the selected keys.
+
+    ``key_positions`` gives the global position of each row of ``key``, needed when ``key``
+    holds an exchanged subset rather than the whole sequence: ``topk_indices`` then addresses
+    rows, while causality still compares positions. None means the two coincide, which is
+    every non-exchanged case.
+    """
     query_len, batch_size, num_heads, head_dim = query.shape
     num_groups = key.size(2)
     repeat_factor = num_heads // num_groups
@@ -1881,6 +1905,8 @@ def _triton_sparse_attention_forward(
         key,
         value,
         topk_indices,
+        # Triton needs a real pointer even when the flag is off; the kernel never reads it.
+        key_positions if key_positions is not None else topk_indices,
         output,
         softmax_scale,
         q_start,
@@ -1898,6 +1924,7 @@ def _triton_sparse_attention_forward(
         BLOCK_DV=block_dv,
         VALUE_DTYPE=_value_dtype_tag(value.dtype),
         USE_DOT_MMA=_use_dot_mma(value.device),
+        HAS_KEY_POSITIONS=key_positions is not None,
     )
     return output
 
@@ -2577,11 +2604,18 @@ def triton_sparse_attention_tile(
     topk_indices: torch.Tensor,
     softmax_scale: float,
     q_start: int,
+    key_positions: Optional[torch.Tensor] = None,
 ) -> Optional[torch.Tensor]:
-    """Attention output for one query tile over its selected keys."""
+    """Attention output for one query tile over its selected keys.
+
+    Pass ``key_positions`` when ``key`` holds an exchanged subset: ``topk_indices`` then
+    addresses its rows and the positions supply causality separately.
+    """
     if not _can_use_sparse_attention(query, key, value, topk_indices):
         return None
-    return _triton_sparse_attention_forward(query, key, value, topk_indices, softmax_scale, q_start)
+    return _triton_sparse_attention_forward(
+        query, key, value, topk_indices, softmax_scale, q_start, key_positions
+    )
 
 
 def triton_teacher_scores_tile(
