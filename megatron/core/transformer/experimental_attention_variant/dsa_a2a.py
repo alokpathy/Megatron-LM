@@ -43,6 +43,9 @@ class TileExchangePlan:
             concatenated in rank order and split by ``recv_counts``.
         remap: Lookup from global key position to its row in the received buffer. Shaped
             ``[seq_len]``; only the positions this tile selected are meaningful.
+        key_positions: The inverse of ``remap`` -- the global position of each received row,
+            in row order. The Triton kernels read it to test causality, since a row number in
+            the exchanged buffer is not a position.
         total_recv: Number of rows this rank receives, i.e. the size of the exchanged buffer.
     """
 
@@ -50,6 +53,7 @@ class TileExchangePlan:
     recv_counts: torch.Tensor
     requested_local: torch.Tensor
     remap: torch.Tensor
+    key_positions: torch.Tensor
     total_recv: int
 
 
@@ -167,6 +171,8 @@ def plan_tile_exchange(
         recv_counts=recv_counts,
         requested_local=requested_local,
         remap=remap,
+        # Row i of the received buffer holds this global position; the exact inverse of remap.
+        key_positions=wanted_by_owner,
         total_recv=int(wanted_by_owner.numel()),
     )
 
