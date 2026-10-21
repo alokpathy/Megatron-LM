@@ -1775,6 +1775,7 @@ def _dsa_teacher_scores_kernel(
     query_ptr,
     key_ptr,
     topk_indices_ptr,
+    key_positions_ptr,
     teacher_ptr,
     softmax_scale: tl.constexpr,
     q_start,
@@ -1798,6 +1799,7 @@ def _dsa_teacher_scores_kernel(
     HEAD_DIM: tl.constexpr,
     BLOCK_D: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    HAS_KEY_POSITIONS: tl.constexpr,
 ):
     query_idx = tl.program_id(0)
     batch_idx = tl.program_id(1)
@@ -1830,7 +1832,13 @@ def _dsa_teacher_scores_kernel(
             mask=support_mask,
             other=0,
         )
-        valid = support_mask & (selected <= q_start + query_idx)
+        # selected addresses the key tensor; with an exchanged buffer that row number is
+        # not the global position, so causality reads the position from a parallel array.
+        if HAS_KEY_POSITIONS:
+            selected_pos = tl.load(key_positions_ptr + selected, mask=support_mask, other=0)
+        else:
+            selected_pos = selected
+        valid = support_mask & (selected_pos <= q_start + query_idx)
         k = tl.load(
             key_ptr
             + selected[:, None] * k_stride_s
@@ -1860,7 +1868,13 @@ def _dsa_teacher_scores_kernel(
             mask=support_mask,
             other=0,
         )
-        valid = support_mask & (selected <= q_start + query_idx)
+        # selected addresses the key tensor; with an exchanged buffer that row number is
+        # not the global position, so causality reads the position from a parallel array.
+        if HAS_KEY_POSITIONS:
+            selected_pos = tl.load(key_positions_ptr + selected, mask=support_mask, other=0)
+        else:
+            selected_pos = selected
+        valid = support_mask & (selected_pos <= q_start + query_idx)
         k = tl.load(
             key_ptr
             + selected[:, None] * k_stride_s
@@ -2671,6 +2685,7 @@ def triton_teacher_scores_tile(
     topk_indices: torch.Tensor,
     softmax_scale: float,
     q_start: int,
+    key_positions: Optional[torch.Tensor] = None,
 ) -> Optional[torch.Tensor]:
     """Main-attention scores for one query tile, the KL target the indexer is trained on."""
     if not _can_use_sparse_attention(query, key, key, topk_indices):
@@ -2687,6 +2702,7 @@ def triton_teacher_scores_tile(
         query,
         key,
         topk_indices,
+        key_positions if key_positions is not None else topk_indices,
         teacher,
         softmax_scale,
         q_start,
@@ -2699,5 +2715,6 @@ def triton_teacher_scores_tile(
         *teacher.stride(),
         HEAD_DIM=head_dim,
         BLOCK_D=block_d,
+        HAS_KEY_POSITIONS=key_positions is not None,
     )
     return teacher
