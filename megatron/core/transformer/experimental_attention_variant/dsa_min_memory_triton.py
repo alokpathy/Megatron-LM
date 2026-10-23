@@ -1053,7 +1053,7 @@ def _dsa_sparse_attention_forward_kernel(
     key_ptr,
     value_ptr,
     topk_indices_ptr,
-    key_positions_ptr,
+    selected_positions_ptr,
     output_ptr,
     softmax_scale: tl.constexpr,
     q_start,
@@ -1086,7 +1086,7 @@ def _dsa_sparse_attention_forward_kernel(
     BLOCK_K: tl.constexpr,
     VALUE_DTYPE: tl.constexpr,
     USE_DOT_MMA: tl.constexpr,
-    HAS_KEY_POSITIONS: tl.constexpr,
+    HAS_SELECTED_POSITIONS: tl.constexpr,
 ):
     query_idx = tl.program_id(0)
     batch_idx = tl.program_id(1)
@@ -1124,9 +1124,18 @@ def _dsa_sparse_attention_forward_kernel(
         )
         # selected addresses the key tensor. Under an all-to-all exchange that tensor holds
         # only this tile's selected rows, so the row number is not the global position and
-        # causality has to read the position out of a parallel array.
-        if HAS_KEY_POSITIONS:
-            selected_pos = tl.load(key_positions_ptr + selected, mask=support_mask, other=0)
+        # causality reads the position from an array laid out exactly like topk_indices --
+        # the same offsets, so this is a second coalesced load rather than a gather that
+        # depends on the value just loaded.
+        if HAS_SELECTED_POSITIONS:
+            selected_pos = tl.load(
+                selected_positions_ptr
+                + batch_idx * ti_stride_b
+                + query_idx * ti_stride_m
+                + offs_k * ti_stride_k,
+                mask=support_mask,
+                other=0,
+            )
         else:
             selected_pos = selected
         valid = support_mask & (selected_pos <= q_start + query_idx)
@@ -1163,9 +1172,18 @@ def _dsa_sparse_attention_forward_kernel(
         )
         # selected addresses the key tensor. Under an all-to-all exchange that tensor holds
         # only this tile's selected rows, so the row number is not the global position and
-        # causality has to read the position out of a parallel array.
-        if HAS_KEY_POSITIONS:
-            selected_pos = tl.load(key_positions_ptr + selected, mask=support_mask, other=0)
+        # causality reads the position from an array laid out exactly like topk_indices --
+        # the same offsets, so this is a second coalesced load rather than a gather that
+        # depends on the value just loaded.
+        if HAS_SELECTED_POSITIONS:
+            selected_pos = tl.load(
+                selected_positions_ptr
+                + batch_idx * ti_stride_b
+                + query_idx * ti_stride_m
+                + offs_k * ti_stride_k,
+                mask=support_mask,
+                other=0,
+            )
         else:
             selected_pos = selected
         valid = support_mask & (selected_pos <= q_start + query_idx)
@@ -1236,7 +1254,7 @@ def _dsa_sparse_attention_backward_kernel(
     key_ptr,
     value_ptr,
     topk_indices_ptr,
-    key_positions_ptr,
+    selected_positions_ptr,
     grad_output_ptr,
     grad_query_ptr,
     grad_key_ptr,
@@ -1283,7 +1301,7 @@ def _dsa_sparse_attention_backward_kernel(
     BLOCK_DV: tl.constexpr,
     BLOCK_K: tl.constexpr,
     VALUE_DTYPE: tl.constexpr,
-    HAS_KEY_POSITIONS: tl.constexpr,
+    HAS_SELECTED_POSITIONS: tl.constexpr,
 ):
     query_idx = tl.program_id(0)
     batch_idx = tl.program_id(1)
@@ -1338,8 +1356,15 @@ def _dsa_sparse_attention_backward_kernel(
         )
         # selected addresses the key tensor; with an exchanged buffer that row number is
         # not the global position, so causality reads the position from a parallel array.
-        if HAS_KEY_POSITIONS:
-            selected_pos = tl.load(key_positions_ptr + selected, mask=support_mask, other=0)
+        if HAS_SELECTED_POSITIONS:
+            selected_pos = tl.load(
+                selected_positions_ptr
+                + batch_idx * ti_stride_b
+                + query_idx * ti_stride_m
+                + offs_k * ti_stride_k,
+                mask=support_mask,
+                other=0,
+            )
         else:
             selected_pos = selected
         valid = support_mask & (selected_pos <= q_start + query_idx)
@@ -1390,8 +1415,15 @@ def _dsa_sparse_attention_backward_kernel(
         )
         # selected addresses the key tensor; with an exchanged buffer that row number is
         # not the global position, so causality reads the position from a parallel array.
-        if HAS_KEY_POSITIONS:
-            selected_pos = tl.load(key_positions_ptr + selected, mask=support_mask, other=0)
+        if HAS_SELECTED_POSITIONS:
+            selected_pos = tl.load(
+                selected_positions_ptr
+                + batch_idx * ti_stride_b
+                + query_idx * ti_stride_m
+                + offs_k * ti_stride_k,
+                mask=support_mask,
+                other=0,
+            )
         else:
             selected_pos = selected
         valid = support_mask & (selected_pos <= q_start + query_idx)
@@ -1473,7 +1505,7 @@ def _dsa_sparse_attention_backward_pair_kernel(
     key_ptr,
     value_ptr,
     topk_indices_ptr,
-    key_positions_ptr,
+    selected_positions_ptr,
     grad_output_ptr,
     grad_query_ptr,
     grad_key_ptr,
@@ -1521,7 +1553,7 @@ def _dsa_sparse_attention_backward_pair_kernel(
     BLOCK_DV: tl.constexpr,
     BLOCK_K: tl.constexpr,
     VALUE_DTYPE: tl.constexpr,
-    HAS_KEY_POSITIONS: tl.constexpr,
+    HAS_SELECTED_POSITIONS: tl.constexpr,
 ):
     query_idx = tl.program_id(0)
     batch_idx = tl.program_id(1)
@@ -1607,8 +1639,15 @@ def _dsa_sparse_attention_backward_pair_kernel(
         )
         # selected addresses the key tensor; with an exchanged buffer that row number is
         # not the global position, so causality reads the position from a parallel array.
-        if HAS_KEY_POSITIONS:
-            selected_pos = tl.load(key_positions_ptr + selected, mask=support_mask, other=0)
+        if HAS_SELECTED_POSITIONS:
+            selected_pos = tl.load(
+                selected_positions_ptr
+                + batch_idx * ti_stride_b
+                + query_idx * ti_stride_m
+                + offs_k * ti_stride_k,
+                mask=support_mask,
+                other=0,
+            )
         else:
             selected_pos = selected
         valid = support_mask & (selected_pos <= q_start + query_idx)
@@ -1671,8 +1710,15 @@ def _dsa_sparse_attention_backward_pair_kernel(
         )
         # selected addresses the key tensor; with an exchanged buffer that row number is
         # not the global position, so causality reads the position from a parallel array.
-        if HAS_KEY_POSITIONS:
-            selected_pos = tl.load(key_positions_ptr + selected, mask=support_mask, other=0)
+        if HAS_SELECTED_POSITIONS:
+            selected_pos = tl.load(
+                selected_positions_ptr
+                + batch_idx * ti_stride_b
+                + query_idx * ti_stride_m
+                + offs_k * ti_stride_k,
+                mask=support_mask,
+                other=0,
+            )
         else:
             selected_pos = selected
         valid = support_mask & (selected_pos <= q_start + query_idx)
@@ -1775,7 +1821,7 @@ def _dsa_teacher_scores_kernel(
     query_ptr,
     key_ptr,
     topk_indices_ptr,
-    key_positions_ptr,
+    selected_positions_ptr,
     teacher_ptr,
     softmax_scale: tl.constexpr,
     q_start,
@@ -1799,7 +1845,7 @@ def _dsa_teacher_scores_kernel(
     HEAD_DIM: tl.constexpr,
     BLOCK_D: tl.constexpr,
     BLOCK_K: tl.constexpr,
-    HAS_KEY_POSITIONS: tl.constexpr,
+    HAS_SELECTED_POSITIONS: tl.constexpr,
 ):
     query_idx = tl.program_id(0)
     batch_idx = tl.program_id(1)
@@ -1834,8 +1880,15 @@ def _dsa_teacher_scores_kernel(
         )
         # selected addresses the key tensor; with an exchanged buffer that row number is
         # not the global position, so causality reads the position from a parallel array.
-        if HAS_KEY_POSITIONS:
-            selected_pos = tl.load(key_positions_ptr + selected, mask=support_mask, other=0)
+        if HAS_SELECTED_POSITIONS:
+            selected_pos = tl.load(
+                selected_positions_ptr
+                + batch_idx * ti_stride_b
+                + query_idx * ti_stride_m
+                + offs_k * ti_stride_k,
+                mask=support_mask,
+                other=0,
+            )
         else:
             selected_pos = selected
         valid = support_mask & (selected_pos <= q_start + query_idx)
@@ -1870,8 +1923,15 @@ def _dsa_teacher_scores_kernel(
         )
         # selected addresses the key tensor; with an exchanged buffer that row number is
         # not the global position, so causality reads the position from a parallel array.
-        if HAS_KEY_POSITIONS:
-            selected_pos = tl.load(key_positions_ptr + selected, mask=support_mask, other=0)
+        if HAS_SELECTED_POSITIONS:
+            selected_pos = tl.load(
+                selected_positions_ptr
+                + batch_idx * ti_stride_b
+                + query_idx * ti_stride_m
+                + offs_k * ti_stride_k,
+                mask=support_mask,
+                other=0,
+            )
         else:
             selected_pos = selected
         valid = support_mask & (selected_pos <= q_start + query_idx)
@@ -1925,14 +1985,20 @@ def _triton_sparse_attention_forward(
     topk_indices: torch.Tensor,
     softmax_scale: float,
     q_start: int,
-    key_positions: Optional[torch.Tensor] = None,
+    selected_positions: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Attention over the selected keys.
 
-    ``key_positions`` gives the global position of each row of ``key``, needed when ``key``
-    holds an exchanged subset rather than the whole sequence: ``topk_indices`` then addresses
-    rows, while causality still compares positions. None means the two coincide, which is
-    every non-exchanged case.
+    ``selected_positions`` gives the global position of each *selection*, shaped and strided
+    exactly like ``topk_indices``. It is needed when ``key`` holds an exchanged subset rather
+    than the whole sequence: ``topk_indices`` then addresses rows of that subset, while
+    causality still compares positions. None means the two coincide, which is every
+    non-exchanged case.
+
+    Note the indexing: this is parallel to ``topk_indices``, not to ``key``. Indexing it by
+    the gathered row number would be a gather depending on a value just loaded, in the
+    innermost loop; laid out this way the kernel reads it at the same offsets it already
+    computed, as a second coalesced load.
     """
     query_len, batch_size, num_heads, head_dim = query.shape
     num_groups = key.size(2)
@@ -1948,7 +2014,7 @@ def _triton_sparse_attention_forward(
         value,
         topk_indices,
         # Triton needs a real pointer even when the flag is off; the kernel never reads it.
-        key_positions if key_positions is not None else topk_indices,
+        selected_positions if selected_positions is not None else topk_indices,
         output,
         softmax_scale,
         q_start,
@@ -1966,7 +2032,7 @@ def _triton_sparse_attention_forward(
         BLOCK_DV=block_dv,
         VALUE_DTYPE=_value_dtype_tag(value.dtype),
         USE_DOT_MMA=_use_dot_mma(value.device),
-        HAS_KEY_POSITIONS=key_positions is not None,
+        HAS_SELECTED_POSITIONS=selected_positions is not None,
     )
     return output
 
@@ -1982,13 +2048,14 @@ def _triton_sparse_attention_backward(
     grad_value_accum: torch.Tensor,
     softmax_scale: float,
     q_start: int,
-    key_positions: Optional[torch.Tensor] = None,
+    selected_positions: Optional[torch.Tensor] = None,
 ) -> None:
     """Gradients for one query tile.
 
-    ``key_positions`` gives the global position of each row of ``key``; pass it when ``key``
-    holds an exchanged subset, so that causality compares positions while ``topk_indices``
-    keeps addressing rows. The gradient accumulators follow ``key``'s shape either way.
+    ``selected_positions`` gives the global position of each selection, shaped like
+    ``topk_indices`` rather than like ``key``; pass it when ``key`` holds an exchanged subset,
+    so that causality compares positions while ``topk_indices`` keeps addressing rows. The
+    gradient accumulators follow ``key``'s shape either way.
     """
     query_len, batch_size, num_heads, head_dim = query.shape
     num_groups = key.size(2)
@@ -2006,7 +2073,7 @@ def _triton_sparse_attention_backward(
                 key,
                 value,
                 topk_indices,
-                key_positions if key_positions is not None else topk_indices,
+                selected_positions if selected_positions is not None else topk_indices,
                 grad_output,
                 grad_query,
                 grad_key_accum,
@@ -2030,7 +2097,7 @@ def _triton_sparse_attention_backward(
                 BLOCK_D=block_d,
                 BLOCK_DV=block_dv,
                 VALUE_DTYPE=_value_dtype_tag(value.dtype),
-                HAS_KEY_POSITIONS=key_positions is not None,
+                HAS_SELECTED_POSITIONS=selected_positions is not None,
             )
             return
         except _TRITON_RESOURCE_ERRORS:
@@ -2042,7 +2109,7 @@ def _triton_sparse_attention_backward(
         value,
         topk_indices,
         # A real pointer is required even when the flag is off; the kernel never reads it.
-        key_positions if key_positions is not None else topk_indices,
+        selected_positions if selected_positions is not None else topk_indices,
         grad_output,
         grad_query,
         grad_key_accum,
@@ -2065,7 +2132,7 @@ def _triton_sparse_attention_backward(
         BLOCK_D=block_d,
         BLOCK_DV=block_dv,
         VALUE_DTYPE=_value_dtype_tag(value.dtype),
-        HAS_KEY_POSITIONS=key_positions is not None,
+        HAS_SELECTED_POSITIONS=selected_positions is not None,
     )
 
 
@@ -2114,13 +2181,14 @@ def triton_sparse_attention_backward_accumulate(
     grad_value_accum: torch.Tensor,
     softmax_scale: float,
     q_start: int,
-    key_positions: Optional[torch.Tensor] = None,
+    selected_positions: Optional[torch.Tensor] = None,
 ) -> bool:
     """Accumulate sparse-attention gradients into dQ, dK and dV.
 
-    ``key_positions`` carries the global position of each row of ``key`` when ``key`` is an
-    exchanged subset rather than the whole sequence; the accumulators are shaped like ``key``
-    either way, so the caller routes them onward if those rows belong to other ranks.
+    ``selected_positions`` carries the global position of each selection, laid out like
+    ``topk_indices``, when ``key`` is an exchanged subset rather than the whole sequence; the
+    accumulators are shaped like ``key`` either way, so the caller routes them onward if those
+    rows belong to other ranks.
     """
     if not triton_sparse_attention_backward_supported(
         query, key, value, topk_indices, grad_output, grad_query
@@ -2144,7 +2212,7 @@ def triton_sparse_attention_backward_accumulate(
         grad_value_accum,
         softmax_scale,
         q_start,
-        key_positions,
+        selected_positions,
     )
     return True
 
@@ -2665,17 +2733,18 @@ def triton_sparse_attention_tile(
     topk_indices: torch.Tensor,
     softmax_scale: float,
     q_start: int,
-    key_positions: Optional[torch.Tensor] = None,
+    selected_positions: Optional[torch.Tensor] = None,
 ) -> Optional[torch.Tensor]:
     """Attention output for one query tile over its selected keys.
 
-    Pass ``key_positions`` when ``key`` holds an exchanged subset: ``topk_indices`` then
-    addresses its rows and the positions supply causality separately.
+    Pass ``selected_positions`` when ``key`` holds an exchanged subset: ``topk_indices`` then
+    addresses its rows and the positions, laid out like ``topk_indices``, supply causality
+    separately.
     """
     if not _can_use_sparse_attention(query, key, value, topk_indices):
         return None
     return _triton_sparse_attention_forward(
-        query, key, value, topk_indices, softmax_scale, q_start, key_positions
+        query, key, value, topk_indices, softmax_scale, q_start, selected_positions
     )
 
 
@@ -2685,7 +2754,7 @@ def triton_teacher_scores_tile(
     topk_indices: torch.Tensor,
     softmax_scale: float,
     q_start: int,
-    key_positions: Optional[torch.Tensor] = None,
+    selected_positions: Optional[torch.Tensor] = None,
 ) -> Optional[torch.Tensor]:
     """Main-attention scores for one query tile, the KL target the indexer is trained on."""
     if not _can_use_sparse_attention(query, key, key, topk_indices):
@@ -2702,7 +2771,7 @@ def triton_teacher_scores_tile(
         query,
         key,
         topk_indices,
-        key_positions if key_positions is not None else topk_indices,
+        selected_positions if selected_positions is not None else topk_indices,
         teacher,
         softmax_scale,
         q_start,
@@ -2715,6 +2784,6 @@ def triton_teacher_scores_tile(
         *teacher.stride(),
         HEAD_DIM=head_dim,
         BLOCK_D=block_d,
-        HAS_KEY_POSITIONS=key_positions is not None,
+        HAS_SELECTED_POSITIONS=selected_positions is not None,
     )
     return teacher

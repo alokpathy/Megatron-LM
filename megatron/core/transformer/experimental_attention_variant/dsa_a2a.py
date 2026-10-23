@@ -152,8 +152,11 @@ class TileExchangePlan:
         remap: Lookup from global key position to its row in the received buffer. Shaped
             ``[seq_len]``; only the positions this tile selected are meaningful.
         key_positions: The inverse of ``remap`` -- the global position of each received row,
-            in row order. The Triton kernels read it to test causality, since a row number in
-            the exchanged buffer is not a position.
+            in row order. The kernels used to read causality out of this, indexed by the
+            gathered row number; they now take the global ``topk_indices`` instead, which is
+            the same information laid out parallel to the gather indices and so reads as a
+            coalesced load rather than a gather depending on a value just loaded. Kept because
+            it is the plan's statement of what each received row is.
         total_recv: Number of rows this rank receives, i.e. the size of the exchanged buffer.
         send_split: ``send_counts`` as a host-side list.
         recv_split: ``recv_counts`` as a host-side list.
@@ -261,11 +264,15 @@ def plan_tile_exchange(
 ) -> TileExchangePlan:
     """Work out who holds this tile's selected keys and arrange the swap.
 
-    Deduplicates across the whole tile -- every batch row and every query in it -- because one
-    key selected by many queries only has to cross the wire once.
+    Deduplicates across everything it is given -- every batch row and every query -- because a
+    key selected by many queries only has to cross the wire once. Pass a list of tiles to plan
+    one exchange for all of them: the dedupe then spans the tiles too, and since neighbouring
+    query tiles select heavily overlapping keys, one exchange for a whole layer moves far less
+    than one exchange per tile and costs a single collective instead of one each.
 
     Args:
-        topk_indices: Global key positions selected for this tile, ``[batch, query, topk]``.
+        topk_indices: Global key positions selected, ``[batch, query, topk]``, or a list of
+            such tensors to plan a single exchange covering all of them.
         seq_len: Global sequence length.
         cp_size: Context-parallel world size.
         cp_group: The context-parallel process group.
@@ -273,7 +280,8 @@ def plan_tile_exchange(
     Returns:
         The plan the exchange and the index remapping both read.
     """
-    device = topk_indices.device
+    selections = topk_indices if isinstance(topk_indices, (list, tuple)) else (topk_indices,)
+    device = selections[0].device
     shard_len = seq_len // cp_size
 
     # Everything before the collective is kept free of device reads, deliberately.
@@ -292,7 +300,8 @@ def plan_tile_exchange(
         # either one stalls the host here. A gather through a cached table is the same answer
         # at a fixed shape.
         seen = torch.zeros(seq_len, dtype=torch.bool, device=device)
-        seen[topk_indices.reshape(-1)] = True
+        for selection in selections:
+            seen[selection.reshape(-1)] = True
         table = _zigzag_position_table(seq_len, cp_size, device)
         request = seen[table]
 
