@@ -34,6 +34,7 @@ from megatron.core.transformer.experimental_attention_variant.dsa_a2a import (
     KVExchangeContext,
     exchange_tile_kv,
     return_row_grads,
+    return_row_grads_pair,
 )
 from megatron.core.transformer.experimental_attention_variant.dsa_layout import (
     build_zigzag_allgather_cp_key_reorder,
@@ -670,19 +671,32 @@ def _teacher_scores_tile(
     q_start: int,
     pg_collection: ProcessGroupCollection,
     gather_indices: Optional[torch.Tensor] = None,
+    key_positions: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Main-attention scores over a tile's selected keys, the target the indexer learns.
 
     ``gather_indices`` addresses an exchanged key buffer while ``topk_indices`` stays global for
-    the causal mask; see :func:`_sparse_attention_tile` for why the two have to be separable and
-    why an exchanged tile cannot use the Triton kernel.
+    the causal mask; see :func:`_sparse_attention_tile` for the same split and the same rule for
+    when the kernel may be used -- gather indices are safe once positions come with them.
     """
     _, batch_size, num_query_heads, _ = query_tile.shape
     num_query_groups = key.size(2)
     repeat_factor = num_query_heads // num_query_groups
+    # Falling back here is expensive out of proportion to the exchange it accompanies: the
+    # PyTorch branch below materialises a [batch, repeat_factor, query, topk] fp32 score tile
+    # and a softmax over it, per tile, in both passes. The kernel reads causality from
+    # key_positions exactly as the attention kernel does, so an exchanged tile only has to
+    # avoid it when positions are missing.
     teacher = (
-        triton_teacher_scores_tile(query_tile, key, topk_indices, softmax_scale, q_start)
-        if gather_indices is None
+        triton_teacher_scores_tile(
+            query_tile,
+            key,
+            topk_indices if gather_indices is None else gather_indices,
+            softmax_scale,
+            q_start,
+            key_positions,
+        )
+        if gather_indices is None or key_positions is not None
         else None
     )
     if gather_indices is None:
@@ -723,6 +737,7 @@ def _indexer_loss_tile(
     q_start: int,
     pg_collection: ProcessGroupCollection,
     gather_indices: Optional[torch.Tensor] = None,
+    key_positions: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     teacher = _teacher_scores_tile(
         query_tile.detach(),
@@ -732,6 +747,7 @@ def _indexer_loss_tile(
         q_start,
         pg_collection,
         gather_indices,
+        key_positions,
     )
     student = torch.nn.functional.softmax(selected_index_scores, dim=-1, dtype=torch.float32)
     kl = teacher * (torch.log(teacher + 1e-10) - torch.log(student + 1e-10))
@@ -1268,6 +1284,7 @@ def _simplified_sparse_forward_impl(
     simplified_input_norm=None,
     routing_topk_cache: Optional[list] = None,
     selected_scores_cache: Optional[list] = None,
+    exchange_plan_cache: Optional[list] = None,
     linear_k_weight: Optional[torch.Tensor] = None,
     full_k_index: Optional[torch.Tensor] = None,
     query_positions: Optional[torch.Tensor] = None,
@@ -1316,6 +1333,13 @@ def _simplified_sparse_forward_impl(
         tile_key, tile_value, gather_indices, exchange_plan = exchange_tile_kv(
             key, value, topk_indices, kv_exchange
         )
+        if exchange_plan_cache is not None:
+            # The plan only. Caching the exchanged rows as well was measured and reverted: it
+            # removes a collective per tile from the backward but keeps every tile's keys,
+            # values and gather indices live across the whole forward-backward window, and the
+            # resulting allocator pressure cost about 2.4% -- several times what the repeated
+            # exchange cost. The plan is index vectors and is small enough not to show.
+            exchange_plan_cache.append(exchange_plan)
         output[q_lo:q_hi] = _sparse_attention_tile(
             query_tile,
             tile_key,
@@ -1342,6 +1366,7 @@ def _simplified_sparse_forward_impl(
                 q_start,
                 pg_collection,
                 gather_indices,
+                None if exchange_plan is None else exchange_plan.key_positions,
             )
     if cp_size > 1:
         # Each rank's KL covers only its own queries. The loss is a mean over the full sequence,
@@ -1394,6 +1419,10 @@ class DSASimplifiedMinMemoryGQAFn(torch.autograd.Function):
         _validate_query_positions(query_positions, query.size(0), query_chunk_size)
         routing_topk_cache = [] if cache_routing else None
         selected_scores_cache = [] if cache_selected_scores else None
+        # Always cached when there is an exchange, with no toggle beside the other two: a plan
+        # is a few index vectors per tile, kilobytes against the megabytes those caches weigh,
+        # and rebuilding one costs a collective the backward would otherwise wait on.
+        exchange_plan_cache = [] if kv_exchange is not None else None
         with _triton_dispatch_enabled(use_triton):
             with torch.no_grad():
                 # Project the indexer K once for the whole sequence. Routing would otherwise
@@ -1438,6 +1467,7 @@ class DSASimplifiedMinMemoryGQAFn(torch.autograd.Function):
                     simplified_input_norm,
                     routing_topk_cache=routing_topk_cache,
                     selected_scores_cache=selected_scores_cache,
+                    exchange_plan_cache=exchange_plan_cache,
                     linear_k_weight=linear_k_weight,
                     full_k_index=full_k_index,
                     query_positions=query_positions,
@@ -1465,6 +1495,9 @@ class DSASimplifiedMinMemoryGQAFn(torch.autograd.Function):
         ctx.simplified_input_norm = simplified_input_norm
         ctx.routing_topk_cache = (
             tuple(routing_topk_cache) if routing_topk_cache is not None else None
+        )
+        ctx.exchange_plan_cache = (
+            tuple(exchange_plan_cache) if exchange_plan_cache is not None else None
         )
         ctx.selected_scores_cache = (
             tuple(selected_scores_cache) if selected_scores_cache is not None else None
@@ -1612,10 +1645,17 @@ class DSASimplifiedMinMemoryGQAFn(torch.autograd.Function):
                             key_seq_len=None if kv_exchange is None else kv_exchange.seq_len,
                         )
 
-                # Rebuilt rather than stashed: the plan is a function of topk_indices, and
-                # keeping one per tile would cost the memory this backend exists to save.
+                # The forward's plan for this tile, which addresses the same keys this tile's
+                # top-k just reproduced. Rebuilding it would cost two collectives to arrive at
+                # the same answer; the rows themselves still have to be fetched again, since
+                # keeping them is the memory this backend exists not to spend.
+                cached_plan = (
+                    None
+                    if ctx.exchange_plan_cache is None
+                    else ctx.exchange_plan_cache[chunk_idx]
+                )
                 tile_key, tile_value, gather_indices, exchange_plan = exchange_tile_kv(
-                    key, value, topk_indices, kv_exchange
+                    key, value, topk_indices, kv_exchange, cached_plan
                 )
 
                 triton_attention_done = False
@@ -1682,16 +1722,16 @@ class DSASimplifiedMinMemoryGQAFn(torch.autograd.Function):
                         if triton_attention_done and kv_exchange is not None:
                             # Reduced here rather than at the end: the next tile's buffer is a
                             # different length, so there is nothing to keep accumulating into.
-                            grad_key.add_(
-                                _route_exchanged_grad(
-                                    tile_grad_key, exchange_plan, kv_exchange, key.shape
-                                ).to(grad_key.dtype)
+                            # dK and dV ride home in one collective, as they came out.
+                            routed_key, routed_value = return_row_grads_pair(
+                                tile_grad_key,
+                                tile_grad_value,
+                                exchange_plan,
+                                kv_exchange.cp_group,
+                                key.shape,
                             )
-                            grad_value.add_(
-                                _route_exchanged_grad(
-                                    tile_grad_value, exchange_plan, kv_exchange, value.shape
-                                ).to(grad_value.dtype)
-                            )
+                            grad_key.add_(routed_key.to(grad_key.dtype))
+                            grad_value.add_(routed_value.to(grad_value.dtype))
 
                 if not triton_attention_done:
                     attention_inputs = []
@@ -1806,6 +1846,7 @@ class DSASimplifiedMinMemoryGQAFn(torch.autograd.Function):
                             q_start,
                             ctx.pg_collection,
                             gather_indices,
+                            None if exchange_plan is None else exchange_plan.key_positions,
                         )
                         scale = grad_indexer_loss * (ctx.loss_coeff / total_positions)
                         grad_scores = triton_indexer_loss_grad(selected_scores, teacher, scale)

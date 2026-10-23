@@ -22,14 +22,122 @@ the *global* indices must be kept for that and only the gather may use the remap
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
 import torch
 
-from megatron.core.transformer.experimental_attention_variant.dsa_layout import (
-    zigzag_cp_owner_and_local_index,
-)
+
+
+# Set DSA_A2A_STATS=1 to have the exchange record how much it actually moves.
+#
+# This answers the question the design rests on. Moving "only the selected keys" is a saving
+# only while the keys a tile selects are few; a tile holds many queries, each picks top-k, and
+# the exchange sends the union. Once that union approaches the sequence, the exchange is an
+# all-gather with extra bookkeeping, and no amount of tuning the bookkeeping will help -- the
+# tile has to get smaller. Accumulating it costs nothing: total_recv is already a host-side
+# int, so there is no device read here.
+# Note the per-tile/per-layer trap when reading ``rows_if_all_gathered``: an all-gather runs
+# once for a layer, while the exchange runs once per tile, so the two are only comparable
+# after multiplying this by the tile count. A tile fetching 74% of what one all-gather moves
+# is not a saving when the layer has two tiles -- it is half again as much traffic.
+_STATS_ENABLED = os.environ.get("DSA_A2A_STATS") == "1"
+_stats = {"tiles": 0, "rows_received": 0, "rows_if_all_gathered": 0}
+
+# Wall-clock attribution, so "optimize the exchange" is aimed by measurement rather than by
+# which part looks expensive. Events are recorded and only read at exit: querying one forces a
+# synchronise, which is the cost this instrumentation exists to find.
+_timed_regions: dict = {}
+
+
+class _NullRegion:
+    """What :func:`_TimedRegion` returns when stats are off: no allocation, no work.
+
+    The timed regions sit inside the per-tile path, so when the instrumentation is disabled
+    -- which is always, outside a diagnostic run -- it must cost nothing at all. A single
+    shared instance is handed out rather than a new object per call.
+    """
+
+    __slots__ = ()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+_NULL_REGION = _NullRegion()
+
+
+class _CudaTimedRegion:
+    """Bracket a region with CUDA events and keep them for a later, offline read."""
+
+    __slots__ = ("name", "start", "stop")
+
+    def __init__(self, name: str):
+        self.name = name
+
+    def __enter__(self):
+        self.start = torch.cuda.Event(enable_timing=True)
+        self.stop = torch.cuda.Event(enable_timing=True)
+        self.start.record()
+        return self
+
+    def __exit__(self, *exc):
+        self.stop.record()
+        # Capped: the point is a representative sample, not a complete trace, and an
+        # unbounded list of events is its own memory problem on a long run.
+        bucket = _timed_regions.setdefault(self.name, [])
+        if len(bucket) < 2000:
+            bucket.append((self.start, self.stop))
+        return False
+
+
+def _TimedRegion(name: str):
+    """A timed region when stats are on, and the shared no-op when they are not."""
+    if _STATS_ENABLED and torch.cuda.is_available():
+        return _CudaTimedRegion(name)
+    return _NULL_REGION
+
+
+def exchange_stats() -> dict:
+    """Totals recorded since the last reset, empty unless ``DSA_A2A_STATS=1``."""
+    return dict(_stats)
+
+
+def reset_exchange_stats() -> None:
+    """Zero the counters, so a caller can measure one step rather than the whole run."""
+    for key in _stats:
+        _stats[key] = 0
+
+
+if _STATS_ENABLED:  # pragma: no cover - diagnostic path
+    import atexit
+
+    @atexit.register
+    def _report_exchange_stats():
+        """Print the totals at exit, so no training-loop hook is needed to see them."""
+        if not _stats["tiles"]:
+            return
+        received, gathered = _stats["rows_received"], _stats["rows_if_all_gathered"]
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        print(
+            f"[dsa-a2a-stats rank {rank}] tiles={_stats['tiles']} "
+            f"rows_received={received} rows_if_all_gathered_per_tile={gathered} "
+            f"per_tile_ratio={received / max(1, gathered):.3f}",
+            flush=True,
+        )
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            for name, events in sorted(_timed_regions.items()):
+                total = sum(start.elapsed_time(stop) for start, stop in events)
+                print(
+                    f"[dsa-a2a-time rank {rank}] {name}: calls={len(events)} "
+                    f"total_ms={total:.1f} mean_ms={total / max(1, len(events)):.3f}",
+                    flush=True,
+                )
 
 
 @dataclass(frozen=True)
@@ -47,6 +155,14 @@ class TileExchangePlan:
             in row order. The Triton kernels read it to test causality, since a row number in
             the exchanged buffer is not a position.
         total_recv: Number of rows this rank receives, i.e. the size of the exchanged buffer.
+        send_split: ``send_counts`` as a host-side list.
+        recv_split: ``recv_counts`` as a host-side list.
+
+    ``all_to_all_single`` takes its split sizes as Python lists, so they have to come off the
+    device at some point, and every such read stalls the pipeline until the queued work drains.
+    They are pulled once here and carried on the plan because the alternative -- calling
+    ``.tolist()`` at each use -- repeats that stall for every exchange and every gradient
+    return, several times per tile per layer, for numbers that never change.
     """
 
     send_counts: torch.Tensor
@@ -55,6 +171,8 @@ class TileExchangePlan:
     remap: torch.Tensor
     key_positions: torch.Tensor
     total_recv: int
+    send_split: list
+    recv_split: list
 
 
 @dataclass(frozen=True)
@@ -80,6 +198,7 @@ def exchange_tile_kv(
     value: torch.Tensor,
     topk_indices: torch.Tensor,
     context: Optional[KVExchangeContext],
+    plan: Optional[TileExchangePlan] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[TileExchangePlan]]:
     """Fetch a tile's selected keys and values, or pass through when there is no exchange.
 
@@ -88,18 +207,53 @@ def exchange_tile_kv(
     masking either way. The plan comes back so a backward can hand gradients on the returned
     buffers to :func:`return_row_grads`.
 
+    Pass ``plan`` to reuse one the forward already built. Planning costs a collective and a
+    device read, and the recomputing backward would otherwise redo both for a tile whose top-k
+    it has just reproduced bit for bit -- the plan is a pure function of those indices, so the
+    second computation can only agree with the first.
+
     Runs without autograd. The min-memory backward recomputes tiles and routes dK and dV by
     hand, so a graph here would be dead weight; see :func:`exchange_rows`.
     """
     if context is None:
         return key, value, None, None
-    plan = plan_tile_exchange(topk_indices, context.seq_len, context.cp_size, context.cp_group)
-    return (
-        exchange_rows(key, plan, context.cp_group),
-        exchange_rows(value, plan, context.cp_group),
-        plan.remap[topk_indices],
-        plan,
-    )
+    if plan is None:
+        with _TimedRegion("plan"):
+            plan = plan_tile_exchange(
+                topk_indices, context.seq_len, context.cp_size, context.cp_group
+            )
+    with _TimedRegion("exchange_kv"):
+        tile_key, tile_value = exchange_rows_pair(key, value, plan, context.cp_group)
+    with _TimedRegion("remap_gather"):
+        gather_indices = plan.remap[topk_indices]
+    return tile_key, tile_value, gather_indices, plan
+
+
+_POSITION_TABLE_CACHE: dict = {}
+
+
+def _zigzag_position_table(seq_len: int, cp_size: int, device) -> torch.Tensor:
+    """``table[r, j]`` is the global position of rank ``r``'s local row ``j``.
+
+    The forward direction of :func:`zigzag_cp_owner_and_local_index`, for every rank at once.
+    Reading a mask over the sequence through this gives the same mask laid out per owner,
+    which is what the planner needs and what lets it avoid the owner arithmetic entirely. It
+    depends only on the layout, so it is built once per shape rather than once per tile.
+    """
+    key = (seq_len, cp_size, str(device))
+    table = _POSITION_TABLE_CACHE.get(key)
+    if table is None:
+        chunk_len = seq_len // (2 * cp_size)
+        rank = torch.arange(cp_size, device=device).unsqueeze(1)
+        local = torch.arange(seq_len // cp_size, device=device).unsqueeze(0)
+        # Rank r holds chunk r in its low rows and chunk 2*cp_size-1-r in its high rows.
+        table = torch.where(
+            local < chunk_len,
+            rank * chunk_len + local,
+            (2 * cp_size - 1 - rank) * chunk_len + (local - chunk_len),
+        )
+        _POSITION_TABLE_CACHE[key] = table
+    return table
 
 
 def plan_tile_exchange(
@@ -120,51 +274,89 @@ def plan_tile_exchange(
         The plan the exchange and the index remapping both read.
     """
     device = topk_indices.device
-    wanted = torch.unique(topk_indices.reshape(-1))
-    # Checked rather than trusted: a position outside the sequence turns into a negative owner
-    # or a local index past the shard, and the first thing that notices is a device-side assert
-    # inside a scatter, which reports no useful context.
-    if wanted.numel():
-        lo, hi = int(wanted[0].item()), int(wanted[-1].item())
-        if lo < 0 or hi >= seq_len:
-            raise ValueError(
-                f"selected key positions must lie in [0, {seq_len}); got [{lo}, {hi}]."
-            )
-    owner, local_index = zigzag_cp_owner_and_local_index(wanted, seq_len, cp_size)
     shard_len = seq_len // cp_size
-    if local_index.numel() and int(local_index.max().item()) >= shard_len:
-        raise ValueError(
-            f"owner map produced local index {int(local_index.max().item())} for a shard of "
-            f"{shard_len} rows (seq_len={seq_len}, cp_size={cp_size})."
-        )
 
-    # Group the requests by owner. unique() returns position order, which zigzag does not keep
-    # aligned with rank order, so this permutation is what makes the counts describe contiguous
-    # blocks the collective can split on.
-    order = torch.argsort(owner, stable=True)
-    wanted_by_owner = wanted[order]
-    local_by_owner = local_index[order]
-    send_counts = torch.bincount(owner, minlength=cp_size).to(torch.int64)
+    # Everything before the collective is kept free of device reads, deliberately.
+    #
+    # A read stalls the host until the queued work drains, and a stall before a collective is
+    # paid twice: once draining, then again at the collective, which waits for the slowest
+    # rank regardless. Profiling the two-collective version showed exactly that -- the
+    # ``nonzero`` that compacted the selections cost about as much as all the arithmetic
+    # around it, while the identical reads placed after the collective were almost free,
+    # because by then the queue had already drained. So the request is built with dense
+    # arithmetic whose shapes are known in advance, and the compaction waits its turn.
+    with _TimedRegion("plan.build_request"):
+        # Dedupe into a mask over the sequence, then read that mask through the layout table to
+        # get the request laid out per owner. No ``nonzero`` and no owner arithmetic: both
+        # produce or consume a variable-length list, and the length is a device value, so
+        # either one stalls the host here. A gather through a cached table is the same answer
+        # at a fixed shape.
+        seen = torch.zeros(seq_len, dtype=torch.bool, device=device)
+        seen[topk_indices.reshape(-1)] = True
+        table = _zigzag_position_table(seq_len, cp_size, device)
+        request = seen[table]
 
-    # Tell each owner how much to expect before sending indices of unknown length.
-    recv_counts = torch.empty_like(send_counts)
-    torch.distributed.all_to_all_single(recv_counts, send_counts, group=cp_group)
+    # Ask for rows as a fixed-size mask over each owner's shard rather than as a list of
+    # indices. A variable-length request has to be preceded by its own length, which is why
+    # this used to be two collectives: counts first, then the indices themselves. A mask is
+    # the same size no matter how much it asks for, so no length has to be agreed in advance,
+    # and both sides can derive their split sizes from what they already hold -- the requester
+    # from its own mask, the owner by counting bits in what arrived.
+    #
+    # It is also smaller. The mask is one bit per row of a shard, ``cp_size * shard_len`` bits
+    # in total, against eight bytes for every index a tile selected.
+    with _TimedRegion("plan.request_a2a"):
+        incoming = torch.empty_like(request)
+        torch.distributed.all_to_all_single(incoming, request, group=cp_group)
 
-    send_split = send_counts.tolist()
-    recv_split = recv_counts.tolist()
-    requested_local = torch.empty(int(sum(recv_split)), dtype=torch.int64, device=device)
-    torch.distributed.all_to_all_single(
-        requested_local,
-        local_by_owner.contiguous(),
-        output_split_sizes=recv_split,
-        input_split_sizes=send_split,
-        group=cp_group,
-    )
+    with _TimedRegion("plan.counts"):
+        send_counts = request.sum(dim=1).to(torch.int64)
+        recv_counts = incoming.sum(dim=1).to(torch.int64)
+
+    # The one device read in the whole planner.
+    #
+    # Three were needed before: two ``nonzero`` compactions, each of which must learn its own
+    # output length, and this one for the split sizes. Each stalls the host until the queue
+    # drains, and the profile showed the exchange's cost staying flat across a run while the
+    # all-gather arm warmed up -- the signature of a fixed per-iteration stall rather than of
+    # work. Both compactions are rewritten below to take their lengths from this read instead.
+    with _TimedRegion("plan.splits_sync"):
+        both_splits = torch.stack((send_counts, recv_counts)).tolist()
+        send_split, recv_split = both_splits[0], both_splits[1]
+        total_send, total_recv_rows = sum(send_split), sum(recv_split)
+
+    with _TimedRegion("plan.compact"):
+        # Compaction by sorting a sentinel-padded index instead of by ``nonzero``: the wanted
+        # entries carry their own index and the rest carry a value that sorts past the end, so
+        # the first n of the result are exactly what nonzero would have returned -- but the
+        # shapes are fixed, so nothing has to be read back to produce it. n comes from the
+        # read above. The arrays sorted are one entry per row of the sequence, not per
+        # selection, so this is a few thousand elements.
+        cells = request.numel()
+        positions = torch.arange(cells, device=device)
+        # Ascending flat index over [cp_size, shard_len] is rank-major with local index
+        # ascending, which is the order the data collective splits on and the order the
+        # replies arrive in; ascending local index is ascending global position within an
+        # owner, so this is also what the remap expects.
+        chosen = torch.where(request.reshape(-1), positions, cells).sort().values[:total_send]
+        wanted_by_owner = table.reshape(-1)[chosen]
+        served = torch.where(incoming.reshape(-1), positions, cells).sort().values
+        requested_local = served[:total_recv_rows] % shard_len
 
     # Replies arrive in the order the requests left, so row i of the received buffer is
     # wanted_by_owner[i]. Inverting that gives the remap the gather needs.
-    remap = torch.zeros(seq_len, dtype=torch.int64, device=device)
-    remap[wanted_by_owner] = torch.arange(wanted_by_owner.numel(), dtype=torch.int64, device=device)
+    with _TimedRegion("plan.remap_build"):
+        remap = torch.zeros(seq_len, dtype=torch.int64, device=device)
+        remap[wanted_by_owner] = torch.arange(
+            wanted_by_owner.numel(), dtype=torch.int64, device=device
+        )
+
+    if _STATS_ENABLED:
+        _stats["tiles"] += 1
+        _stats["rows_received"] += int(wanted_by_owner.numel())
+        # What an all-gather would have moved to this rank for the same tile: everyone else's
+        # shard. The ratio of the two is the whole case for the sparse exchange.
+        _stats["rows_if_all_gathered"] += seq_len - seq_len // cp_size
 
     return TileExchangePlan(
         send_counts=send_counts,
@@ -174,6 +366,8 @@ def plan_tile_exchange(
         # Row i of the received buffer holds this global position; the exact inverse of remap.
         key_positions=wanted_by_owner,
         total_recv=int(wanted_by_owner.numel()),
+        send_split=send_split,
+        recv_split=recv_split,
     )
 
 
@@ -192,11 +386,83 @@ def exchange_rows(local_rows: torch.Tensor, plan: TileExchangePlan, cp_group) ->
     torch.distributed.all_to_all_single(
         received,
         served.contiguous(),
-        output_split_sizes=plan.send_counts.tolist(),
-        input_split_sizes=plan.recv_counts.tolist(),
+        output_split_sizes=plan.send_split,
+        input_split_sizes=plan.recv_split,
         group=cp_group,
     )
     return received
+
+
+def exchange_rows_pair(
+    key_rows: torch.Tensor, value_rows: torch.Tensor, plan: TileExchangePlan, cp_group
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Exchange K and V in a single collective rather than one each.
+
+    K and V are selected by the same top-k, so they address the same rows and move between the
+    same pairs of ranks. Sending them as one buffer halves the number of collectives, which is
+    what this costs: the rows are the handful the top-k picked, so the payload is small enough
+    that per-call launch and handshake latency, not bandwidth, sets the price.
+
+    They are joined on the trailing dimension because the split sizes partition dimension 0 --
+    anything concatenated there would have to interleave with the rank blocks. The halves come
+    back as views, so each is made contiguous for the kernels, a copy of the received rows only.
+    """
+    head_dim = key_rows.shape[-1]
+    served = torch.cat(
+        (
+            key_rows.index_select(0, plan.requested_local),
+            value_rows.index_select(0, plan.requested_local),
+        ),
+        dim=-1,
+    )
+    received = torch.empty(
+        (plan.total_recv, *served.shape[1:]), dtype=served.dtype, device=served.device
+    )
+    torch.distributed.all_to_all_single(
+        received,
+        served.contiguous(),
+        output_split_sizes=plan.send_split,
+        input_split_sizes=plan.recv_split,
+        group=cp_group,
+    )
+    return received[..., :head_dim].contiguous(), received[..., head_dim:].contiguous()
+
+
+def return_row_grads_pair(
+    grad_key_received: torch.Tensor,
+    grad_value_received: torch.Tensor,
+    plan: TileExchangePlan,
+    cp_group,
+    local_shape,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Route dK and dV home together, the mirror of :func:`exchange_rows_pair`.
+
+    Same reasoning: one collective instead of two for payloads small enough that the call
+    itself dominates.
+    """
+    timer = _TimedRegion("return_grads")
+    timer.__enter__()
+    head_dim = grad_key_received.shape[-1]
+    grad_received = torch.cat((grad_key_received, grad_value_received), dim=-1)
+    grad_served = torch.empty(
+        (plan.requested_local.numel(), *grad_received.shape[1:]),
+        dtype=grad_received.dtype,
+        device=grad_received.device,
+    )
+    torch.distributed.all_to_all_single(
+        grad_served,
+        grad_received.contiguous(),
+        output_split_sizes=plan.recv_split,
+        input_split_sizes=plan.send_split,
+        group=cp_group,
+    )
+    grad_local = torch.zeros(
+        (*local_shape[:-1], 2 * head_dim), dtype=grad_received.dtype, device=grad_received.device
+    )
+    grad_local.index_add_(0, plan.requested_local, grad_served)
+    split = grad_local[..., :head_dim].contiguous(), grad_local[..., head_dim:].contiguous()
+    timer.__exit__()
+    return split
 
 
 def return_row_grads(
@@ -218,18 +484,11 @@ def return_row_grads(
     torch.distributed.all_to_all_single(
         grad_served,
         grad_received.contiguous(),
-        output_split_sizes=plan.recv_counts.tolist(),
-        input_split_sizes=plan.send_counts.tolist(),
+        output_split_sizes=plan.recv_split,
+        input_split_sizes=plan.send_split,
         group=cp_group,
     )
     grad_local = torch.zeros(local_shape, dtype=grad_received.dtype, device=grad_received.device)
-    if plan.requested_local.numel():
-        worst = int(plan.requested_local.max().item())
-        if worst >= local_shape[0]:
-            raise ValueError(
-                f"a peer asked for local row {worst} of a {local_shape[0]}-row shard; the "
-                "exchange plan and the tensor being scattered into disagree."
-            )
     grad_local.index_add_(0, plan.requested_local, grad_served)
     return grad_local
 
