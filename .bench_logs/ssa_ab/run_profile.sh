@@ -32,6 +32,18 @@ export WANDB_CONSOLE=off
 
 NGPU=${NGPU:-4}
 
+# A rerun has to start from nothing. Each arm saves at exit, and on the next run --load finds
+# that checkpoint, resumes at the final iteration and exits with nothing to train: no error, no
+# trace, and an arm silently missing from the comparison. This bit once already, when a rerun
+# after a crash left the arm that had succeeded with a checkpoint and the arm that had failed
+# without one. KEEP_RUN_DIR=1 to opt out.
+RUN_ROOT="/lustre/fsw/portfolios/nemotron/users/atripathy/runs/dsa_gqa_ssa_ab"
+if [ "${KEEP_RUN_DIR:-0}" != "1" ]; then
+    for stale in "${RUN_ROOT}"/*"_prof${TAG}"; do
+        [ -d "${stale}" ] && echo "removing stale run dir: ${stale}" && rm -rf "${stale}"
+    done
+fi
+
 PROFILE=1 \
 PROFILE_ARMS="${ARMS}" \
 NO_SRUN=1 \

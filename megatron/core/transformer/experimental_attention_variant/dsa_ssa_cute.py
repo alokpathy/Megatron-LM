@@ -48,6 +48,31 @@ def require_ssa_cute_internals() -> None:
         )
 
 
+def _validate_split_inputs(query, key, value, q_idx, k_idx) -> None:
+    """The wheel's input contract, with the routing and attention key streams kept apart.
+
+    Everything upstream checks per tensor -- dtype, device, SM103, no graph capture, compact
+    rows -- is delegated by validating the attention operands as their own fused call and the
+    indexer operands against the query. Only the row-count rule differs, and it is the reason
+    this exists: upstream requires one key extent, and a split has two.
+    """
+    rows = query.size(0)
+    if q_idx.size(0) != rows:
+        raise ValueError(
+            f"CuTe DSA indexer query rows must match the query: Tq={rows}, Iq={q_idx.size(0)}."
+        )
+    if value.size(0) != key.size(0):
+        raise ValueError(f"CuTe DSA K/V row counts disagree: Tk={key.size(0)}, V={value.size(0)}.")
+    if k_idx.size(0) < key.size(0):
+        raise ValueError(
+            "CuTe DSA indexer keys must cover at least the attention shard: "
+            f"Ik={k_idx.size(0)}, Tk={key.size(0)}."
+        )
+    # Validate the attention operands exactly as the fused path would, by giving the upstream
+    # validator a key stream whose extent matches them.
+    _validate_inputs(query, key, value, q_idx, k_idx[: key.size(0)])
+
+
 class SplitSparseAttention(torch.autograd.Function):
     """``sparse_attention`` with routing and attention separated.
 
@@ -59,11 +84,18 @@ class SplitSparseAttention(torch.autograd.Function):
     @staticmethod
     def forward(ctx, query, key, value, q_idx, k_idx, layout, topk, loss_coeff, exchange):
         require_ssa_cute_internals()
-        _validate_inputs(query, key, value, q_idx, k_idx)
+        # Two key streams meet here. Routing scores against k_idx, which spans every key in the
+        # layout's coordinate system; attention reads whatever the exchange hands back, which
+        # under all-to-all is only the rows routing selected. The wheel's own validator folds
+        # them together -- it requires Ik == Tk, true of the fused path by construction and
+        # false of this one by design -- so the two are checked against their own extents.
+        _validate_split_inputs(query, key, value, q_idx, k_idx)
         layout, lengths, attention_lengths = _normalize_layout(
             layout,
             query_length=query.size(0),
-            key_length=key.size(0),
+            # The layout describes the stream routing selects over, so its bounds are checked
+            # against that extent, not against the shard attention happens to start from.
+            key_length=k_idx.size(0),
             device=query.device,
             topk=topk,
         )

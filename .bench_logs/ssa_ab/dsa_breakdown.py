@@ -30,36 +30,39 @@ RULES = [
     ("INDEXER", "score (routing)", ["_dsa_simplified_score_block_kernel"]),
     ("INDEXER", "score (teacher)", ["_dsa_teacher_scores_kernel"]),
     ("INDEXER", "score bwd (qk)", ["_dsa_simplified_selected_scores_backward_qk"]),
-    ("INDEXER", "proj wgrad", ["_dsa_linear_wgrad_kernel",
-                               "_dsa_simplified_gathered_linear_wgrad"]),
+    (
+        "INDEXER",
+        "proj wgrad",
+        ["_dsa_linear_wgrad_kernel", "_dsa_simplified_gathered_linear_wgrad"],
+    ),
     ("INDEXER", "norm stats", ["_dsa_simplified_input_norm_stats"]),
     ("INDEXER", "topk / select", ["mbtopk", "radix_select", "_dsa_topk", "select_kernel"]),
     ("INDEXER", "scatter grad", ["scatter_selected_grad"]),
     ("ATTENTION", "attn fwd", ["_dsa_sparse_attention_forward_kernel"]),
     ("ATTENTION", "attn bwd", ["_dsa_sparse_attention_backward_pair_kernel"]),
     # --- simplified_sparse_attention CuTe backend ----------------------------------
-    # Named from the wheel's kernel modules; see simplified_sparse_attention/kernels/.
-    ("INDEXER", "cute indexer fwd+topk", ["indexer_forward_topk"]),
-    ("INDEXER", "cute indexer aux grad", ["indexer_aux_grad_precompute"]),
-    ("INDEXER", "cute topk select", ["gvr_topk", "filtered_top_k", "block_scan"]),
-    ("INDEXER", "cute dense indexer kl", ["phase1_dense_indexer_kl"]),
-    ("ATTENTION", "cute attn fwd", ["sparse_attention_h96", "sparse_attention_large",
-                                    "attention_teacher_forward"]),
-    ("ATTENTION", "cute attn bwd", ["sparse_attention_backward"]),
+    # Matched on the emitted CUDA kernel names, not the wheel's Python module names. An
+    # earlier version keyed on the modules (sparse_attention_large, attention_teacher_forward)
+    # and matched nothing, which cost a whole reported breakdown: the kernels are all emitted
+    # as "kernel_cutlass__<entry>_<mangled operand types>".
+    ("INDEXER", "cute score", ["cutlass__score_kernel"]),
+    ("INDEXER", "cute topk select", ["filtered_topk", "filtered_top_k", "gvr_topk", "block_scan"]),
+    ("INDEXER", "cute indexer aux grad", ["indexer_aux_grad", "cutlass__dz_kernel"]),
+    ("ATTENTION", "cute attn fwd", ["cutlass__ssa_"]),
+    ("ATTENTION", "cute attn bwd", ["cutlass__stock__bwd_kernel", "sparse_attention_backward"]),
+    ("ATTENTION", "cute spmm (bwd gather/reduce)", ["cutlass__spmm"]),
     ("ATTENTION", "cute dense gemm", ["dense_gemm_sm100"]),
 ]
 
 # Kernels that are DSA-adjacent but neither indexer nor attention: the projections feeding
 # them, layout moves, and the loss bookkeeping.
-MISC_RULES = [
-    ("misc", ["dsa_", "simplified_sparse", "cute_dsl", "ssa_"]),
-]
+MISC_RULES = [("misc", ["dsa_", "simplified_sparse", "cute_dsl", "ssa_"])]
 
 # Collectives. Reported separately because under context parallelism the comm pattern is the
 # thing under test, and because an nccl kernel's duration includes waiting for the slowest
 # peer -- it is a bound on the exchange, not its cost in isolation.
 COMM_RULES = [
-    ("a2a (selected keys)", ["alltoall", "all_to_all", "ncclDevKernel_AllToAll"]),
+    ("a2a (selected keys)", ["sendrecv", "alltoall", "all_to_all"]),
     ("all-gather", ["allgather", "ncclDevKernel_AllGather"]),
     ("reduce-scatter", ["reducescatter", "ncclDevKernel_ReduceScatter"]),
     ("all-reduce", ["allreduce", "ncclDevKernel_AllReduce"]),
@@ -118,8 +121,12 @@ def analyse(path, layers, microbatches):
     kernels = gpu_kernels(events)
     if not windows:
         # No ProfilerStep markers: treat the whole trace as one window.
-        windows = [(min((k[0] for k in kernels), default=0),
-                    max((k[0] + k[1] for k in kernels), default=0))]
+        windows = [
+            (
+                min((k[0] for k in kernels), default=0),
+                max((k[0] + k[1] for k in kernels), default=0),
+            )
+        ]
 
     per_step = []
     unclaimed = collections.Counter()
@@ -130,8 +137,7 @@ def analyse(path, layers, microbatches):
                 continue
             bucket, label = classify(name)
             if bucket is None:
-                if "dsa" in name.lower() or "cute" in name.lower():
-                    unclaimed[name] += dur
+                unclaimed[name] += dur
                 continue
             totals[(bucket, label)] += dur
         if totals:
@@ -147,8 +153,10 @@ def analyse(path, layers, microbatches):
 
 def report(label, median, unclaimed, n_windows, layers, microbatches):
     invocations = layers * microbatches
-    print(f"\n=== {label}  ({n_windows} profiled step(s), "
-          f"{layers} DSA layers x {microbatches} microbatches = {invocations} invocations)")
+    print(
+        f"\n=== {label}  ({n_windows} profiled step(s), "
+        f"{layers} DSA layers x {microbatches} microbatches = {invocations} invocations)"
+    )
     if median is None:
         print("  no DSA kernels matched in any step")
         return {}
@@ -162,13 +170,17 @@ def report(label, median, unclaimed, n_windows, layers, microbatches):
         if not by_bucket.get(bucket):
             continue
         total = by_bucket[bucket]
-        print(f"  {bucket:<34}{total/1000:>10.2f}{total/1000/invocations:>11.3f}"
-              f"{100*total/grand:>9.1f}%")
+        print(
+            f"  {bucket:<34}{total/1000:>10.2f}{total/1000/invocations:>11.3f}"
+            f"{100*total/grand:>9.1f}%"
+        )
         for (b, lab), value in sorted(median.items(), key=lambda kv: -kv[1]):
             if b != bucket:
                 continue
-            print(f"    {lab:<32}{value/1000:>10.2f}{value/1000/invocations:>11.3f}"
-                  f"{100*value/grand:>9.1f}%")
+            print(
+                f"    {lab:<32}{value/1000:>10.2f}{value/1000/invocations:>11.3f}"
+                f"{100*value/grand:>9.1f}%"
+            )
     print("  " + "-" * 63)
     print(f"  {'TOTAL DSA':<34}{grand/1000:>10.2f}{grand/1000/invocations:>11.3f}{100.0:>9.1f}%")
     if unclaimed:
