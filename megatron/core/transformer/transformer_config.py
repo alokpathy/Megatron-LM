@@ -3906,22 +3906,10 @@ class TransformerConfig(ModelParallelConfig):
                         "dsa_kernel_backend='ssa-cute' has no dense-warmup path; use a "
                         "min-memory backend for phase 1."
                     )
-                    # A2A exchanges only the keys routing selected, which means splitting
-                    # routing from attention and putting a collective between them. The wheel
-                    # fuses both into one autograd call, so only the gathered form works here.
-                    if self.context_parallel_size > 1:
-                        cp_types = (
-                            self.cp_comm_type
-                            if isinstance(self.cp_comm_type, list)
-                            else [self.cp_comm_type]
-                        )
-                        assert all(
-                            c is not None and c.replace("_", "").lower() == "allgather"
-                            for c in cp_types
-                        ), (
-                            "dsa_kernel_backend='ssa-cute' supports cp_comm_type='allgather' "
-                            f"only; got {self.cp_comm_type!r}."
-                        )
+                    # A2A exchanges only the keys routing selected, so it needs a collective
+                    # between routing and attention. The wheel's public call fuses both;
+                    # dsa_ssa_cute.split_sparse_attention is that call with the seam left open,
+                    # which is what makes this value legal here.
                 # Context parallelism all-gathers K and V so each rank runs the indexer and
                 # attention locally against the full key set, which is what keeps the indexer's
                 # top-k a global selection rather than a distributed merge. That requires the

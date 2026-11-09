@@ -37,6 +37,10 @@ from megatron.core.transformer.experimental_attention_variant.dsa_min_memory imp
     dsa_min_memory_gqa,
     dsa_min_memory_gqa_forward_only,
 )
+from megatron.core.transformer.experimental_attention_variant.dsa_ssa_cute import (
+    SelectedKVExchange,
+    split_sparse_attention,
+)
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -1056,20 +1060,31 @@ class DSGQACoreAttention(MegatronModule):
 
         cp_group = getattr(self.pg_collection, "cp", None) if self.pg_collection else None
         cp_size = 1 if cp_group is None else cp_group.size()
+        comm_type = (
+            normalize_cp_comm_type(getattr(self, "cp_comm_type", None)) if cp_size > 1 else None
+        )
+        local_seq = sq
         if cp_size > 1:
-            # The main K/V gather is shared with the min-memory path, including the reorder that
-            # turns rank order into global position order. The indexer's K is a separate learned
-            # projection, so it needs the same treatment -- gathered, then reordered identically,
-            # or the two caches would disagree about which key a global index names.
-            key, value, query_positions, _ = _gather_kv_for_context_parallel(
-                key, value, cp_group, "allgather"
-            )
+            # Routing scores against every key either way, so the indexer's K is always gathered.
+            # It is a separate learned projection from attention K, but one set of global indices
+            # addresses both, so the two have to agree on what a global index names -- hence the
+            # same reorder that turns rank order into global position order.
             index_k = gather_from_sequence_parallel_region(
                 index_k, tensor_parallel_output_grad=True, group=cp_group
-            )[build_zigzag_allgather_cp_key_reorder(sq, cp_size, key.device)]
+            )[build_zigzag_allgather_cp_key_reorder(sq, cp_size, index_k.device)]
+            query_positions = build_zigzag_cp_local_positions(
+                sq * cp_size, cp_size, cp_group.rank(), query.device
+            )
+            if comm_type == "allgather":
+                key, value, _, _ = _gather_kv_for_context_parallel(
+                    key, value, cp_group, "allgather"
+                )
         else:
             query_positions = None
-        skv = key.size(0)
+        # Attention reads the global stream under all-gather and only the selected rows under
+        # a2a, but routing and the indexer objective are global in both, so the key extent that
+        # describes the layout is the global one regardless of what attention will be handed.
+        skv = sq * cp_size if cp_size > 1 else key.size(0)
         if cp_size == 1:
             assert skv == sq, "ssa-cute expects Tq == Tk per sequence without context parallelism."
 
@@ -1117,17 +1132,32 @@ class DSGQACoreAttention(MegatronModule):
         topk = self.indexer.index_topk
         # Query and key extents differ under CP, which is exactly why reserve_indexer takes both.
         _ssa_cute_reserve_indexer(rows, batch_size * skv, topk)
-        output, indexer_loss = sparse_attention(
-            flat_query,
-            flat_key,
-            flat_value,
-            flat_index_q,
-            flat_index_k,
-            layout,
-            topk,
-            # Already applied inside; the logging below divides it back out for the raw value.
-            loss_coeff=indexer_loss_coeff,
-        )
+        if comm_type == "a2a":
+            # The exchange has to sit between routing and attention, which the fused public call
+            # has no room for; split_sparse_attention is that call with the seam left open.
+            output, indexer_loss = split_sparse_attention(
+                flat_query,
+                flat_key,
+                flat_value,
+                flat_index_q,
+                flat_index_k,
+                layout,
+                topk,
+                loss_coeff=indexer_loss_coeff,
+                exchange=SelectedKVExchange(cp_group, cp_size, sq * cp_size, batch_size, local_seq),
+            )
+        else:
+            output, indexer_loss = sparse_attention(
+                flat_query,
+                flat_key,
+                flat_value,
+                flat_index_q,
+                flat_index_k,
+                layout,
+                topk,
+                # Already applied inside; logging below divides it back out for the raw value.
+                loss_coeff=indexer_loss_coeff,
+            )
 
         output = output.reshape(batch_size, sq, num_query_heads * flat_value.size(-1))
         output = output.transpose(0, 1).contiguous()

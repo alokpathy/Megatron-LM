@@ -226,6 +226,81 @@ class _NoExchange:
         return grad_key, grad_value
 
 
+class SelectedKVExchange:
+    """Fetch only the keys routing selected, from the ranks that own them.
+
+    Reuses the min-memory path's planner and collectives unchanged. Two coordinate systems meet
+    here and the translation between them is the whole job:
+
+    * the plan addresses ``[local_seq, batch, groups, head_dim]`` and dedupes over *sequence
+      positions*, spanning the batch, because a key selected by many queries crosses the wire
+      once;
+    * the CuTe kernels address a flat batch-major token stream, where row ``b * seq + p`` is
+      batch ``b``'s position ``p``.
+
+    So selections arrive as flat stream indices, are reduced to positions for the plan, and the
+    plan's answer is lifted back into flat rows of the received buffer.
+    """
+
+    def __init__(self, cp_group, cp_size: int, global_seq: int, batch_size: int, local_seq: int):
+        self.cp_group = cp_group
+        self.cp_size = cp_size
+        self.global_seq = global_seq
+        self.batch_size = batch_size
+        self.local_seq = local_seq
+        self._plan = None
+        self._head_dim = None
+
+    def __call__(self, key, value, indices):
+        from megatron.core.transformer.experimental_attention_variant.dsa_a2a import (
+            exchange_rows_pair,
+            plan_tile_exchange,
+        )
+
+        batch, gseq = self.batch_size, self.global_seq
+        head_dim = key.size(-1)
+        # Slots past a row's valid length hold whatever the top-k kernel left there. They are
+        # never attended to, but they are still gathered through remap, so bring them in range.
+        flat = indices.long().clamp_(0, batch * gseq - 1)
+        batch_id, position = flat // gseq, flat % gseq
+
+        plan = plan_tile_exchange(
+            position.view(batch, -1, position.size(-1)), gseq, self.cp_size, self.cp_group
+        )
+        # [b*s, 1, D] -> [s, b, 1, D]: the plan selects rows of dimension 0, which it reads as
+        # sequence position with the batch alongside.
+        key_sb = key.view(batch, self.local_seq, 1, head_dim).transpose(0, 1).contiguous()
+        value_sb = value.view(batch, self.local_seq, 1, head_dim).transpose(0, 1).contiguous()
+        received_key, received_value = exchange_rows_pair(key_sb, value_sb, plan, self.cp_group)
+
+        total = plan.total_recv
+        flat_key = received_key.transpose(0, 1).reshape(batch * total, 1, head_dim).contiguous()
+        flat_value = received_value.transpose(0, 1).reshape(batch * total, 1, head_dim).contiguous()
+        # The received buffer is per-batch too, so a flat row is batch-offset the same way the
+        # global stream is -- with the received count in place of the sequence length.
+        compact = (batch_id * total + plan.remap[position]).to(torch.int32)
+
+        self._plan, self._head_dim = plan, head_dim
+        return flat_key, flat_value, compact, self
+
+    def return_grads(self, grad_key, grad_value):
+        from megatron.core.transformer.experimental_attention_variant.dsa_a2a import (
+            return_row_grads_pair,
+        )
+
+        plan, head_dim = self._plan, self._head_dim
+        batch, total = self.batch_size, plan.total_recv
+        grad_key_sb = grad_key.view(batch, total, 1, head_dim).transpose(0, 1).contiguous()
+        grad_value_sb = grad_value.view(batch, total, 1, head_dim).transpose(0, 1).contiguous()
+        local_key, local_value = return_row_grads_pair(
+            grad_key_sb, grad_value_sb, plan, self.cp_group, (self.local_seq, batch, 1, head_dim)
+        )
+        return (
+            local_key.transpose(0, 1).reshape(batch * self.local_seq, 1, head_dim).contiguous(),
+            local_value.transpose(0, 1).reshape(batch * self.local_seq, 1, head_dim).contiguous(),
+        )
+
+
 def split_sparse_attention(
     query: torch.Tensor,
     key: torch.Tensor,
