@@ -41,6 +41,25 @@ from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 
+_SSA_CUTE_RESERVED: set = set()
+
+
+def _ssa_cute_reserve_indexer(max_query_len: int, max_key_len: int, topk: int) -> None:
+    """Size the CuTe indexer's persistent state once, on the first forward of each device.
+
+    Without this the filtered indexer grows on demand with 12.5% headroom and recaptures its
+    repair graph mid-run, which lands in whatever iteration happens to exceed the current
+    capacity -- including a profiled one. Sequence length is fixed here, so the first call's
+    extents are also the maxima.
+    """
+    from simplified_sparse_attention import reserve_indexer
+
+    key = (torch.cuda.current_device(), max_query_len, max_key_len, topk)
+    if key in _SSA_CUTE_RESERVED:
+        return
+    reserve_indexer(max_query_len, max_key_len, topk)
+    _SSA_CUTE_RESERVED.add(key)
+
 
 def _gather_kv_for_context_parallel(key, value, cp_group, cp_comm_type):
     """All-gather K and V along the sequence dimension over the context-parallel group.
@@ -820,6 +839,17 @@ class DSGQACoreAttention(MegatronModule):
         sq, b, _, _ = query.size()
         skv = key.size(0)
         dsa_kernel_backend = getattr(self.config, "dsa_kernel_backend", "reference")
+        if dsa_kernel_backend == "ssa-cute":
+            return self._forward_ssa_cute(
+                query=query,
+                key=key,
+                value=value,
+                hidden_states=hidden_states,
+                use_indexer_rope=use_indexer_rope,
+                indexer_input_norm=indexer_input_norm,
+                attn_mask_type=attn_mask_type,
+                packed_seq_params=packed_seq_params,
+            )
         if dsa_kernel_backend in ("min-memory-triton", "min-memory-torch"):
             return self._forward_min_memory(
                 query=query,
@@ -981,6 +1011,135 @@ class DSGQACoreAttention(MegatronModule):
             mask=sparse_attention_mask,
             query_chunk_size=None,
         )
+
+    def _forward_ssa_cute(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        hidden_states: torch.Tensor,
+        use_indexer_rope: bool,
+        indexer_input_norm: Optional[_DSAIndexerInputNormSpec],
+        attn_mask_type: Optional[AttnMaskType],
+        packed_seq_params: Optional[PackedSeqParams],
+    ) -> torch.Tensor:
+        """Run the external simplified-sparse-attention CuTe kernels.
+
+        The wheel owns forward, backward and the selected-support indexer loss in one autograd
+        call, so this replaces dsa_min_memory_gqa wholesale rather than swapping kernels inside
+        it. Its coordinate system is a flat token stream: each (sequence, position) pair is a
+        row whose causal key interval is given explicitly, which is how a batch is expressed
+        without a batch axis.
+
+        Under context parallelism the rank keeps its own query rows and attends against the
+        gathered global keys -- the wheel's rectangular Tq != Tk case, which is what it calls
+        "local queries and gathered global keys". A row's causal bound is then its *global*
+        position, so the interval is what carries the zigzag layout into the kernels. Only the
+        gathered form works: all-to-all would have to exchange keys between routing and
+        attention, and the wheel fuses those into one call.
+        """
+        from simplified_sparse_attention import RowMetadata, sparse_attention
+
+        if attn_mask_type is not None:
+            assert attn_mask_type == AttnMaskType.causal, "ssa-cute supports causal masks only."
+
+        sq, batch_size, num_query_heads, head_dim = query.size()
+
+        indexer_hidden_states = hidden_states.detach()
+        if _simplified_indexer_uses_main_input_norm(self.config):
+            indexer_hidden_states = _normalized_indexer_input(
+                indexer_hidden_states, indexer_input_norm
+            )
+        index_q, index_k = self.indexer.forward_qk(
+            indexer_hidden_states, use_rope=use_indexer_rope, packed_seq_params=packed_seq_params
+        )
+
+        cp_group = getattr(self.pg_collection, "cp", None) if self.pg_collection else None
+        cp_size = 1 if cp_group is None else cp_group.size()
+        if cp_size > 1:
+            # The main K/V gather is shared with the min-memory path, including the reorder that
+            # turns rank order into global position order. The indexer's K is a separate learned
+            # projection, so it needs the same treatment -- gathered, then reordered identically,
+            # or the two caches would disagree about which key a global index names.
+            key, value, query_positions, _ = _gather_kv_for_context_parallel(
+                key, value, cp_group, "allgather"
+            )
+            index_k = gather_from_sequence_parallel_region(
+                index_k, tensor_parallel_output_grad=True, group=cp_group
+            )[build_zigzag_allgather_cp_key_reorder(sq, cp_size, key.device)]
+        else:
+            query_positions = None
+        skv = key.size(0)
+        if cp_size == 1:
+            assert skv == sq, "ssa-cute expects Tq == Tk per sequence without context parallelism."
+
+        # [s, b, ...] -> [b * s, ...]: batch-major so one sequence's rows stay contiguous, which
+        # lets a document be a single [start, end) interval per row.
+        def _flatten(tensor: torch.Tensor, *trailing: int) -> torch.Tensor:
+            return tensor.transpose(0, 1).reshape(batch_size * tensor.size(0), *trailing)
+
+        flat_query = _flatten(query, num_query_heads, head_dim).contiguous()
+        flat_key = _flatten(key, 1, head_dim).contiguous()
+        flat_value = _flatten(value, 1, value.size(-1)).contiguous()
+        flat_index_q = _flatten(index_q, index_q.size(-1)).contiguous()
+        flat_index_k = _flatten(index_k, index_k.size(-1)).contiguous()
+
+        device = query.device
+        # Without CP a row's causal bound is its own index; with CP it is the global position the
+        # zigzag layout assigns, since the keys it may see are the global prefix.
+        if query_positions is None:
+            position = torch.arange(sq, device=device, dtype=torch.int32)
+        else:
+            position = query_positions.to(device=device, dtype=torch.int32)
+        position = position.repeat(batch_size)
+        sequence_base = (
+            torch.arange(batch_size, device=device, dtype=torch.int32).repeat_interleave(sq) * skv
+        )
+        key_starts = sequence_base
+        key_ends = sequence_base + position + 1
+
+        rows = batch_size * sq
+        layout = RowMetadata(
+            key_starts=key_starts,
+            key_ends=key_ends,
+            query_valid=torch.ones(rows, dtype=torch.bool, device=device),
+            # The wheel divides the summed indexer objective by this, so it sets what the
+            # reported loss is a mean over. Rows, to match the min-memory path's per-token mean.
+            loss_denominator=torch.tensor(float(rows), dtype=torch.float32, device=device),
+            # Explicit bounds rather than triangular_scores: a batch is several documents in one
+            # stream, and only the bounded form reaches the filtered long-context indexer.
+            triangular_scores=False,
+            mask_invalid_rows=True,
+            all_query_rows_valid=True,
+        )
+
+        indexer_loss_coeff = getattr(self.config, "dsa_indexer_loss_coeff", 0.0) or 0.0
+        topk = self.indexer.index_topk
+        # Query and key extents differ under CP, which is exactly why reserve_indexer takes both.
+        _ssa_cute_reserve_indexer(rows, batch_size * skv, topk)
+        output, indexer_loss = sparse_attention(
+            flat_query,
+            flat_key,
+            flat_value,
+            flat_index_q,
+            flat_index_k,
+            layout,
+            topk,
+            # Already applied inside; the logging below divides it back out for the raw value.
+            loss_coeff=indexer_loss_coeff,
+        )
+
+        output = output.reshape(batch_size, sq, num_query_heads * flat_value.size(-1))
+        output = output.transpose(0, 1).contiguous()
+        if indexer_loss_coeff > 0:
+            DSAIndexerLossLoggingHelper.save_loss_to_tracker(
+                loss=indexer_loss,
+                raw_loss=indexer_loss / indexer_loss_coeff,
+                layer_number=self.layer_number,
+                num_layers=self.config.num_layers,
+            )
+            return DSAIndexerLossAutoScaler.apply(output, indexer_loss)
+        return output
 
     def _forward_min_memory(
         self,
