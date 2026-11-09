@@ -389,7 +389,15 @@ class TransformerConfig(ModelParallelConfig):
     top-k indices."""
 
     dsa_kernel_backend: (
-        Literal["none", "tilelang", "cudnn", "min-memory-triton", "min-memory-torch", "reference"]
+        Literal[
+            "none",
+            "tilelang",
+            "cudnn",
+            "min-memory-triton",
+            "min-memory-torch",
+            "reference",
+            "ssa-cute",
+        ]
         | None
     ) = None
     """Which DSA implementation to run. This is the only backend selector.
@@ -408,7 +416,14 @@ class TransformerConfig(ModelParallelConfig):
     ``min-memory-triton`` no         yes          chunked min-memory, Triton kernels
     ``min-memory-torch``  no         yes          chunked min-memory, Triton dispatch off
     ``reference``       no           yes          dense-mask reference the kernels are A/B'd against
+    ``ssa-cute``        no           yes          simplified_sparse_attention CuTe kernels, SM103
     =================== ============ ============ =========================================
+
+    ``ssa-cute`` routes the DSA-over-GQA forward and backward into the external
+    ``simplified_sparse_attention`` wheel. Its kernels are shape-specialized: head dim 256,
+    indexer dim 128, 16/32/96 query heads, one KV group, top-k in {512, 1024, 2048}, BF16,
+    SM103 only, and no CUDA-graph capture. It exists to A/B those kernels against
+    ``min-memory-triton`` on an otherwise identical model.
 
     ``cudnn`` selects the fused cuDNN indexer, which exists only on the standard-indexer path
     and so is MLA-only: the simplified indexer the GQA path requires has no cuDNN branch.
@@ -4648,11 +4663,49 @@ class TransformerConfig(ModelParallelConfig):
                     'min-memory-triton',
                     'min-memory-torch',
                     'reference',
+                    'ssa-cute',
                 ), (
                     "DSA over GQA supports dsa_kernel_backend in ('min-memory-triton', "
-                    f"'min-memory-torch', 'reference'); got {self.dsa_kernel_backend!r}. "
+                    f"'min-memory-torch', 'reference', 'ssa-cute'); got "
+                    f"{self.dsa_kernel_backend!r}. "
                     "'tilelang' and 'cudnn' select fused kernels and are MLA-only."
                 )
+                if self.dsa_kernel_backend == 'ssa-cute':
+                    # The CuTe kernels are shape-specialized rather than configurable, so an
+                    # unsupported model fails inside the wheel on the first forward. Check the
+                    # whole envelope here, where the message can name the flag to change.
+                    assert (
+                        simplified_indexer
+                    ), "dsa_kernel_backend='ssa-cute' requires dsa_indexer_mode='simplified'."
+                    assert self.kv_channels == 256, (
+                        "dsa_kernel_backend='ssa-cute' requires kv_channels=256; got "
+                        f"{self.kv_channels}."
+                    )
+                    assert self.dsa_indexer_head_dim == 128, (
+                        "dsa_kernel_backend='ssa-cute' requires dsa_indexer_head_dim=128; got "
+                        f"{self.dsa_indexer_head_dim}."
+                    )
+                    # The kernels see one tensor-parallel rank's share of the heads, not the
+                    # model's, so TP is what has to land on a supported count.
+                    local_heads = self.num_attention_heads // self.tensor_model_parallel_size
+                    assert local_heads in (16, 32, 96), (
+                        "dsa_kernel_backend='ssa-cute' supports 16, 32 or 96 query heads per "
+                        f"tensor-parallel rank; num_attention_heads={self.num_attention_heads} "
+                        f"over tensor_model_parallel_size={self.tensor_model_parallel_size} "
+                        f"gives {local_heads}."
+                    )
+                    assert self.num_query_groups == 1, (
+                        "dsa_kernel_backend='ssa-cute' requires num_query_groups=1; got "
+                        f"{self.num_query_groups}."
+                    )
+                    assert self.dsa_indexer_topk in (512, 1024, 2048), (
+                        "dsa_kernel_backend='ssa-cute' supports dsa_indexer_topk in "
+                        f"(512, 1024, 2048); got {self.dsa_indexer_topk}."
+                    )
+                    assert not self.dsa_fwd_use_dense_attn, (
+                        "dsa_kernel_backend='ssa-cute' has no dense-warmup path; use a "
+                        "min-memory backend for phase 1."
+                    )
                 # DSA over MLA supports CP/SP (upstream gates CP on cp_comm_type=allgather
                 # below). The GQA path does not: its min-memory kernels have no
                 # sequence-parallel gather and no CP support yet.

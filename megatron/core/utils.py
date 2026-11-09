@@ -526,7 +526,7 @@ def is_emerging_optimizers_min_version(version, check_equality=True):
 
 
 # Values that select a fused kernel backend and therefore carry optional dependencies.
-_FUSED_DSA_KERNEL_BACKENDS = ("tilelang", "cudnn")
+_FUSED_DSA_KERNEL_BACKENDS = ("tilelang", "cudnn", "ssa-cute")
 # Values that select a DSA implementation needing no optional dependency: "none" plus the
 # DSA-over-GQA paths, which are written in PyTorch and Triton.
 _UNFUSED_DSA_KERNEL_BACKENDS = ("none", "min-memory-triton", "min-memory-torch", "reference")
@@ -546,6 +546,15 @@ def _missing_tilelang_dsa_kernel_dependencies() -> List[str]:
     if tilelang_dsa.SparseMLA is None:
         missing.append("TileLang SparseMLA")
     return missing
+
+
+def _missing_ssa_cute_dsa_kernel_dependencies() -> List[str]:
+    """Return missing simplified-sparse-attention CuTe DSA kernel dependencies."""
+    try:
+        from simplified_sparse_attention import sparse_attention  # noqa: F401
+    except ImportError:
+        return ["simplified_sparse_attention"]
+    return []
 
 
 def _missing_cudnn_dsa_kernel_dependencies() -> List[str]:
@@ -581,6 +590,8 @@ def _validate_dsa_kernel_backend_dependencies(dsa_kernel_backend: str) -> None:
         missing = _missing_tilelang_dsa_kernel_dependencies()
     elif dsa_kernel_backend == "cudnn":
         missing = _missing_cudnn_dsa_kernel_dependencies()
+    elif dsa_kernel_backend == "ssa-cute":
+        missing = _missing_ssa_cute_dsa_kernel_dependencies()
 
     if missing:
         raise ValueError(
