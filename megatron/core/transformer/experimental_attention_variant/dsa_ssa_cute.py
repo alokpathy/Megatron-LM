@@ -69,8 +69,19 @@ class SplitSparseAttention(torch.autograd.Function):
         )
 
         rows = query.size(0)
+        # Allocated up front, in the order the fused path allocates them, and deliberately so.
+        # indexer_aux_grad_precompute reads every one of a row's topk teacher slots, including
+        # the ones past its valid length that attention never writes. Those slots hold whatever
+        # the caching allocator last left at that address, so the allocation sequence is part of
+        # the numerics: interleaving these with the routing call changes the indexer gradient in
+        # a handful of elements, which is small enough to read as noise and is not.
         indices = torch.empty((rows, topk), device=query.device, dtype=torch.int32)
         predict = torch.empty_like(indices, dtype=torch.float32)
+        output = torch.empty_like(query)
+        lse = torch.empty((rows, query.size(1)), device=query.device, dtype=torch.float32)
+        teacher = torch.empty_like(predict)
+        softmax_max = torch.empty_like(lse)
+        softmax_inv_sum = torch.empty_like(lse)
 
         # --- routing: selects over the key stream k_idx describes, in its coordinates ---
         _kernel_module("indexer_forward_topk").run(
@@ -96,11 +107,6 @@ class SplitSparseAttention(torch.autograd.Function):
             key, value, indices
         )
 
-        output = torch.empty_like(query)
-        lse = torch.empty((rows, query.size(1)), device=query.device, dtype=torch.float32)
-        teacher = torch.empty_like(predict)
-        softmax_max = torch.empty_like(lse)
-        softmax_inv_sum = torch.empty_like(lse)
         _attention_forward_entry(query_heads=query.size(1), topk=topk)(
             query,
             attention_key,
